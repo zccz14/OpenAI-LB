@@ -6,3 +6,5 @@
 /*.sqlite-wal
 /.env
 .DS_Store
+
+.worktrees/

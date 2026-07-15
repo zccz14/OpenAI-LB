@@ -1,0 +1,311 @@
+pub mod api;
+pub mod auth;
+pub mod balancer;
+pub mod config;
+pub mod crypto;
+pub mod db;
+pub mod oauth;
+pub mod proxy;
+
+use std::{sync::Arc, time::Duration};
+
+use axum::{
+    Router,
+    http::{HeaderValue, Method, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{delete, get, patch, post},
+};
+use dashmap::DashMap;
+use rust_embed::RustEmbed;
+use serde_json::json;
+use sqlx::SqlitePool;
+use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
+
+use crate::{auth::AuthVerifier, balancer::Balancer, config::Config};
+
+#[derive(Clone)]
+pub struct AppState {
+    pub config: Arc<Config>,
+    pub db: SqlitePool,
+    pub client: reqwest::Client,
+    pub auth: AuthVerifier,
+    pub balancer: Balancer,
+    pub refresh_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl AppState {
+    pub fn new(config: Config, db: SqlitePool) -> anyhow::Result<Self> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(600))
+            .build()?;
+        let auth = AuthVerifier::new(
+            config.auth_issuer.clone(),
+            config.auth_audience.clone(),
+            client.clone(),
+        );
+        Ok(Self {
+            config: Arc::new(config),
+            db,
+            client,
+            auth,
+            balancer: Balancer::default(),
+            refresh_locks: Arc::new(DashMap::new()),
+        })
+    }
+}
+
+pub fn router(state: AppState) -> Router {
+    let cors = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE])
+        .allow_headers([
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::CONTENT_TYPE,
+            HeaderNameExt::x_request_id(),
+        ])
+        .allow_origin(
+            state
+                .config
+                .allowed_origins
+                .iter()
+                .filter_map(|origin| origin.parse::<HeaderValue>().ok())
+                .collect::<Vec<_>>(),
+        );
+    let limit = state.config.max_body_bytes;
+    Router::new()
+        .route("/api/health", get(api::health))
+        .route("/api/config", get(api::public_config))
+        .route("/api/me", get(api::me))
+        .route("/api/keys", get(api::list_keys).post(api::create_key))
+        .route("/api/keys/{id}", delete(api::revoke_key))
+        .route(
+            "/api/channels",
+            get(api::list_channels).post(api::create_channel),
+        )
+        .route(
+            "/api/channels/{id}",
+            patch(api::update_channel).delete(api::delete_channel),
+        )
+        .route("/api/oauth/start", post(api::oauth_start))
+        .route("/api/oauth/complete", post(api::oauth_complete))
+        .route("/api/usage", get(api::usage))
+        .route("/api/audit", get(api::audit))
+        .route("/api/admin-audit", get(api::list_admin_audit))
+        .route("/api/dashboard", get(api::dashboard))
+        .route("/api/settings", get(api::settings))
+        .route("/v1/responses", post(proxy::handle))
+        .route("/v1/responses/compact", post(proxy::handle))
+        .route("/backend-api/codex/responses", post(proxy::handle))
+        .route("/backend-api/codex/responses/compact", post(proxy::handle))
+        .route("/v1/audio/transcriptions", post(proxy::handle))
+        .route("/v1/images/generations", post(proxy::handle))
+        .route("/v1/models", get(proxy::handle))
+        .fallback(static_asset)
+        .layer(RequestBodyLimitLayer::new(limit))
+        .layer(cors)
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+struct HeaderNameExt;
+impl HeaderNameExt {
+    fn x_request_id() -> axum::http::HeaderName {
+        axum::http::HeaderName::from_static("x-request-id")
+    }
+}
+
+#[derive(RustEmbed)]
+#[folder = "web/dist/"]
+struct Assets;
+
+async fn static_asset(uri: axum::http::Uri) -> Response {
+    if ["/api", "/v1", "/backend-api"]
+        .iter()
+        .any(|prefix| uri.path() == *prefix || uri.path().starts_with(&format!("{prefix}/")))
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(
+                json!({"error":{"message":"API route not found","type":"not_found","code":404}}),
+            ),
+        )
+            .into_response();
+    }
+    let requested = uri.path().trim_start_matches('/');
+    let path = if requested.is_empty() {
+        "index.html"
+    } else {
+        requested
+    };
+    let requested_asset = Assets::get(path);
+    let is_fallback = requested_asset.is_none();
+    match requested_asset.or_else(|| Assets::get("index.html")) {
+        Some(asset) => {
+            let mime = if is_fallback {
+                "text/html; charset=utf-8"
+            } else {
+                match path.rsplit('.').next() {
+                    Some("js") => "text/javascript",
+                    Some("css") => "text/css",
+                    Some("svg") => "image/svg+xml",
+                    Some("woff2") => "font/woff2",
+                    _ => "text/html; charset=utf-8",
+                }
+            };
+            ([(axum::http::header::CONTENT_TYPE, mime)], asset.data).into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct AppError {
+    status: StatusCode,
+    message: String,
+}
+
+impl AppError {
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+        }
+    }
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+        }
+    }
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: message.into(),
+        }
+    }
+    pub fn upstream(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            message: message.into(),
+        }
+    }
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        (self.status, axum::Json(json!({"error":{"message":self.message,"type":"proxy_error","code":self.status.as_u16()}}))).into_response()
+    }
+}
+
+impl From<anyhow::Error> for AppError {
+    fn from(error: anyhow::Error) -> Self {
+        tracing::error!(%error, "request failed");
+        Self::internal("internal server error")
+    }
+}
+
+macro_rules! internal_from {
+    ($($kind:ty),+ $(,)?) => {$(
+        impl From<$kind> for AppError {
+            fn from(error: $kind) -> Self {
+                tracing::error!(%error, "request failed");
+                Self::internal("internal server error")
+            }
+        }
+    )+};
+}
+
+internal_from!(
+    sqlx::Error,
+    reqwest::Error,
+    serde_json::Error,
+    url::ParseError
+);
+
+#[cfg(test)]
+pub(crate) async fn test_state(oauth_token_url: &str) -> AppState {
+    test_state_with_upstream(oauth_token_url, "http://upstream.invalid").await
+}
+
+#[cfg(test)]
+pub(crate) async fn test_state_with_upstream(
+    oauth_token_url: &str,
+    upstream_base: &str,
+) -> AppState {
+    let config = Config {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        database_url: "sqlite::memory:".to_owned(),
+        encryption_key: [9_u8; 32],
+        auth_issuer: "http://auth.invalid".to_owned(),
+        auth_audience: None,
+        admin_user_id: None,
+        upstream_base: upstream_base.to_owned(),
+        image_host_model: "gpt-5.4".to_owned(),
+        oauth_authorize_url: "http://auth.invalid/oauth/authorize".to_owned(),
+        oauth_token_url: oauth_token_url.to_owned(),
+        oauth_redirect_uri: "http://localhost:1455/auth/callback".to_owned(),
+        oauth_client_id: "test-client".to_owned(),
+        allowed_origins: vec!["http://localhost".to_owned()],
+        max_body_bytes: 1024 * 1024,
+        affinity_ttl_seconds: 3600,
+    };
+    let pool = db::connect(&config.database_url).await.unwrap();
+    AppState::new(config, pool).unwrap()
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn unknown_api_namespace_returns_json_not_spa() {
+        let state = crate::test_state("http://token.invalid").await;
+        for path in ["/api/missing", "/v1/missing", "/backend-api/missing"] {
+            let response = crate::router(state.clone())
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(
+                response.headers().get("content-type").unwrap(),
+                "application/json"
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(
+                std::str::from_utf8(&body)
+                    .unwrap()
+                    .contains("API route not found")
+            );
+        }
+    }
+}

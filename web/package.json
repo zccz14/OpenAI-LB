@@ -9,14 +9,15 @@
     "lint": "eslint .",
     "format": "prettier --write \"**/*.{ts,tsx}\"",
     "typecheck": "tsc -b --noEmit",
-    "check": "npm run typecheck && npm run lint && npm run build",
+    "test": "node --experimental-strip-types --test tests/auth-redirect.test.ts",
+    "check": "npm run test && npm run typecheck && npm run lint && npm run build",
     "preview": "vite preview"
   },
   "dependencies": {
     "@base-ui/react": "^1.6.0",
     "@fontsource-variable/geist": "^5.2.9",
     "@tailwindcss/vite": "^4",
-    "auth-mini": "^0.3.0",
+    "auth-mini": "0.3.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "^1.24.0",

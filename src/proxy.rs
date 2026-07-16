@@ -740,13 +740,12 @@ async fn relay_response(
     let mut stream = upstream.bytes_stream();
     let output = async_stream::stream! {
         let mut completion = completion;
-        let mut usage = Usage::default();
         let mut stream_failed = false;
         let mut pending = Vec::<u8>::new();
         while let Some(item) = stream.next().await {
             match item {
                 Ok(bytes) => {
-                    update_sse_usage(&mut pending, &bytes, &mut usage);
+                    completion.capture_sse(&mut pending, &bytes);
                     yield Ok::<Bytes, Infallible>(bytes);
                 }
                 Err(error) => {
@@ -756,7 +755,7 @@ async fn relay_response(
                 }
             }
         }
-        completion.finish(usage, stream_failed);
+        completion.finish(stream_failed);
         drop(lease);
     };
     build_response(status, headers, Body::from_stream(output))
@@ -848,6 +847,7 @@ struct StreamCompletion {
     permit: Option<mpsc::OwnedPermit<AuditEvent>>,
     event: Option<AuditEvent>,
     started: Instant,
+    usage: Usage,
 }
 
 impl StreamCompletion {
@@ -856,10 +856,15 @@ impl StreamCompletion {
             permit: Some(permit),
             event: Some(event),
             started,
+            usage: Usage::default(),
         }
     }
 
-    fn finish(&mut self, usage: Usage, failed: bool) {
+    fn capture_sse(&mut self, pending: &mut Vec<u8>, bytes: &[u8]) {
+        update_sse_usage(pending, bytes, &mut self.usage);
+    }
+
+    fn finish(&mut self, failed: bool) {
         let Some(mut event) = self.event.take() else {
             return;
         };
@@ -870,7 +875,7 @@ impl StreamCompletion {
             &mut event,
             status,
             model.as_deref(),
-            usage,
+            self.usage,
             error,
             self.started,
         );
@@ -889,7 +894,7 @@ impl Drop for StreamCompletion {
                 &mut event,
                 499,
                 model.as_deref(),
-                Usage::default(),
+                self.usage,
                 Some("client_cancelled"),
                 self.started,
             );
@@ -1183,6 +1188,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reads_usage_from_response_completed_sse_across_chunks() {
+        let event = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{",
+            "\"input_tokens\":11,\"output_tokens\":5,",
+            "\"input_tokens_details\":{\"cached_tokens\":7}}}}\n\n",
+        );
+        let mut pending = Vec::new();
+        let mut usage = Usage::default();
+
+        for chunk in event.as_bytes().chunks(17) {
+            update_sse_usage(&mut pending, chunk, &mut usage);
+        }
+
+        assert_eq!(
+            (usage.input_tokens, usage.cached_tokens, usage.output_tokens),
+            (11, 7, 5)
+        );
+    }
+
     #[tokio::test]
     async fn audit_persists_usage_without_request_body() {
         let state = crate::test_state("http://token.invalid").await;
@@ -1222,6 +1247,48 @@ mod tests {
         let row: (i64, i64, i64, i64) = sqlx::query_as("SELECT input_tokens,output_tokens,cached_tokens,COUNT(*) FROM api_calls WHERE request_id='request-1'")
             .fetch_one(&state.db).await.unwrap();
         assert_eq!(row, (12, 4, 3, 1));
+    }
+
+    #[tokio::test]
+    async fn stream_cancellation_preserves_captured_usage() {
+        let state = crate::test_state("http://token.invalid").await;
+        seed_proxy(&state, false).await;
+        let identity = ApiIdentity {
+            key_id: "key-1".to_owned(),
+            user_id: "user-1".to_owned(),
+        };
+        let mut audit = AuditTracker::begin(
+            &state,
+            &identity,
+            "cancelled-stream",
+            &Method::POST,
+            "/v1/responses",
+            "127.0.0.1",
+        )
+        .await
+        .unwrap();
+        let mut completion = audit.take_stream(StatusCode::OK, Some("gpt-5.5"));
+        let mut pending = Vec::new();
+        completion.capture_sse(
+            &mut pending,
+            concat!(
+                "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{",
+                "\"input_tokens\":11,\"output_tokens\":5,",
+                "\"input_tokens_details\":{\"cached_tokens\":7}}}}\n\n",
+            )
+            .as_bytes(),
+        );
+
+        drop(completion);
+        wait_for_audits(&state, 1).await;
+
+        let row: (i64, i64, i64, i64, String) = sqlx::query_as(
+            "SELECT input_tokens,cached_tokens,output_tokens,status,error FROM api_calls WHERE request_id='cancelled-stream'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(row, (11, 7, 5, 499, "client_cancelled".to_owned()));
     }
 
     #[tokio::test]

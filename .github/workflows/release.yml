@@ -5,8 +5,7 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -67,6 +66,8 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -81,8 +82,15 @@ jobs:
   deploy:
     needs: publish
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v7
+      - name: Verify deploy scripts
+        run: |
+          bash -n .github/scripts/send-deploy.sh deploy/deploy-release.sh .github/scripts/test-send-deploy.sh
+          .github/scripts/test-send-deploy.sh
       - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
@@ -90,4 +98,5 @@ jobs:
       - name: Deploy release through AWS Systems Manager
         env:
           EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: .github/scripts/send-deploy.sh "$EC2_INSTANCE_ID" "$GITHUB_REF_NAME"

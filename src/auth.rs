@@ -230,12 +230,20 @@ pub async fn api_identity(state: &AppState, headers: &HeaderMap) -> Result<ApiId
     if !secret.starts_with("sk-") {
         return Err(AppError::unauthorized("invalid API key"));
     }
-    let row =
-        sqlx::query("SELECT id,user_id FROM api_keys WHERE secret_hash=? AND revoked_at IS NULL")
+    let row = sqlx::query(
+        "SELECT k.id,k.user_id,u.role,u.channel_access FROM api_keys k JOIN users u ON u.id=k.user_id WHERE k.secret_hash=? AND k.revoked_at IS NULL",
+    )
             .bind(api_key_hash(secret))
             .fetch_optional(&state.db)
             .await?
             .ok_or_else(|| AppError::unauthorized("invalid API key"))?;
+    let role: String = row.get(2);
+    let channel_access = row.get::<i64, _>(3) != 0;
+    if role == "user" && !channel_access {
+        return Err(AppError::forbidden(
+            "channel access is not enabled for this user",
+        ));
+    }
     let identity = ApiIdentity {
         key_id: row.get(0),
         user_id: row.get(1),
@@ -284,11 +292,13 @@ mod tests {
     async fn api_key_auth_accepts_active_hash_and_rejects_revoked_key() {
         let state = crate::test_state("http://token.invalid").await;
         let now = chrono::Utc::now().timestamp();
-        sqlx::query("INSERT INTO users(id,role,created_at) VALUES('user-1','user',?)")
-            .bind(now)
-            .execute(&state.db)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO users(id,role,channel_access,created_at) VALUES('user-1','user',1,?)",
+        )
+        .bind(now)
+        .execute(&state.db)
+        .await
+        .unwrap();
         sqlx::query("INSERT INTO api_keys(id,user_id,name,prefix,secret_hash,created_at) VALUES('key-1','user-1','test','sk-test',?,?)")
             .bind(api_key_hash("sk-test-secret")).bind(now).execute(&state.db).await.unwrap();
         let mut headers = HeaderMap::new();
@@ -307,6 +317,51 @@ mod tests {
             .await
             .unwrap();
         assert!(api_identity(&state, &headers).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn tenant_api_keys_require_an_explicit_channel_grant_but_administrators_bypass_it() {
+        let state = crate::test_state("http://token.invalid").await;
+        let now = chrono::Utc::now().timestamp();
+        for (id, role, secret) in [
+            ("tenant", "user", "sk-tenant-secret"),
+            ("admin", "admin", "sk-admin-secret"),
+        ] {
+            sqlx::query("INSERT INTO users(id,role,created_at) VALUES(?,?,?)")
+                .bind(id)
+                .bind(role)
+                .bind(now)
+                .execute(&state.db)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO api_keys(id,user_id,name,prefix,secret_hash,created_at) VALUES(?,?,?,?,?,?)")
+                .bind(format!("key-{id}"))
+                .bind(id)
+                .bind("test")
+                .bind("sk-test")
+                .bind(api_key_hash(secret))
+                .bind(now)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+        let mut tenant_headers = HeaderMap::new();
+        tenant_headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-tenant-secret"),
+        );
+        assert!(api_identity(&state, &tenant_headers).await.is_err());
+        sqlx::query("UPDATE users SET channel_access=1 WHERE id='tenant'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        assert!(api_identity(&state, &tenant_headers).await.is_ok());
+        let mut admin_headers = HeaderMap::new();
+        admin_headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-admin-secret"),
+        );
+        assert!(api_identity(&state, &admin_headers).await.is_ok());
     }
 
     fn claims(sub: &str) -> Claims {

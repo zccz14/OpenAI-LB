@@ -895,9 +895,9 @@ pub async fn list_users(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     let root = browser_identity(&state, &headers).await?;
-    require_root(&root)?;
+    require_admin(&root)?;
     let rows = sqlx::query(
-        "SELECT id,email,display_name,role,created_at FROM users ORDER BY created_at,id",
+        "SELECT id,email,display_name,role,channel_access,created_at FROM users ORDER BY created_at,id",
     )
     .fetch_all(&state.db)
     .await?;
@@ -909,7 +909,8 @@ pub async fn list_users(
                     "email":row.get::<Option<String>,_>(1),
                     "display_name":row.get::<Option<String>,_>(2),
                     "role":row.get::<String,_>(3),
-                    "created_at":row.get::<i64,_>(4)
+                    "channel_access":row.get::<i64,_>(4) != 0,
+                    "created_at":row.get::<i64,_>(5)
                 })
             })
             .collect(),
@@ -917,40 +918,69 @@ pub async fn list_users(
 }
 
 #[derive(Deserialize)]
-pub struct UpdateUserRole {
-    role: String,
+pub struct UpdateUser {
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    channel_access: Option<bool>,
 }
 
-pub async fn update_user_role(
+pub async fn update_user(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Json(input): Json<UpdateUserRole>,
+    Json(input): Json<UpdateUser>,
 ) -> Result<Json<Value>, AppError> {
-    let root = browser_identity(&state, &headers).await?;
-    require_root(&root)?;
-    if !matches!(input.role.as_str(), "admin" | "user") {
-        return Err(AppError::bad_request("role must be admin or user"));
+    let admin = browser_identity(&state, &headers).await?;
+    require_admin(&admin)?;
+    if input.role.is_none() && input.channel_access.is_none() {
+        return Err(AppError::bad_request("role or channel_access is required"));
     }
-    let result = sqlx::query("UPDATE users SET role=? WHERE id=? AND role<>'root'")
-        .bind(&input.role)
-        .bind(&id)
-        .execute(&state.db)
+    if let Some(role) = input.role {
+        require_root(&admin)?;
+        if !matches!(role.as_str(), "admin" | "user") {
+            return Err(AppError::bad_request("role must be admin or user"));
+        }
+        let result = sqlx::query("UPDATE users SET role=? WHERE id=? AND role<>'root'")
+            .bind(role)
+            .bind(&id)
+            .execute(&state.db)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::not_found(
+                "user not found or root role is immutable",
+            ));
+        }
+        write_admin_audit(
+            &state,
+            &admin.id,
+            "user.role.update",
+            Some(&id),
+            &peer.ip().to_string(),
+        )
         .await?;
-    if result.rows_affected() == 0 {
-        return Err(AppError::not_found(
-            "user not found or root role is immutable",
-        ));
     }
-    write_admin_audit(
-        &state,
-        &root.id,
-        "user.role.update",
-        Some(&id),
-        &peer.ip().to_string(),
-    )
-    .await?;
+    if let Some(channel_access) = input.channel_access {
+        let result = sqlx::query("UPDATE users SET channel_access=? WHERE id=? AND role='user'")
+            .bind(channel_access)
+            .bind(&id)
+            .execute(&state.db)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::bad_request(
+                "channel access only applies to tenant users",
+            ));
+        }
+        write_admin_audit(
+            &state,
+            &admin.id,
+            "user.channel_access.update",
+            Some(&id),
+            &peer.ip().to_string(),
+        )
+        .await?;
+    }
     Ok(Json(json!({"ok":true})))
 }
 
@@ -1285,6 +1315,43 @@ mod tests {
         }
         sqlx::query("INSERT INTO api_keys(id,user_id,name,prefix,secret_hash,created_at) VALUES('history-key','root-user','history','sk-history','hash-history',?)")
             .bind(now).execute(&state.db).await.unwrap();
+
+        let admin_browser_token = setup_token(&signing, &issuer, "admin-user");
+        let users = channel_request(
+            &state,
+            Method::GET,
+            "/api/users",
+            &admin_browser_token,
+            None,
+        )
+        .await;
+        assert_eq!(users.status(), StatusCode::OK);
+        let users: Value =
+            serde_json::from_slice(&users.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(
+            users
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|user| user["id"] == "tenant-user")
+                .and_then(|user| user["channel_access"].as_bool()),
+            Some(false)
+        );
+        let grant = channel_request(
+            &state,
+            Method::PATCH,
+            "/api/users/tenant-user",
+            &admin_browser_token,
+            Some(json!({"channel_access":true})),
+        )
+        .await;
+        assert_eq!(grant.status(), StatusCode::OK);
+        let granted: i64 =
+            sqlx::query_scalar("SELECT channel_access FROM users WHERE id='tenant-user'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(granted, 1);
 
         for user_id in ["root-user", "admin-user"] {
             let channel_id = format!("channel-{user_id}");

@@ -2,9 +2,9 @@
 set -euo pipefail
 
 tag="${1:?release tag is required}"
-repository="zccz14/OpenAI-LB"
+archive_url="${2:?archive download URL is required}"
+checksum_url="${3:?checksum download URL is required}"
 archive="openai-lb-x86_64-unknown-linux-gnu.tar.gz"
-release_url="https://github.com/$repository/releases/download/$tag"
 release_dir="/opt/openai-lb/releases/$tag"
 temporary_dir="$(mktemp -d)"
 previous_release="$(readlink -f /opt/openai-lb/current 2>/dev/null || true)"
@@ -16,10 +16,10 @@ trap cleanup EXIT
 
 curl --fail --location --retry 5 --retry-all-errors \
   --output "$temporary_dir/$archive" \
-  "$release_url/$archive"
+  "$archive_url"
 curl --fail --location --retry 5 --retry-all-errors \
   --output "$temporary_dir/$archive.sha256" \
-  "$release_url/$archive.sha256"
+  "$checksum_url"
 
 cd "$temporary_dir"
 sha256sum --check "$archive.sha256"

@@ -1,5 +1,9 @@
 use anyhow::Result;
-use openai_lb::{AppState, config::Config, db, router};
+use openai_lb::{
+    AppState,
+    config::{BootstrapConfig, Config},
+    db, router,
+};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -10,10 +14,11 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| EnvFilter::new("openai_lb=info,tower_http=info")),
         )
         .init();
-    let config = Config::from_env()?;
-    let listen = config.listen;
-    let pool = db::connect(&config.database_url).await?;
-    let state = AppState::new(config, pool)?;
+    let bootstrap = BootstrapConfig::load()?;
+    let listen = bootstrap.listen;
+    let pool = db::connect(&bootstrap.database_path).await?;
+    let config = Config::load(bootstrap, &pool).await?;
+    let state = AppState::new(config, pool).await?;
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(%listen, "OpenAI-LB listening");
     axum::serve(

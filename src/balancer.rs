@@ -6,7 +6,8 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use dashmap::DashMap;
+use arc_swap::ArcSwap;
+use dashmap::{DashMap, DashSet};
 use reqwest::{StatusCode, header::HeaderMap};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -38,6 +39,27 @@ pub struct Channel {
 pub struct Balancer {
     inflight: Arc<DashMap<String, AtomicUsize>>,
     cursor: Arc<AtomicU64>,
+    channels: Arc<ArcSwap<Vec<Channel>>>,
+    affinities: Arc<DashMap<String, AffinityEntry>>,
+    dirty_affinities: Arc<DashSet<String>>,
+    channel_updates: Arc<DashMap<String, ChannelUpdate>>,
+}
+
+#[derive(Clone, PartialEq)]
+struct AffinityEntry {
+    channel_id: String,
+    expires_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Clone, PartialEq)]
+struct ChannelUpdate {
+    status: String,
+    cooldown_until: Option<i64>,
+    rate_limit_json: String,
+    last_error: Option<String>,
+    last_used_at: Option<i64>,
+    updated_at: i64,
 }
 
 pub struct Lease {
@@ -60,6 +82,10 @@ impl Default for Balancer {
         Self {
             inflight: Arc::new(DashMap::new()),
             cursor: Arc::new(AtomicU64::new(0)),
+            channels: Arc::new(ArcSwap::from_pointee(Vec::new())),
+            affinities: Arc::new(DashMap::new()),
+            dirty_affinities: Arc::new(DashSet::new()),
+            channel_updates: Arc::new(DashMap::new()),
         }
     }
 }
@@ -72,60 +98,52 @@ impl Balancer {
         excluded: Option<&str>,
     ) -> Result<Lease, AppError> {
         let now = chrono::Utc::now().timestamp();
-        sqlx::query("UPDATE channels SET status='active',cooldown_until=NULL,last_error=NULL,updated_at=? WHERE manual_disabled=0 AND status='cooldown' AND cooldown_until<=?")
-            .bind(now).bind(now).execute(&state.db).await?;
-        sqlx::query("DELETE FROM affinities WHERE expires_at<=?")
-            .bind(now)
-            .execute(&state.db)
-            .await?;
-        let channels = sqlx::query_as::<_, Channel>("SELECT * FROM channels WHERE manual_disabled=0 AND status='active' AND (cooldown_until IS NULL OR cooldown_until<=?) ORDER BY created_at,id")
-            .bind(now).fetch_all(&state.db).await?;
+        let channels = self.channels.load();
         let eligible: Vec<Channel> = channels
-            .into_iter()
+            .iter()
+            .filter(|item| channel_is_available(item, now))
             .filter(|item| excluded != Some(item.id.as_str()))
+            .cloned()
             .collect();
         if eligible.is_empty() {
             return Err(AppError::unavailable("no available CodeX channel"));
         }
         let chosen = match affinity {
-            Some(key) => self.affinity_channel(state, key, &eligible, now).await?,
+            Some(key) => self.affinity_channel(key, &eligible, now),
             None => None,
         }
         .unwrap_or_else(|| self.least_inflight(&eligible));
         if let Some(key) = affinity {
-            persist_affinity(state, key, &chosen.id, now).await?;
+            self.remember_affinity(
+                key,
+                &chosen.id,
+                now,
+                state.config.load().affinity_ttl_seconds,
+            );
         }
         self.inflight
             .entry(chosen.id.clone())
             .or_default()
             .fetch_add(1, Ordering::Relaxed);
         Ok(Lease {
-            access_token: decrypt(&state.config.encryption_key, &chosen.access_enc)?,
-            refresh_token: decrypt(&state.config.encryption_key, &chosen.refresh_enc)?,
+            access_token: decrypt(&state.config.load().encryption_key, &chosen.access_enc)?,
+            refresh_token: decrypt(&state.config.load().encryption_key, &chosen.refresh_enc)?,
             channel: chosen,
             inflight: self.inflight.clone(),
         })
     }
 
-    async fn affinity_channel(
-        &self,
-        state: &AppState,
-        key: &str,
-        eligible: &[Channel],
-        now: i64,
-    ) -> Result<Option<Channel>, AppError> {
+    fn affinity_channel(&self, key: &str, eligible: &[Channel], now: i64) -> Option<Channel> {
         let hash = affinity_hash(key);
-        let row =
-            sqlx::query("SELECT channel_id FROM affinities WHERE affinity_hash=? AND expires_at>?")
-                .bind(hash)
-                .bind(now)
-                .fetch_optional(&state.db)
-                .await?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let id: String = row.get(0);
-        Ok(eligible.iter().find(|channel| channel.id == id).cloned())
+        let entry = self.affinities.get(&hash)?;
+        (entry.expires_at > now)
+            .then(|| {
+                eligible
+                    .iter()
+                    .find(|channel| channel.id == entry.channel_id)
+                    .cloned()
+            })
+            .flatten()
     }
 
     fn least_inflight(&self, channels: &[Channel]) -> Channel {
@@ -151,17 +169,163 @@ impl Balancer {
             .map(|value| value.load(Ordering::Relaxed))
             .unwrap_or_default()
     }
+
+    fn remember_affinity(&self, key: &str, channel_id: &str, now: i64, ttl: i64) {
+        let hash = affinity_hash(key);
+        self.affinities.insert(
+            hash.clone(),
+            AffinityEntry {
+                channel_id: channel_id.to_owned(),
+                expires_at: now + ttl,
+                updated_at: now,
+            },
+        );
+        self.dirty_affinities.insert(hash);
+    }
+
+    pub async fn hydrate(&self, pool: &sqlx::SqlitePool) -> Result<(), AppError> {
+        self.reload_channels(pool).await?;
+        let now = chrono::Utc::now().timestamp();
+        let rows = sqlx::query("SELECT affinity_hash,channel_id,expires_at,updated_at FROM affinities WHERE expires_at>?")
+            .bind(now)
+            .fetch_all(pool)
+            .await?;
+        self.affinities.clear();
+        for row in rows {
+            self.affinities.insert(
+                row.get(0),
+                AffinityEntry {
+                    channel_id: row.get(1),
+                    expires_at: row.get(2),
+                    updated_at: row.get(3),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn reload_channels(&self, pool: &sqlx::SqlitePool) -> Result<(), AppError> {
+        let channels =
+            sqlx::query_as::<_, Channel>("SELECT * FROM channels ORDER BY created_at,id")
+                .fetch_all(pool)
+                .await?;
+        self.channels.store(Arc::new(channels));
+        Ok(())
+    }
+
+    pub fn start_maintenance(&self, pool: sqlx::SqlitePool) {
+        let balancer = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                if let Err(error) = balancer.maintain(&pool).await {
+                    tracing::error!(%error, "channel maintenance failed");
+                }
+            }
+        });
+    }
+
+    async fn maintain(&self, pool: &sqlx::SqlitePool) -> Result<(), AppError> {
+        let now = chrono::Utc::now().timestamp();
+        let updates = self
+            .channel_updates
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect::<Vec<_>>();
+        let affinities = self
+            .dirty_affinities
+            .iter()
+            .filter_map(|hash| {
+                self.affinities
+                    .get(hash.key())
+                    .map(|entry| (hash.key().clone(), entry.clone()))
+            })
+            .collect::<Vec<_>>();
+        let mut transaction = pool.begin().await?;
+        for (id, update) in &updates {
+            sqlx::query("UPDATE channels SET status=CASE WHEN manual_disabled=1 THEN 'disabled' ELSE ? END,cooldown_until=CASE WHEN manual_disabled=1 THEN NULL ELSE ? END,rate_limit_json=?,last_error=?,last_used_at=COALESCE(?,last_used_at),updated_at=? WHERE id=?")
+                .bind(&update.status).bind(update.cooldown_until).bind(&update.rate_limit_json)
+                .bind(&update.last_error).bind(update.last_used_at).bind(update.updated_at).bind(id)
+                .execute(&mut *transaction).await?;
+        }
+        for (hash, entry) in &affinities {
+            sqlx::query("INSERT INTO affinities(affinity_hash,channel_id,expires_at,updated_at) VALUES(?,?,?,?) ON CONFLICT(affinity_hash) DO UPDATE SET channel_id=excluded.channel_id,expires_at=excluded.expires_at,updated_at=excluded.updated_at")
+                .bind(hash).bind(&entry.channel_id).bind(entry.expires_at).bind(entry.updated_at)
+                .execute(&mut *transaction).await?;
+        }
+        sqlx::query("UPDATE channels SET status='active',cooldown_until=NULL,last_error=NULL,updated_at=? WHERE manual_disabled=0 AND status='cooldown' AND cooldown_until<=?")
+            .bind(now).bind(now).execute(&mut *transaction).await?;
+        sqlx::query("DELETE FROM affinities WHERE expires_at<=?")
+            .bind(now)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        for (id, update) in updates {
+            if self
+                .channel_updates
+                .get(&id)
+                .is_some_and(|current| *current == update)
+            {
+                self.channel_updates.remove(&id);
+            }
+        }
+        for (hash, entry) in affinities {
+            if self
+                .affinities
+                .get(&hash)
+                .is_some_and(|current| *current == entry)
+            {
+                self.dirty_affinities.remove(&hash);
+            }
+        }
+        self.affinities.retain(|_, entry| entry.expires_at > now);
+        self.recover_cached_channels(now);
+        Ok(())
+    }
+
+    fn recover_cached_channels(&self, now: i64) {
+        let mut channels = (**self.channels.load()).clone();
+        for channel in &mut channels {
+            if channel.manual_disabled == 0
+                && channel.status == "cooldown"
+                && channel.cooldown_until.is_some_and(|until| until <= now)
+            {
+                channel.status = "active".to_owned();
+                channel.cooldown_until = None;
+                channel.last_error = None;
+                channel.updated_at = now;
+            }
+        }
+        self.channels.store(Arc::new(channels));
+    }
+
+    fn observe(&self, channel_id: &str, update: ChannelUpdate) {
+        let mut channels = (**self.channels.load()).clone();
+        if let Some(channel) = channels.iter_mut().find(|channel| channel.id == channel_id) {
+            channel.status = if channel.manual_disabled == 1 {
+                "disabled".to_owned()
+            } else {
+                update.status.clone()
+            };
+            channel.cooldown_until = (channel.manual_disabled == 0)
+                .then_some(update.cooldown_until)
+                .flatten();
+            channel.rate_limit_json = Some(update.rate_limit_json.clone());
+            channel.last_error = update.last_error.clone();
+            channel.last_used_at = update.last_used_at.or(channel.last_used_at);
+            channel.updated_at = update.updated_at;
+        }
+        self.channels.store(Arc::new(channels));
+        self.channel_updates.insert(channel_id.to_owned(), update);
+    }
 }
 
-async fn persist_affinity(
-    state: &AppState,
-    key: &str,
-    channel_id: &str,
-    now: i64,
-) -> Result<(), AppError> {
-    sqlx::query("INSERT INTO affinities(affinity_hash,channel_id,expires_at,updated_at) VALUES(?,?,?,?) ON CONFLICT(affinity_hash) DO UPDATE SET channel_id=excluded.channel_id,expires_at=excluded.expires_at,updated_at=excluded.updated_at")
-        .bind(affinity_hash(key)).bind(channel_id).bind(now + state.config.affinity_ttl_seconds).bind(now).execute(&state.db).await?;
-    Ok(())
+fn channel_is_available(channel: &Channel, now: i64) -> bool {
+    channel.manual_disabled == 0
+        && (channel.status == "active"
+            || (channel.status == "cooldown"
+                && channel.cooldown_until.is_some_and(|until| until <= now)))
 }
 
 pub fn affinity_hash(key: &str) -> String {
@@ -189,28 +353,36 @@ pub async fn track_response(
         })
         .collect::<serde_json::Map<String, serde_json::Value>>();
     let rate_json = serde_json::Value::Object(tracked).to_string();
-    match status.as_u16() {
-        401 | 403 => {
-            sqlx::query("UPDATE channels SET status='auth_error',last_error=?,rate_limit_json=?,updated_at=? WHERE id=?")
-            .bind(format!("upstream HTTP {}", status.as_u16())).bind(rate_json).bind(now).bind(channel_id).execute(&state.db).await?;
-        }
+    let update = match status.as_u16() {
+        401 | 403 => ChannelUpdate {
+            status: "auth_error".to_owned(),
+            cooldown_until: None,
+            rate_limit_json: rate_json,
+            last_error: Some(format!("upstream HTTP {}", status.as_u16())),
+            last_used_at: Some(now),
+            updated_at: now,
+        },
         429 => {
             let cooldown = cooldown_until(headers, now);
-            sqlx::query("UPDATE channels SET status='cooldown',cooldown_until=?,last_error='rate limited',rate_limit_json=?,updated_at=? WHERE id=? AND manual_disabled=0")
-                .bind(cooldown).bind(rate_json).bind(now).bind(channel_id).execute(&state.db).await?;
+            ChannelUpdate {
+                status: "cooldown".to_owned(),
+                cooldown_until: Some(cooldown),
+                rate_limit_json: rate_json,
+                last_error: Some("rate limited".to_owned()),
+                last_used_at: Some(now),
+                updated_at: now,
+            }
         }
-        _ => {
-            sqlx::query(
-                "UPDATE channels SET rate_limit_json=?,last_used_at=?,updated_at=? WHERE id=?",
-            )
-            .bind(rate_json)
-            .bind(now)
-            .bind(now)
-            .bind(channel_id)
-            .execute(&state.db)
-            .await?;
-        }
+        _ => ChannelUpdate {
+            status: "active".to_owned(),
+            cooldown_until: None,
+            rate_limit_json: rate_json,
+            last_error: None,
+            last_used_at: Some(now),
+            updated_at: now,
+        },
     };
+    state.balancer.observe(channel_id, update);
     Ok(())
 }
 
@@ -279,10 +451,11 @@ mod tests {
         for (id, created) in [("channel-a", now), ("channel-b", now + 1)] {
             sqlx::query("INSERT INTO channels(id,name,account_id,access_enc,refresh_enc,status,created_at,updated_at) VALUES(?,?,?,?,?,'active',?,?)")
                 .bind(id).bind(id).bind(format!("account-{id}"))
-                .bind(crate::crypto::encrypt(&state.config.encryption_key, "access").unwrap())
-                .bind(crate::crypto::encrypt(&state.config.encryption_key, "refresh").unwrap())
+                .bind(crate::crypto::encrypt(&state.config.load().encryption_key, "access").unwrap())
+                .bind(crate::crypto::encrypt(&state.config.load().encryption_key, "refresh").unwrap())
                 .bind(created).bind(created).execute(&state.db).await.unwrap();
         }
+        state.balancer.reload_channels(&state.db).await.unwrap();
         let first = state
             .balancer
             .select(&state, Some("session-1"), None)
@@ -303,6 +476,7 @@ mod tests {
             .execute(&state.db)
             .await
             .unwrap();
+        state.balancer.reload_channels(&state.db).await.unwrap();
         let reallocated = state
             .balancer
             .select(&state, Some("session-1"), None)

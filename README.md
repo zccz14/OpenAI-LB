@@ -1,110 +1,50 @@
 # OpenAI-LB
 
-OpenAI-LB 是面向 CodeX OAuth 的多租户反向代理与负载均衡器。它只实现 OpenAI / CodeX 能力，不提供 Claude、Gemini 等其他厂商协议兼容。服务以 Rust、Axum、Tokio 和 SQLite 构建，React + shadcn/ui 控制台会嵌入同一个 release binary。
+OpenAI-LB 是一个面向 OpenAI / CodeX OAuth 渠道的反向代理和负载均衡器。它以单个 Rust 可执行文件交付，内嵌 React + shadcn 管理界面，并使用 SQLite 保存配置、权限、渠道、API Key、用量和逐调用审计。
 
-## 能力边界
+项目只处理 OpenAI / CodeX 能力，包括 Responses、Compact、图像生成、音频转写和模型列表。它不提供其他 AI 厂商的协议兼容层。
 
-- 管理员可直接导入多组 `access_key` / `refresh_key`，或通过 PKCE OAuth 注册渠道；服务从 access JWT 解析 `chatgpt_account_id` 并在到期前刷新凭据。
-- Auth Mini 提供浏览器登录和刷新；Rust 根据 issuer 与 `/jwks` 在本地验证 EdDSA access JWT。配置 `ADMIN_USER_ID` 时仅该用户成为管理员；未配置时，首位用户通过 SQLite 原子事务成为管理员。
-- 租户 API Key 使用 `sk-` 前缀，只在创建响应中返回一次；SQLite 只保存 SHA-256 哈希。
-- 支持 `/v1/responses`、`/v1/responses/compact`、对应的 `/backend-api/codex/...` 路径、`/v1/audio/transcriptions`、`/v1/images/generations` 和 `/v1/models`。
-- Responses 和 SSE 响应按字节转发；音频 multipart 原样发往 CodeX `/transcribe`；图像请求转换为 Responses `image_generation` 工具并还原为 OpenAI Images envelope。
-- API Key 验证成功后立即创建 pending 调用记录，并在无渠道、刷新/网络失败、上游响应、SSE 完成或客户端取消时结算；记录 request ID、租户、API Key、渠道、真实 HTTP method、路径、模型、状态、延迟、IP、错误及 Token，不记录 prompt、Authorization 或 OAuth 凭据。渠道与 OAuth 管理操作另写管理员审计。
+## 直接运行
 
-当前未实现 `/v1/chat/completions`、其他厂商兼容接口、图像 edits 或实时 WebSocket。调用方应使用 OpenAI Responses API。
+从 [GitHub Releases](https://github.com/zccz14/OpenAI-LB/releases) 下载当前平台的压缩包并校验同名 `.sha256` 文件，然后运行：
 
-## 架构
-
-```text
-浏览器 ── Auth Mini SDK ── Auth Mini
-   │ access JWT                │ /jwks
-   └──────────┬────────────────┘
-              ▼
-       Axum 管理 API ── SQLite（用户、Key、渠道、亲和、审计）
-              │
-客户端 ─ sk- API Key ─► 代理入口 ─► 亲和 / least-inflight 调度
-                                      │
-                                      ├─ Responses / compact
-                                      ├─ /transcribe
-                                      └─ image_generation 转换
-                                              │
-                                              ▼
-                                     CodeX OAuth 渠道池
+```bash
+./openai-lb
 ```
 
-调度先检查 `x-lb-affinity-key`，再检查 `session_id` / `x-session-id`，最后检查请求中的 `session_id`、`previous_response_id` 或 `prompt_cache_key`。映射以 SHA-256 键持久化并带 TTL。无有效亲和时，在可用渠道中选择 inflight 最少者，同压渠道使用轮询打破平局。
+服务监听 `0.0.0.0:8080`。首次启动会自动完成以下本地准备：
 
-上游 `429` 会读取 `Retry-After` 或 `x-ratelimit-reset*`，将渠道置为 cooldown；到期后查询路径自动恢复。`401/403` 标记为 `auth_error`，需要管理员刷新凭据。手工禁用不会自动恢复。上游在响应尚未下发前返回 `401/403/429/5xx` 时，最多更换一次渠道；开始向客户端传输后不重试。
+- 创建 `~/.openai-lb/`。
+- 创建 `~/.openai-lb/openai-lb.sqlite3` 并执行版本化迁移。
+- 创建 `~/.openai-lb/master.key`；Unix 权限固定为 `0600`。
+- 提供 Setup API 和 Setup GUI。
 
-## 配置
+打开 `http://localhost:8080`，填写品牌提供的 Auth Mini issuer，使用该 Auth Mini 实例登录，再将当前用户绑定为唯一 `root`。Setup 完成后初始化入口立即关闭。
 
-复制 [`.env.example`](./.env.example) 并设置以下必填值：
+OpenAI-LB 连接现有的品牌 Auth Mini 实例。用户不需要为 OpenAI-LB 部署 Auth Mini。前端使用 `auth-mini` SDK，后端通过 issuer 的 `/jwks` 验证 Ed25519 JWT，并使用 `user_id` 关联本地 `root / admin / user` 权限。
 
-| 变量 | 说明 |
+## 产品能力
+
+- 注册多组 CodeX OAuth `access_key` / `refresh_key`，支持 PKCE OAuth 和自动刷新。
+- 以 API Key 为租户调用凭据，密钥只显示一次，数据库只保存 SHA-256 哈希。
+- 按 API Key 汇总请求、Token、缓存 Token、错误和延迟。
+- 每次代理调用保留请求 ID、用户、API Key、渠道、接口、模型、状态、耗时和用量。
+- 支持显式亲和键、会话头和 Responses 会话字段；亲和键在持久化前进行 SHA-256 哈希。
+- 跟踪 `Retry-After` 与 `x-ratelimit-*`，对 429 渠道自动冷却并在到期后恢复。
+- 对 401/403 渠道标记认证错误；手工禁用渠道不会自动恢复。
+- Responses、SSE、音频上传和二进制响应保持流式传输。
+
+权限边界：
+
+| 角色 | 权限 |
 | --- | --- |
-| `ENCRYPTION_KEY` | 32 字节 base64，使用 `openssl rand -base64 32` 生成；AES-256-GCM 加密 OAuth 凭据 |
-| `AUTH_MINI_ISSUER` | Auth Mini 对外 issuer，必须与其 `--issuer` 完全一致 |
-| `DATABASE_URL` | 默认 `sqlite://openai-lb.sqlite?mode=rwc` |
-| `ADMIN_USER_ID` | 设置后仅匹配用户是管理员；留空时首位用户成为管理员 |
-| `CORS_ALLOWED_ORIGINS` | 逗号分隔的控制台来源，不要在生产环境使用通配符 |
-| `CODEX_UPSTREAM_BASE` | 可替换为测试服务器；默认 `https://chatgpt.com/backend-api/codex` |
+| `root` | 系统配置、用户角色、渠道、全局审计与个人 API Key |
+| `admin` | 渠道、全局审计与个人 API Key |
+| `user` | 个人 API Key、个人用量与个人审计 |
 
-OAuth redirect URI 默认采用 CodeX CLI 的 `http://localhost:1455/auth/callback`。管理员完成浏览器授权后，可从回调地址复制 `code` 到控制台。生产环境若使用自有回调接收器，应同步设置 `CODEX_OAUTH_REDIRECT_URI`。
+## 调用示例
 
-## 部署 Auth Mini
-
-在 Auth Mini 项目或已安装的 CLI 中创建实例并允许控制台来源：
-
-```bash
-npx auth-mini create ./auth-mini.sqlite
-npx auth-mini origin add ./auth-mini.sqlite --value https://lb.example.com
-npx auth-mini start ./auth-mini.sqlite --issuer https://auth.example.com
-```
-
-将 `AUTH_MINI_ISSUER=https://auth.example.com` 配置到 OpenAI-LB。浏览器直接使用 `auth-mini/sdk/browser` 完成邮箱 OTP、Passkey、跨标签页会话恢复和 refresh token 轮换。refresh token 只在浏览器与 Auth Mini 之间流动，不发送给 OpenAI-LB。
-
-## 本地开发
-
-要求 Rust 1.93+、Node.js 24+ 和 npm。
-
-```bash
-cp .env.example .env
-# 填写 ENCRYPTION_KEY 与 AUTH_MINI_ISSUER，然后加载环境变量
-set -a; source .env; set +a
-
-cd web
-npm ci
-npm run dev
-```
-
-另开终端启动后端。开发时 Vite 请求可通过 `web/vite.config.ts` 配置的代理访问 `8080`；也可以先执行 `npm run build`，直接从 Rust 服务访问内嵌页面。
-
-```bash
-cargo run
-```
-
-## 构建与运行单一 Binary
-
-`build.rs` 会在 Cargo 构建时运行前端生产构建。首次构建先安装锁定的 npm 依赖：
-
-```bash
-cd web && npm ci && cd ..
-cargo build --release --locked
-./target/release/openai-lb
-```
-
-最终部署只需要 `target/release/openai-lb`、环境变量和 SQLite 文件所在的可写目录。也可使用容器：
-
-```bash
-docker build -t openai-lb .
-docker run --rm -p 8080:8080 -v "$PWD/data:/data" --env-file .env openai-lb
-```
-
-SQLite 已启用 WAL、foreign keys 和 busy timeout。备份时同时处理 `.sqlite`、`.sqlite-wal` 与 `.sqlite-shm`，或在停写后执行 SQLite online backup。不要只复制正在写入的主文件。
-
-## API 示例
-
-创建 Key 必须在控制台登录后完成；以下 `sk-...` 是租户调用凭据。
+在管理界面创建 API Key 后调用代理：
 
 ```bash
 curl http://localhost:8080/v1/responses \
@@ -125,8 +65,39 @@ curl http://localhost:8080/v1/audio/transcriptions \
 curl http://localhost:8080/v1/images/generations \
   -H 'Authorization: Bearer sk-REPLACE_ME' \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-image-1.5","prompt":"A precise exploded diagram of a mechanical keyboard","size":"1024x1024"}'
+  -d '{"model":"gpt-image-1.5","prompt":"A precise exploded diagram","size":"1024x1024"}'
 ```
+
+## 数据与并发模型
+
+SQLite 为单实例数据层。连接池中的每条连接统一启用 WAL、foreign keys、5 秒 busy timeout 和 `synchronous=NORMAL`，连接池上限为 4。
+
+代理热路径使用内存渠道快照和亲和映射。渠道 Rate Limit 观测、亲和持久化、过期清理和 cooldown 恢复由后台任务批量提交。逐调用审计进入容量为 4096 的有界队列，由单 writer 以最多 128 条的事务写入；客户端取消仍结算为 HTTP 499。
+
+音频 multipart 不会整体读入内存。请求体从 Axum `Body` 直接流入 Reqwest；因为流式请求体无法安全重放，音频上传开始后不执行跨渠道重试。Responses 和图像使用独立的小型 JSON 请求限制。
+
+## 本地开发
+
+要求 Rust 1.93、Node.js 24 和 npm。
+
+```bash
+cd web
+npm ci
+npm run build
+cd ..
+cargo run
+```
+
+开发前端时运行 `npm run dev`；Vite 会把 API 请求代理到 `http://localhost:8080`。
+
+生产构建先生成一次 `web/dist`，Rust 只负责嵌入已有静态资源：
+
+```bash
+cd web && npm ci && npm run check && cd ..
+cargo build --release --locked
+```
+
+`build.rs` 不启动 npm，因此 Rust 构建环境不需要 Node。GitHub Release 工作流先构建一次前端，再复用相同产物生成各平台二进制。
 
 ## 验证
 
@@ -134,14 +105,19 @@ curl http://localhost:8080/v1/images/generations \
 cd web && npm run check && cd ..
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
-cargo build --release --locked
+cargo test --all-targets --all-features --locked
 ```
 
-## 安全边界
+Pull Request 工作流还会运行 RustSec 依赖审计。
 
-- `ENCRYPTION_KEY` 不进入数据库或 binary；丢失后现有 OAuth 凭据无法恢复。当前版本不提供在线密钥轮换，轮换前应重新导入渠道。
-- 入站 `Authorization` 和 hop-by-hop headers 不会发送给上游；上游只收到所选渠道的 OAuth access token。
-- 审计错误会保留上游错误消息，但不会保存请求正文。仍应限制日志与 SQLite 的读取权限。
-- SQLite 适合单实例部署。不要让多个主机通过网络文件系统同时写同一个数据库；横向扩展前需要迁移到具备分布式并发语义的数据层。
-- API Key 是高熵 bearer secret。SHA-256 哈希用于数据库泄漏隔离，不替代客户端密钥保护、TLS、最小权限与定期吊销。
+## 安全说明
+
+- `master.key` 不进入 SQLite 或可执行文件。丢失该文件后，现有 OAuth 凭据无法解密。
+- 入站 `Authorization`、Cookie、hop-by-hop headers 和代理专用亲和头不会转发到上游。
+- 审计不保存 prompt、请求正文、API Key 或 OAuth 凭据。
+- SQLite 文件和 `master.key` 应位于本机磁盘；不要让多个实例通过网络文件系统同时写入同一数据库。
+- 生产部署应在 OpenAI-LB 前提供 TLS，并限制数据目录的系统账户访问权限。
+
+## License
+
+[MIT](./LICENSE)

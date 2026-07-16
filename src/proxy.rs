@@ -49,6 +49,7 @@ const PROXY_ONLY_HEADERS: &[&str] = &[
 struct CallContext {
     request_id: String,
     model: Option<String>,
+    stream: bool,
 }
 
 struct AuditTracker {
@@ -305,6 +306,11 @@ async fn dispatch(
         .and_then(|value| value.get("model"))
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let stream = parsed
+        .as_ref()
+        .and_then(|value| value.get("stream"))
+        .and_then(Value::as_bool)
+        .unwrap_or_default();
     let affinity =
         affinity_key(headers, parsed.as_ref()).map(|key| format!("{}:{key}", identity.key_id));
     let mut payload = transform_request(path, parsed, &state)?;
@@ -331,7 +337,11 @@ async fn dispatch(
             Ok(mut second) => {
                 if refresh_if_needed(&state, &mut second).await.is_err() {
                     return relay_response(
-                        CallContext { request_id, model },
+                        CallContext {
+                            request_id,
+                            model,
+                            stream,
+                        },
                         first,
                         response,
                         audit,
@@ -361,10 +371,18 @@ async fn dispatch(
         (first, response)
     };
     if path == "/v1/images/generations" {
-        let context = CallContext { request_id, model };
+        let context = CallContext {
+            request_id,
+            model,
+            stream,
+        };
         return image_response(context, lease, upstream, audit).await;
     }
-    let context = CallContext { request_id, model };
+    let context = CallContext {
+        request_id,
+        model,
+        stream,
+    };
     relay_response(context, lease, upstream, audit).await
 }
 
@@ -400,6 +418,7 @@ async fn dispatch_audio(
         CallContext {
             request_id,
             model: None,
+            stream: false,
         },
         lease,
         upstream,
@@ -699,11 +718,11 @@ fn should_forward_request_header(path: &str, name: &HeaderName) -> bool {
     {
         return false;
     }
-    let common = matches!(lower.as_str(), "accept" | "content-type" | "user-agent")
+    let common = matches!(lower.as_str(), "accept" | "user-agent")
         || lower.starts_with("x-openai-")
         || lower.starts_with("x-codex-");
     if path == "/v1/audio/transcriptions" {
-        return common;
+        return common || lower == "content-type";
     }
     common || lower.starts_with("openai-")
 }
@@ -720,11 +739,7 @@ async fn relay_response(
 ) -> Result<Response, AppError> {
     let status = upstream.status();
     let headers = filtered_response_headers(upstream.headers());
-    let is_stream = upstream
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.starts_with("text/event-stream"));
+    let is_stream = context.stream && status.is_success();
     if !is_stream {
         let bytes = upstream.bytes().await?;
         let usage = usage_from_bytes(&bytes);
@@ -1088,6 +1103,25 @@ mod tests {
                 .body(Body::from(events))
                 .unwrap();
         }
+        let stream = serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|value| value.get("stream").and_then(Value::as_bool))
+            .unwrap_or_default();
+        if stream {
+            let events = concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"usage\":null},\"sequence_number\":1}\n\n",
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.5\",\"usage\":{",
+                "\"input_tokens\":19,\"input_tokens_details\":{\"cache_write_tokens\":0,\"cached_tokens\":0},",
+                "\"output_tokens\":6,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":25}},",
+                "\"sequence_number\":9}\n\n",
+            );
+            return Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::from(events))
+                .unwrap();
+        }
         Json(json!({"id":"resp","usage":{"input_tokens":1,"output_tokens":2}})).into_response()
     }
 
@@ -1292,6 +1326,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn requested_stream_audits_real_sse_without_content_type() {
+        let (upstream, _) = spawn_mock(StatusCode::OK).await;
+        let state = crate::test_state_with_upstream("http://token.invalid", &upstream).await;
+        seed_proxy(&state, true).await;
+        let response = crate::router(state.clone())
+            .oneshot(proxy_request(
+                "/v1/responses",
+                "application/json",
+                Body::from(r#"{"model":"gpt-5.5","input":"audit","stream":true}"#),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.ends_with(b"\n\n"));
+        wait_for_audits(&state, 1).await;
+
+        let row: (i64, i64, i64) =
+            sqlx::query_as("SELECT input_tokens,cached_tokens,output_tokens FROM api_calls")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(row, (19, 0, 6));
+    }
+
+    #[tokio::test]
     async fn audit_survives_channel_deletion_during_an_inflight_call() {
         let state = crate::test_state("http://token.invalid").await;
         seed_proxy(&state, false).await;
@@ -1368,7 +1429,7 @@ mod tests {
             .clone()
             .oneshot(proxy_request(
                 "/v1/responses",
-                "application/json",
+                "application/vnd.client+json",
                 Body::from(r#"{"model":"gpt-5.4","input":"hello"}"#),
             ))
             .await
@@ -1453,6 +1514,20 @@ mod tests {
         assert!(response_body.get("instructions").is_some());
         let compact_body: Value = serde_json::from_slice(&records[1].body).unwrap();
         assert!(compact_body.get("store").is_none());
+        for record in [&records[0], &records[1], &records[3]] {
+            assert_eq!(
+                record.headers.get_all(header::CONTENT_TYPE).iter().count(),
+                1
+            );
+            assert_eq!(
+                record.headers.get(header::CONTENT_TYPE).unwrap(),
+                "application/json"
+            );
+        }
+        assert_eq!(
+            records[2].headers.get(header::CONTENT_TYPE).unwrap(),
+            "multipart/form-data; boundary=test"
+        );
         assert_eq!(records[2].body, audio);
         drop(records);
         wait_for_audits(&state, 4).await;

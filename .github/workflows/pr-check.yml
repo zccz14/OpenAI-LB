@@ -17,8 +17,8 @@ jobs:
     name: pr-check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -42,10 +42,11 @@ jobs:
   audit:
     permissions:
       contents: read
-      checks: write
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@cargo-audit
+      - name: RustSec audit
+        # SQLx records its optional MySQL driver in Cargo.lock. The SQLite-only
+        # dependency graph does not contain rsa (`cargo tree -i rsa` is empty).
+        run: cargo audit --ignore RUSTSEC-2023-0071

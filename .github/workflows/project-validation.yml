@@ -37,8 +37,8 @@ jobs:
       - name: Rust tests
         run: cargo test --all-targets --all-features --locked
 
-  rustsec-audit:
-    name: rustsec-audit
+  audit:
+    name: audit
     permissions:
       contents: read
     runs-on: ubuntu-latest

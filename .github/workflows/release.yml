@@ -78,7 +78,8 @@ jobs:
           Copy-Item README.md,LICENSE package/
           Compress-Archive package/* openai-lb-${{ matrix.target }}.zip
           $hash = (Get-FileHash openai-lb-${{ matrix.target }}.zip -Algorithm SHA256).Hash.ToLower()
-          "$hash  openai-lb-${{ matrix.target }}.zip" | Out-File -Encoding ascii openai-lb-${{ matrix.target }}.zip.sha256
+          $checksum = "$hash  openai-lb-${{ matrix.target }}.zip`n"
+          [System.IO.File]::WriteAllText("openai-lb-${{ matrix.target }}.zip.sha256", $checksum, [System.Text.Encoding]::ASCII)
       - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}

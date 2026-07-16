@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNo
 import { createBrowserSdk } from "auth-mini/sdk/browser"
 import {
   ActivityIcon, BoxesIcon, CheckCircle2Icon, ChevronRightIcon,
-  CircleGaugeIcon, ClipboardIcon, KeyRoundIcon, LanguagesIcon, LogOutIcon, PlusIcon,
+  CircleGaugeIcon, ClipboardIcon, KeyRoundIcon, LanguagesIcon, LogInIcon, LogOutIcon, PlusIcon,
   RefreshCwIcon, ScrollTextIcon, SettingsIcon, ShieldAlertIcon, SlidersHorizontalIcon, UserRoundCogIcon, XCircleIcon,
 } from "lucide-react"
 import { toast } from "sonner"
@@ -30,6 +30,13 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { api, type AuthSdk } from "@/lib/api"
+import {
+  clearAuthMiniSetupDraft,
+  normalizeAuthMiniIssuer,
+  readAuthMiniSetupDraft,
+  startAuthMiniLogin,
+  type SetupDraft,
+} from "@/lib/auth-redirect"
 
 type Locale = "zh" | "en"
 type Page = "dashboard" | "channels" | "keys" | "usage" | "audit" | "users" | "settings"
@@ -47,7 +54,7 @@ type SettingsData = { auth_issuer?: string; upstream_base: string; image_host_mo
 const copy = {
   zh: {
     dashboard:"总览",channels:"渠道",keys:"API 密钥",usage:"用量",audit:"审计",users:"用户",settings:"设置",signout:"退出登录",title:"OpenAI-LB",subtitle:"CodeX OAuth 负载均衡器",console:"控制台",english:"English",roleLoading:"加载中",
-    loginDescription:"使用 Auth Mini 登录运维控制台",email:"邮箱",otp:"验证码",loginFailed:"登录失败",sendCode:"发送验证码",verifyLogin:"验证并登录",usePasskey:"使用 Passkey",loading:"正在加载 OpenAI-LB…",
+    loginDescription:"使用 Auth Mini 登录运维控制台",email:"邮箱",authRedirectTitle:"在 Auth Mini 完成身份验证",authRedirectHelp:"邮箱验证码、Passkey 和 ED25519 登录均在 Auth Mini 页面完成；成功后会自动返回 OpenAI-LB。",continueAuthMini:"前往 Auth Mini 登录",loading:"正在加载 OpenAI-LB…",
     pageDashboard:"查看渠道容量与当前租户的 24 小时运行摘要。",pageChannels:"注册、刷新、停用并观察 CodeX OAuth 渠道。",pageKeys:"创建和吊销租户调用凭据；密钥仅显示一次。",pageUsage:"按 API Key 核算请求、Token、错误和延迟。",pageAudit:"逐次追踪请求、渠道、结果与用量，不记录内容。",pageUsers:"由 root 管理本地授权角色；用户身份仍由 Auth Mini 提供。",pageSettings:"确认身份边界、上游与部署限制。",
     operationalStatus:"运行状态",operationalDescription:"当前租户与渠道池的可行动摘要",availableChannels:"可用渠道",activeKeys:"有效 API Key",calls24h:"24 小时调用",errors24h:"24 小时错误",
     channelPool:"OAuth 渠道池",channelDescription:"凭据只加密存储；状态包含原因与恢复时间。",addChannel:"添加渠道",noChannels:"尚无渠道",noChannelsDescription:"添加 access_key 与 refresh_key，或开始 PKCE OAuth。",name:"名称",account:"账户",status:"状态",recoveryReason:"恢复 / 原因",actions:"操作",refresh:"刷新",channelUpdated:"渠道已更新",channelAdded:"渠道已添加",oauthChannelAdded:"OAuth 渠道已添加",
@@ -60,7 +67,7 @@ const copy = {
   },
   en: {
     dashboard:"Overview",channels:"Channels",keys:"API keys",usage:"Usage",audit:"Audit",users:"Users",settings:"Settings",signout:"Sign out",title:"OpenAI-LB",subtitle:"CodeX OAuth load balancer",console:"Console",english:"简体中文",roleLoading:"Loading",
-    loginDescription:"Sign in to the operations console with Auth Mini",email:"Email",otp:"One-time code",loginFailed:"Sign-in failed",sendCode:"Send code",verifyLogin:"Verify and sign in",usePasskey:"Use passkey",loading:"Loading OpenAI-LB…",
+    loginDescription:"Sign in to the operations console with Auth Mini",email:"Email",authRedirectTitle:"Verify your identity in Auth Mini",authRedirectHelp:"Email codes, passkeys, and ED25519 sign-in stay on the Auth Mini page. You will return to OpenAI-LB after signing in.",continueAuthMini:"Continue to Auth Mini",loading:"Loading OpenAI-LB…",
     pageDashboard:"Review channel capacity and the tenant's 24-hour operating summary.",pageChannels:"Register, refresh, disable, and observe CodeX OAuth channels.",pageKeys:"Create and revoke tenant credentials; secrets are shown once.",pageUsage:"Attribute requests, tokens, errors, and latency to each API key.",pageAudit:"Trace each request, channel, result, and usage without recording content.",pageUsers:"Root manages local authorization roles while Auth Mini remains the identity provider.",pageSettings:"Confirm identity boundaries, upstream, and deployment limits.",
     operationalStatus:"Operational status",operationalDescription:"Actionable tenant and channel-pool summary",availableChannels:"Available channels",activeKeys:"Active API keys",calls24h:"Calls in 24h",errors24h:"Errors in 24h",
     channelPool:"OAuth channel pool",channelDescription:"Credentials stay encrypted; states include cause and recovery time.",addChannel:"Add channel",noChannels:"No channels",noChannelsDescription:"Add access_key and refresh_key, or start PKCE OAuth.",name:"Name",account:"Account",status:"Status",recoveryReason:"Recovery / reason",actions:"Actions",refresh:"Refresh",channelUpdated:"Channel updated",channelAdded:"Channel added",oauthChannelAdded:"OAuth channel added",
@@ -73,10 +80,10 @@ const copy = {
   },
 } satisfies Record<Locale, Record<string, string>>
 
-function App() {
+function App({ startupError = "" }: { startupError?: string }) {
   const [locale, setLocale] = useState<Locale>(() => (localStorage.getItem("locale") as Locale) || "zh")
   const [config, setConfig] = useState<PublicConfig | null>(null)
-  const [bootError, setBootError] = useState("")
+  const [bootError, setBootError] = useState(startupError)
   const [sdk, setSdk] = useState<AuthSdk | null>(null)
   const [authenticated, setAuthenticated] = useState(false)
   const [recovering, setRecovering] = useState(true)
@@ -108,17 +115,19 @@ function App() {
 
   if (!config && !bootError) return <CenteredLoading />
   if (bootError) return <main className="mx-auto flex min-h-svh w-full max-w-2xl items-center p-4"><ErrorState message={bootError} /></main>
+  if (!config) return <CenteredLoading />
   if (config?.setup_required) return <TooltipProvider><Setup locale={locale} setLocale={changeLocale} /><Toaster richColors /></TooltipProvider>
   if (recovering || !sdk) return <CenteredLoading />
-  return <TooltipProvider>{authenticated ? <Console sdk={sdk} locale={locale} setLocale={changeLocale} /> : <Login sdk={sdk} locale={locale} setLocale={changeLocale} />}<Toaster richColors /></TooltipProvider>
+  return <TooltipProvider>{authenticated ? <Console sdk={sdk} locale={locale} setLocale={changeLocale} /> : <Login issuer={config.auth_issuer!} locale={locale} setLocale={changeLocale} />}<Toaster richColors /></TooltipProvider>
 }
 
 function Setup({ locale, setLocale }: { locale: Locale; setLocale: (locale: Locale) => void }) {
   const t = copy[locale]
-  const [issuer, setIssuer] = useState("")
-  const [audience, setAudience] = useState("")
+  const [setupDraft] = useState(() => readAuthMiniSetupDraft())
+  const [issuer, setIssuer] = useState(setupDraft?.issuer ?? "")
+  const [audience, setAudience] = useState(setupDraft?.audience ?? "")
   const [issuerError, setIssuerError] = useState("")
-  const [sdk, setSdk] = useState<AuthSdk | null>(null)
+  const [sdk, setSdk] = useState<AuthSdk | null>(() => setupDraft ? createBrowserSdk(setupDraft.issuer) : null)
   const [authenticated, setAuthenticated] = useState(false)
   const [pending, setPending] = useState(false)
   const [error, setError] = useState("")
@@ -133,9 +142,9 @@ function Setup({ locale, setLocale }: { locale: Locale; setLocale: (locale: Loca
   function connect(event: FormEvent) {
     event.preventDefault(); setIssuerError("")
     try {
-      const url = new URL(issuer.trim())
-      if (!(["http:", "https:"] as string[]).includes(url.protocol) || url.search || url.hash) throw new Error()
-      setSdk(createBrowserSdk(issuer.trim().replace(/\/$/, "")))
+      const normalizedIssuer = normalizeAuthMiniIssuer(issuer)
+      setIssuer(normalizedIssuer)
+      setSdk(createBrowserSdk(normalizedIssuer))
     } catch { setIssuerError(t.setupIssuerHelp) }
   }
 
@@ -144,6 +153,7 @@ function Setup({ locale, setLocale }: { locale: Locale; setLocale: (locale: Loca
     setPending(true); setError("")
     try {
       await api(sdk, "/api/setup", { method: "POST", body: JSON.stringify({ auth_issuer: issuer.trim(), auth_audience: audience.trim() || null }) })
+      clearAuthMiniSetupDraft()
       window.location.reload()
     } catch (cause) { setError(message(cause, t)); setPending(false) }
   }
@@ -166,46 +176,38 @@ function Setup({ locale, setLocale }: { locale: Locale; setLocale: (locale: Loca
           <Alert><CheckCircle2Icon /><AlertTitle>{t.setupAuthenticated}</AlertTitle><AlertDescription>{t.setupLoginHelp}</AlertDescription></Alert>
           {error && <Alert variant="destructive"><ShieldAlertIcon /><AlertTitle>{t.unableLoad}</AlertTitle><AlertDescription>{error}</AlertDescription></Alert>}
           <Button disabled={pending} onClick={() => void finish()}>{pending && <Spinner data-icon="inline-start" />}{pending ? t.finishingSetup : t.finishSetup}</Button>
-        </> : <AuthForm sdk={sdk} locale={locale} />}
-          <Button variant="ghost" disabled={pending || authenticated} onClick={() => setSdk(null)}>{t.changeAuth}</Button>
+        </> : <HostedAuth issuer={issuer} locale={locale} setupDraft={{ issuer, audience }} />}
+          <Button variant="ghost" disabled={pending || authenticated} onClick={() => { clearAuthMiniSetupDraft(); setAuthenticated(false); setSdk(null) }}>{t.changeAuth}</Button>
         </div>}</CardContent></Card>
       </div>
     </div>
   </main>
 }
 
-function Login({ sdk, locale, setLocale }: { sdk: AuthSdk; locale: Locale; setLocale: (locale: Locale) => void }) {
+function Login({ issuer, locale, setLocale }: { issuer: string; locale: Locale; setLocale: (locale: Locale) => void }) {
   const t = copy[locale]
   return <main className="flex min-h-svh items-center justify-center bg-muted/40 p-4">
     <Card className="w-full max-w-sm">
       <CardHeader><div className="flex items-start justify-between gap-3"><div><CardTitle>OpenAI-LB</CardTitle><CardDescription>{t.loginDescription}</CardDescription></div><Button size="sm" variant="ghost" onClick={() => setLocale(locale === "zh" ? "en" : "zh")}><LanguagesIcon data-icon="inline-start" />{t.english}</Button></div></CardHeader>
-      <CardContent><AuthForm sdk={sdk} locale={locale} /></CardContent>
+      <CardContent><HostedAuth issuer={issuer} locale={locale} /></CardContent>
     </Card>
   </main>
 }
 
-function AuthForm({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
+function HostedAuth({ issuer, locale, setupDraft }: { issuer: string; locale: Locale; setupDraft?: SetupDraft }) {
   const t = copy[locale]
-  const [email, setEmail] = useState("")
-  const [code, setCode] = useState("")
-  const [sent, setSent] = useState(false)
-  const [pending, setPending] = useState(false)
   const [error, setError] = useState("")
-  async function submit(event: FormEvent) {
-    event.preventDefault(); setPending(true); setError("")
+  function redirect() {
+    setError("")
     try {
-      if (!sent) { await sdk.email.start({ email: email.trim() }); setSent(true) }
-      else await sdk.email.verify({ email: email.trim(), code: code.trim() })
-    } catch (cause) { setError(cause instanceof Error ? cause.message : t.loginUnknown) }
-    finally { setPending(false) }
+      startAuthMiniLogin(issuer, setupDraft)
+    } catch (cause) { setError(message(cause, t)) }
   }
-  return <form onSubmit={submit}><FieldGroup>
-        <Field><FieldLabel htmlFor="email">{t.email}</FieldLabel><Input id="email" type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} required /></Field>
-        {sent && <Field><FieldLabel htmlFor="code">{t.otp}</FieldLabel><Input id="code" inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(event) => setCode(event.target.value)} required /></Field>}
-        {error && <Alert variant="destructive"><ShieldAlertIcon /><AlertTitle>{t.loginFailed}</AlertTitle><AlertDescription>{error}</AlertDescription></Alert>}
-        <Button type="submit" disabled={pending || !email.trim() || (sent && !code.trim())}>{pending && <Spinner data-icon="inline-start" />}{sent ? t.verifyLogin : t.sendCode}</Button>
-        <Button type="button" variant="outline" disabled={pending} onClick={() => void sdk.passkey.authenticate().catch((cause: unknown) => setError(message(cause)))}>{t.usePasskey}</Button>
-      </FieldGroup></form>
+  return <div className="flex flex-col gap-4">
+    <Alert><LogInIcon /><AlertTitle>{t.authRedirectTitle}</AlertTitle><AlertDescription>{t.authRedirectHelp}</AlertDescription></Alert>
+    {error && <Alert variant="destructive"><ShieldAlertIcon /><AlertTitle>{t.unableLoad}</AlertTitle><AlertDescription>{error}</AlertDescription></Alert>}
+    <Button onClick={redirect}><LogInIcon data-icon="inline-start" />{t.continueAuthMini}</Button>
+  </div>
 }
 
 function Console({ sdk, locale, setLocale }: { sdk: AuthSdk; locale: Locale; setLocale: (locale: Locale) => void }) {

@@ -21,7 +21,7 @@ OpenAI-LB 是一个面向 OpenAI / CodeX OAuth 渠道的反向代理和负载均
 - 创建 `~/.openai-lb/master.key`；Unix 权限固定为 `0600`。
 - 提供 Setup API 和 Setup GUI。
 
-打开 `http://localhost:8080`，填写品牌提供的 Auth Mini issuer，使用该 Auth Mini 实例登录，再将当前用户绑定为唯一 `root`。Setup 完成后初始化入口立即关闭。
+打开 `http://localhost:8080`，填写品牌提供的 Auth Mini issuer，然后前往该 Auth Mini 实例的托管登录页面。登录成功后浏览器会返回 OpenAI-LB，再将当前用户绑定为唯一 `root`。Setup 完成后初始化入口立即关闭。
 
 OpenAI-LB 连接现有的品牌 Auth Mini 实例。用户不需要为 OpenAI-LB 部署 Auth Mini。前端使用 `auth-mini` SDK，后端通过 issuer 的 `/jwks` 验证 Ed25519 JWT，并使用 `user_id` 关联本地 `root / admin / user` 权限。
 

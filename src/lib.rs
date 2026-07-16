@@ -82,6 +82,7 @@ pub fn router(state: AppState) -> Router {
             "/api/channels",
             get(api::list_channels).post(api::create_channel),
         )
+        .route("/api/channels/usage", get(api::list_channel_usage))
         .route(
             "/api/channels/{id}",
             get(api::read_channel_tokens)

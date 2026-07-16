@@ -48,12 +48,13 @@ impl AppState {
             config.auth_audience.clone(),
             client.clone(),
         );
-        let audit = AuditWriter::new(db.clone());
+        let config = Arc::new(ArcSwap::from_pointee(config));
+        let audit = AuditWriter::new(db.clone(), config.clone());
         let balancer = Balancer::default();
         balancer.hydrate(&db).await?;
         balancer.start_maintenance(db.clone());
         Ok(Self {
-            config: Arc::new(ArcSwap::from_pointee(config)),
+            config,
             db,
             client,
             auth,
@@ -290,6 +291,7 @@ pub(crate) async fn test_state_with_upstream(
         image_body_limit: 1024 * 1024,
         audio_body_limit: 1024 * 1024,
         affinity_ttl_seconds: 3600,
+        request_archive_retention_days: 7,
     };
     AppState::new(config, pool).await.unwrap()
 }

@@ -1,4 +1,9 @@
-use std::{convert::Infallible, net::SocketAddr, time::Instant};
+use std::{
+    convert::Infallible,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use axum::{
     body::{Body, Bytes},
@@ -46,6 +51,8 @@ const PROXY_ONLY_HEADERS: &[&str] = &[
     "thread-id",
 ];
 
+const ARCHIVE_BODY_LIMIT: usize = 1024 * 1024;
+
 struct CallContext {
     request_id: String,
     model: Option<String>,
@@ -91,6 +98,12 @@ impl AuditTracker {
                 error: None,
                 client_ip: client_ip.to_owned(),
                 created_at: chrono::Utc::now().timestamp(),
+                request_headers_json: "[]".to_owned(),
+                request_body: Vec::new(),
+                request_body_truncated: false,
+                response_headers_json: None,
+                response_body: None,
+                response_body_truncated: false,
             }),
             started: Instant::now(),
         })
@@ -100,6 +113,45 @@ impl AuditTracker {
         if let Some(event) = &mut self.event {
             event.channel_id = Some(channel_id.to_owned());
         }
+    }
+
+    fn set_request(&mut self, headers: &HeaderMap, body: &[u8], truncated: bool) {
+        if let Some(event) = &mut self.event {
+            event.request_headers_json = archive_headers(headers);
+            let (body, limit_truncated) = body_preview(body);
+            event.request_body = body;
+            event.request_body_truncated = truncated || limit_truncated;
+        }
+    }
+
+    fn set_response_headers(&mut self, headers: &HeaderMap) {
+        if let Some(event) = &mut self.event {
+            event.response_headers_json = Some(archive_headers(headers));
+        }
+    }
+
+    fn set_response_body(&mut self, body: &[u8], truncated: bool) {
+        if let Some(event) = &mut self.event {
+            let (body, limit_truncated) = body_preview(body);
+            event.response_body = Some(body);
+            event.response_body_truncated = truncated || limit_truncated;
+        }
+    }
+
+    fn set_error_response(&mut self, error: &AppError) {
+        let body = serde_json::to_vec(&json!({"error":{
+            "message":error.message(),
+            "type":"proxy_error",
+            "code":error.status().as_u16()
+        }}))
+        .expect("proxy error response is serializable");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        self.set_response_headers(&headers);
+        self.set_response_body(&body, false);
     }
 
     fn finish(
@@ -143,6 +195,7 @@ impl AuditTracker {
 impl Drop for AuditTracker {
     fn drop(&mut self) {
         if let Some(mut event) = self.event.take() {
+            event.response_body_truncated = true;
             settle(
                 &mut event,
                 499,
@@ -196,6 +249,7 @@ pub async fn handle_json(
         &client_ip,
     )
     .await?;
+    audit.set_request(&headers, &body, false);
     let result = dispatch(
         state,
         identity,
@@ -209,6 +263,7 @@ pub async fn handle_json(
     if let Err(error) = &result
         && audit.event.is_some()
     {
+        audit.set_error_response(error);
         audit.finish(
             error.status(),
             None,
@@ -238,6 +293,7 @@ pub async fn handle_audio(
         &peer.ip().to_string(),
     )
     .await?;
+    audit.set_request(&headers, &[], true);
     let result = dispatch_audio(
         state,
         identity,
@@ -251,6 +307,7 @@ pub async fn handle_audio(
     if let Err(error) = &result
         && audit.event.is_some()
     {
+        audit.set_error_response(error);
         audit.finish(
             error.status(),
             None,
@@ -279,7 +336,59 @@ pub async fn handle_models(
         &peer.ip().to_string(),
     )
     .await?;
+    audit.set_request(&headers, &[], false);
     models_response(&state, &mut audit).await
+}
+
+fn body_preview(body: &[u8]) -> (Vec<u8>, bool) {
+    let end = body.len().min(ARCHIVE_BODY_LIMIT);
+    (body[..end].to_vec(), body.len() > end)
+}
+
+fn archive_headers(headers: &HeaderMap) -> String {
+    let values = headers
+        .iter()
+        .filter(|(name, _)| archive_header_allowed(name))
+        .map(|(name, value)| {
+            (
+                name.as_str(),
+                value.to_str().unwrap_or("<non-UTF-8 header value>"),
+            )
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&values).expect("HTTP headers are serializable")
+}
+
+fn archive_header_allowed(name: &HeaderName) -> bool {
+    let name = name.as_str();
+    matches!(
+        name,
+        "accept"
+            | "accept-encoding"
+            | "content-encoding"
+            | "content-length"
+            | "content-type"
+            | "date"
+            | "retry-after"
+            | "server"
+            | "user-agent"
+            | "x-request-id"
+    ) || name.starts_with("x-ratelimit-")
+}
+
+#[derive(Default)]
+struct StreamingPreview {
+    body: Vec<u8>,
+    truncated: bool,
+}
+
+impl StreamingPreview {
+    fn capture(&mut self, bytes: &[u8]) {
+        let remaining = ARCHIVE_BODY_LIMIT.saturating_sub(self.body.len());
+        let copied = remaining.min(bytes.len());
+        self.body.extend_from_slice(&bytes[..copied]);
+        self.truncated |= copied < bytes.len();
+    }
 }
 
 fn request_id(headers: &HeaderMap) -> String {
@@ -398,15 +507,32 @@ async fn dispatch_audio(
     let affinity = affinity_key(headers, None).map(|key| format!("{}:{key}", identity.key_id));
     let lease = select_ready_channel(&state, affinity.as_deref()).await?;
     audit.set_channel(&lease.channel.id);
+    let preview = Arc::new(Mutex::new(StreamingPreview::default()));
+    let capture = preview.clone();
+    let stream = body.into_data_stream().map(move |item| {
+        if let Ok(bytes) = &item {
+            capture
+                .lock()
+                .expect("audio preview mutex is not poisoned")
+                .capture(bytes);
+        }
+        item
+    });
     let upstream = send_upstream(
         &state,
         &lease,
         path,
         headers,
         &request_id,
-        reqwest::Body::wrap_stream(body.into_data_stream()),
+        reqwest::Body::wrap_stream(stream),
     )
-    .await?;
+    .await;
+    let (body, truncated) = {
+        let preview = preview.lock().expect("audio preview mutex is not poisoned");
+        (preview.body.clone(), preview.truncated)
+    };
+    audit.set_request(headers, &body, truncated);
+    let upstream = upstream?;
     track_response(
         &state,
         &lease.channel.id,
@@ -738,10 +864,12 @@ async fn relay_response(
     audit: &mut AuditTracker,
 ) -> Result<Response, AppError> {
     let status = upstream.status();
+    audit.set_response_headers(upstream.headers());
     let headers = filtered_response_headers(upstream.headers());
     let is_stream = context.stream && status.is_success();
     if !is_stream {
         let bytes = upstream.bytes().await?;
+        audit.set_response_body(&bytes, false);
         let usage = usage_from_bytes(&bytes);
         audit.finish(
             status,
@@ -791,6 +919,13 @@ async fn image_response(
     let envelope = serde_json::to_vec(
         &json!({"created": chrono::Utc::now().timestamp(), "data": images, "usage": usage}),
     )?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    audit.set_response_headers(&headers);
+    audit.set_response_body(&envelope, false);
     audit.finish(status, context.model.as_deref(), usage, None);
     build_response(
         StatusCode::OK,
@@ -863,6 +998,7 @@ struct StreamCompletion {
     event: Option<AuditEvent>,
     started: Instant,
     usage: Usage,
+    response_preview: StreamingPreview,
 }
 
 impl StreamCompletion {
@@ -872,11 +1008,13 @@ impl StreamCompletion {
             event: Some(event),
             started,
             usage: Usage::default(),
+            response_preview: StreamingPreview::default(),
         }
     }
 
     fn capture_sse(&mut self, pending: &mut Vec<u8>, bytes: &[u8]) {
         update_sse_usage(pending, bytes, &mut self.usage);
+        self.response_preview.capture(bytes);
     }
 
     fn finish(&mut self, failed: bool) {
@@ -886,6 +1024,8 @@ impl StreamCompletion {
         let status = if failed { 502 } else { event.status };
         let error = failed.then_some("upstream_stream_error");
         let model = event.model.clone();
+        event.response_body = Some(std::mem::take(&mut self.response_preview.body));
+        event.response_body_truncated = self.response_preview.truncated || failed;
         settle(
             &mut event,
             status,
@@ -905,6 +1045,8 @@ impl Drop for StreamCompletion {
     fn drop(&mut self) {
         if let Some(mut event) = self.event.take() {
             let model = event.model.clone();
+            event.response_body = Some(std::mem::take(&mut self.response_preview.body));
+            event.response_body_truncated = true;
             settle(
                 &mut event,
                 499,
@@ -1016,10 +1158,17 @@ async fn models_response(
         "gpt-image-1",
         "gpt-image-1.5",
     ];
-    audit.finish(StatusCode::OK, None, Usage::default(), None);
     let body = serde_json::to_vec(
         &json!({"object":"list","data":models.map(|id| json!({"id":id,"object":"model","owned_by":"openai"}))}),
     )?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    audit.set_response_headers(&headers);
+    audit.set_response_body(&body, false);
+    audit.finish(StatusCode::OK, None, Usage::default(), None);
     build_response(
         StatusCode::OK,
         vec![(
@@ -1142,6 +1291,41 @@ mod tests {
         (format!("http://{address}"), records)
     }
 
+    async fn spawn_stream_mock(fail_after_first_chunk: bool) -> (String, Arc<Notify>) {
+        let interrupt = Arc::new(Notify::new());
+        let wait_for_interrupt = interrupt.clone();
+        let app = Router::new().route(
+            "/responses",
+            post(move || {
+                let wait_for_interrupt = wait_for_interrupt.clone();
+                async move {
+                    let output = async_stream::stream! {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+                        ));
+                        if fail_after_first_chunk {
+                            wait_for_interrupt.notified().await;
+                            yield Err(std::io::Error::other("test stream failure"));
+                        } else {
+                            yield Ok(Bytes::from_static(
+                                b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n",
+                            ));
+                        }
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(output))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}"), interrupt)
+    }
+
     async fn seed_proxy(state: &AppState, channel: bool) {
         let now = chrono::Utc::now().timestamp();
         sqlx::query("INSERT INTO users(id,role,created_at) VALUES('user-1','user',?)")
@@ -1220,6 +1404,32 @@ mod tests {
             (usage.input_tokens, usage.output_tokens, usage.cached_tokens),
             (10, 4, 3)
         );
+    }
+
+    #[test]
+    fn diagnostic_preview_uses_a_safe_header_allowlist() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer secret"),
+        );
+        headers.insert("x-api-key", HeaderValue::from_static("secret"));
+        headers.insert("x-openai-api-key", HeaderValue::from_static("secret"));
+        headers.insert("x-auth", HeaderValue::from_static("secret"));
+        headers.insert("x-credential", HeaderValue::from_static("secret"));
+        headers.insert("access-key", HeaderValue::from_static("secret"));
+        headers.insert("x-session-id", HeaderValue::from_static("session-secret"));
+        headers.insert("x-arbitrary", HeaderValue::from_static("private"));
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let archived = archive_headers(&headers);
+        assert_eq!(archived, r#"[["content-type","application/json"]]"#);
+
+        let (preview, truncated) = body_preview(&vec![7; ARCHIVE_BODY_LIMIT + 1]);
+        assert_eq!(preview.len(), ARCHIVE_BODY_LIMIT);
+        assert!(truncated);
     }
 
     #[test]
@@ -1316,13 +1526,13 @@ mod tests {
         drop(completion);
         wait_for_audits(&state, 1).await;
 
-        let row: (i64, i64, i64, i64, String) = sqlx::query_as(
-            "SELECT input_tokens,cached_tokens,output_tokens,status,error FROM api_calls WHERE request_id='cancelled-stream'",
+        let row: (i64, i64, i64, i64, String, bool) = sqlx::query_as(
+            "SELECT c.input_tokens,c.cached_tokens,c.output_tokens,c.status,c.error,a.response_body_truncated FROM api_calls c JOIN request_archives a ON a.api_call_id=c.id WHERE c.request_id='cancelled-stream'",
         )
         .fetch_one(&state.db)
         .await
         .unwrap();
-        assert_eq!(row, (11, 7, 5, 499, "client_cancelled".to_owned()));
+        assert_eq!(row, (11, 7, 5, 499, "client_cancelled".to_owned(), true));
     }
 
     #[tokio::test]
@@ -1537,6 +1747,161 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(method, "GET");
+        let archive: (String, Vec<u8>, Vec<u8>, bool, bool) = sqlx::query_as(
+            "SELECT a.request_headers_json,a.request_body,a.response_body,a.request_body_truncated,a.response_body_truncated FROM request_archives a JOIN api_calls c ON c.id=a.api_call_id WHERE c.path='/v1/responses'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert!(!archive.0.contains("authorization"));
+        assert!(!archive.0.contains("sk-test-secret"));
+        assert!(!archive.0.contains("session-secret"));
+        assert!(std::str::from_utf8(&archive.1).unwrap().contains("hello"));
+        assert!(std::str::from_utf8(&archive.2).unwrap().contains("resp"));
+        assert!(!archive.3);
+        assert!(!archive.4);
+
+        let archived_audio: Vec<u8> = sqlx::query_scalar(
+            "SELECT a.request_body FROM request_archives a JOIN api_calls c ON c.id=a.api_call_id WHERE c.path='/v1/audio/transcriptions'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(archived_audio, audio);
+    }
+
+    #[tokio::test]
+    async fn network_failure_is_returned_and_archived() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (connection, _) = listener.accept().await.unwrap();
+            drop(connection);
+        });
+        let state =
+            crate::test_state_with_upstream("http://token.invalid", &format!("http://{address}"))
+                .await;
+        seed_proxy(&state, true).await;
+
+        let response = crate::router(state.clone())
+            .oneshot(proxy_request(
+                "/v1/responses",
+                "application/json",
+                Body::from(r#"{"model":"gpt-5.4","input":"network"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        wait_for_audits(&state, 1).await;
+
+        let archived: (i64, String, Vec<u8>, Vec<u8>) = sqlx::query_as(
+            "SELECT c.status,c.error,a.request_body,a.response_body FROM api_calls c JOIN request_archives a ON a.api_call_id=c.id",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(archived.0, 500);
+        assert_eq!(archived.1, "internal server error");
+        assert!(
+            std::str::from_utf8(&archived.2)
+                .unwrap()
+                .contains("network")
+        );
+        assert!(
+            std::str::from_utf8(&archived.3)
+                .unwrap()
+                .contains("internal server error")
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_response_body_is_archived_and_interruption_is_marked_truncated() {
+        for failed in [false, true] {
+            let (upstream, interrupt) = spawn_stream_mock(failed).await;
+            let state = crate::test_state_with_upstream("http://token.invalid", &upstream).await;
+            seed_proxy(&state, true).await;
+            let response = crate::router(state.clone())
+                .oneshot(proxy_request(
+                    "/v1/responses",
+                    "application/json",
+                    Body::from(r#"{"model":"gpt-5.4","input":"stream"}"#),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            if failed {
+                interrupt.notify_one();
+            }
+            let client_body = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(std::str::from_utf8(&client_body).unwrap().contains("hello"));
+            wait_for_audits(&state, 1).await;
+
+            let archived: (i64, Option<String>, Vec<u8>, bool) = sqlx::query_as(
+                "SELECT c.status,c.error,a.response_body,a.response_body_truncated FROM api_calls c JOIN request_archives a ON a.api_call_id=c.id",
+            )
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+            assert!(std::str::from_utf8(&archived.2).unwrap().contains("hello"));
+            if failed {
+                assert_eq!(archived.0, 502);
+                assert_eq!(archived.1.as_deref(), Some("upstream_stream_error"));
+                assert!(archived.3);
+            } else {
+                assert_eq!(archived.0, 200);
+                assert_eq!(archived.1, None);
+                assert!(!archived.3);
+                assert!(
+                    std::str::from_utf8(&archived.2)
+                        .unwrap()
+                        .contains("response.completed")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn temporary_archive_write_failure_does_not_change_response_and_retries() {
+        let state = crate::test_state("http://token.invalid").await;
+        seed_proxy(&state, false).await;
+        sqlx::query("DROP TABLE request_archives")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let retries_before = crate::audit::write_retries();
+
+        let response = crate::router(state.clone())
+            .oneshot(proxy_request(
+                "/v1/models",
+                "application/json",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(std::str::from_utf8(&body).unwrap().contains("gpt-5.4"));
+
+        for _ in 0..100 {
+            if crate::audit::write_retries() > retries_before {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(crate::audit::write_retries() > retries_before);
+        sqlx::query(
+            "CREATE TABLE request_archives (api_call_id TEXT PRIMARY KEY REFERENCES api_calls(id) ON DELETE CASCADE,request_headers_json TEXT NOT NULL,request_body BLOB NOT NULL,request_body_truncated INTEGER NOT NULL CHECK(request_body_truncated IN (0,1)),response_headers_json TEXT,response_body BLOB,response_body_truncated INTEGER NOT NULL CHECK(response_body_truncated IN (0,1)),created_at INTEGER NOT NULL)",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+        wait_for_audits(&state, 1).await;
+        let archives: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_archives")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(archives, 1);
     }
 
     #[tokio::test]
@@ -1567,6 +1932,16 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(status, expected.as_u16() as i64);
+            let archived_response: Vec<u8> =
+                sqlx::query_scalar("SELECT response_body FROM request_archives")
+                    .fetch_one(&state.db)
+                    .await
+                    .unwrap();
+            assert!(
+                std::str::from_utf8(&archived_response)
+                    .unwrap()
+                    .contains("limited")
+            );
         }
 
         let state = crate::test_state("http://token.invalid").await;
@@ -1586,6 +1961,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, 503);
+        let archived_response: Vec<u8> =
+            sqlx::query_scalar("SELECT response_body FROM request_archives")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert!(
+            std::str::from_utf8(&archived_response)
+                .unwrap()
+                .contains("no available CodeX channel")
+        );
     }
 
     #[tokio::test]
@@ -1671,12 +2056,13 @@ mod tests {
         .unwrap();
         drop(audit.take_stream(StatusCode::OK, Some("gpt-5.4")));
         wait_for_audits(&state, 1).await;
-        let status: i64 =
-            sqlx::query_scalar("SELECT status FROM api_calls WHERE request_id='stream-request'")
-                .fetch_one(&state.db)
-                .await
-                .unwrap();
-        assert_eq!(status, 499);
+        let row: (i64, bool) = sqlx::query_as(
+            "SELECT c.status,a.response_body_truncated FROM api_calls c JOIN request_archives a ON a.api_call_id=c.id WHERE c.request_id='stream-request'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(row, (499, true));
     }
 
     #[tokio::test]
@@ -1715,11 +2101,13 @@ mod tests {
         request_task.abort();
         assert!(request_task.await.unwrap_err().is_cancelled());
         wait_for_audits(&state, 1).await;
-        let status: i64 = sqlx::query_scalar("SELECT status FROM api_calls")
+        let row: (i64, bool) = sqlx::query_as(
+            "SELECT c.status,a.response_body_truncated FROM api_calls c JOIN request_archives a ON a.api_call_id=c.id",
+        )
             .fetch_one(&state.db)
             .await
             .unwrap();
-        assert_eq!(status, 499);
+        assert_eq!(row, (499, true));
         let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_calls WHERE status=0")
             .fetch_one(&state.db)
             .await

@@ -1,10 +1,21 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
+use arc_swap::ArcSwap;
 use sqlx::{Sqlite, SqlitePool, Transaction};
 use tokio::sync::mpsc;
 
+use crate::config::Config;
+
 const QUEUE_CAPACITY: usize = 4_096;
 const BATCH_CAPACITY: usize = 128;
+
+#[cfg(test)]
+static WRITE_RETRIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn write_retries() -> usize {
+    WRITE_RETRIES.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 #[derive(Debug)]
 pub struct AuditEvent {
@@ -24,6 +35,12 @@ pub struct AuditEvent {
     pub error: Option<String>,
     pub client_ip: String,
     pub created_at: i64,
+    pub request_headers_json: String,
+    pub request_body: Vec<u8>,
+    pub request_body_truncated: bool,
+    pub response_headers_json: Option<String>,
+    pub response_body: Option<Vec<u8>>,
+    pub response_body_truncated: bool,
 }
 
 #[derive(Clone)]
@@ -32,9 +49,10 @@ pub struct AuditWriter {
 }
 
 impl AuditWriter {
-    pub fn new(pool: SqlitePool) -> Self {
+    pub fn new(pool: SqlitePool, config: Arc<ArcSwap<Config>>) -> Self {
         let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
-        tokio::spawn(run(pool, receiver));
+        tokio::spawn(run(pool.clone(), receiver));
+        tokio::spawn(cleanup(pool, config));
         Self { sender }
     }
 
@@ -58,6 +76,8 @@ async fn run(pool: SqlitePool, mut receiver: mpsc::Receiver<AuditEvent>) {
             match persist(&pool, &batch).await {
                 Ok(()) => break,
                 Err(error) => {
+                    #[cfg(test)]
+                    WRITE_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::error!(events = batch.len(), %error, "audit batch write failed; retrying");
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
@@ -107,5 +127,87 @@ async fn insert(
         .bind(event.created_at)
         .execute(&mut **transaction)
         .await?;
+    sqlx::query("INSERT INTO request_archives(api_call_id,request_headers_json,request_body,request_body_truncated,response_headers_json,response_body,response_body_truncated,created_at) VALUES(?,?,?,?,?,?,?,?)")
+        .bind(&event.id)
+        .bind(&event.request_headers_json)
+        .bind(&event.request_body)
+        .bind(event.request_body_truncated)
+        .bind(&event.response_headers_json)
+        .bind(&event.response_body)
+        .bind(event.response_body_truncated)
+        .bind(event.created_at)
+        .execute(&mut **transaction)
+        .await?;
     Ok(())
+}
+
+async fn cleanup(pool: SqlitePool, config: Arc<ArcSwap<Config>>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+    loop {
+        interval.tick().await;
+        if let Err(error) = delete_expired(
+            &pool,
+            config.load().request_archive_retention_days,
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        {
+            tracing::error!(%error, "request archive cleanup failed");
+        }
+    }
+}
+
+async fn delete_expired(
+    pool: &SqlitePool,
+    retention_days: i64,
+    now: i64,
+) -> Result<u64, sqlx::Error> {
+    let cutoff = now - retention_days * 24 * 60 * 60;
+    Ok(
+        sqlx::query("DELETE FROM request_archives WHERE created_at<?")
+            .bind(cutoff)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn retention_cleanup_removes_only_expired_diagnostics() {
+        let pool = crate::db::connect_memory().await.unwrap();
+        sqlx::query("INSERT INTO users(id,role,created_at) VALUES('user','user',0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO api_keys(id,user_id,name,prefix,secret_hash,created_at) VALUES('key','user','key','sk-test','hash',0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (id, created_at) in [("expired", 0_i64), ("retained", 200_000_i64)] {
+            sqlx::query("INSERT INTO api_calls(id,request_id,api_key_id,user_id,method,path,status,latency_ms,created_at) VALUES(?,?, 'key','user','POST','/v1/responses',200,1,?)")
+                .bind(id)
+                .bind(id)
+                .bind(created_at)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO request_archives(api_call_id,request_headers_json,request_body,request_body_truncated,response_body_truncated,created_at) VALUES(?,'[]',X'',0,0,?)")
+                .bind(id)
+                .bind(created_at)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(delete_expired(&pool, 1, 200_000).await.unwrap(), 1);
+        let ids: Vec<String> = sqlx::query_scalar("SELECT api_call_id FROM request_archives")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(ids, vec!["retained"]);
+    }
 }

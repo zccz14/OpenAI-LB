@@ -63,6 +63,7 @@ pub struct Config {
     pub image_body_limit: usize,
     pub audio_body_limit: usize,
     pub affinity_ttl_seconds: i64,
+    pub request_archive_retention_days: i64,
 }
 
 impl Config {
@@ -104,6 +105,7 @@ impl Config {
             image_body_limit: value("image_body_limit")?.parse()?,
             audio_body_limit: value("audio_body_limit")?.parse()?,
             affinity_ttl_seconds: value("affinity_ttl_seconds")?.parse()?,
+            request_archive_retention_days: value("request_archive_retention_days")?.parse()?,
         })
     }
 }

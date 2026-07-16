@@ -50,6 +50,7 @@ pub fn expires_at_from_jwt(token: &str) -> Option<i64> {
 }
 
 pub async fn start(state: &AppState, user_id: &str) -> Result<OAuthStart, AppError> {
+    let config = state.config.load();
     let random = random_bytes::<32>();
     let verifier = URL_SAFE_NO_PAD.encode(random);
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
@@ -60,16 +61,16 @@ pub async fn start(state: &AppState, user_id: &str) -> Result<OAuthStart, AppErr
         "INSERT INTO oauth_flows(state_hash,verifier_enc,created_by,expires_at) VALUES(?,?,?,?)",
     )
     .bind(state_hash)
-    .bind(encrypt(&state.config.encryption_key, &verifier)?)
+    .bind(encrypt(&config.encryption_key, &verifier)?)
     .bind(user_id)
     .bind(expires_at)
     .execute(&state.db)
     .await?;
-    let mut url = Url::parse(&state.config.oauth_authorize_url)?;
+    let mut url = Url::parse(&config.oauth_authorize_url)?;
     url.query_pairs_mut()
         .append_pair("response_type", "code")
-        .append_pair("client_id", &state.config.oauth_client_id)
-        .append_pair("redirect_uri", &state.config.oauth_redirect_uri)
+        .append_pair("client_id", &config.oauth_client_id)
+        .append_pair("redirect_uri", &config.oauth_redirect_uri)
         .append_pair("scope", "openid profile email offline_access")
         .append_pair("code_challenge", &challenge)
         .append_pair("code_challenge_method", "S256")
@@ -89,11 +90,12 @@ pub async fn exchange(
     code: &str,
     user_id: &str,
 ) -> Result<TokenResponse, AppError> {
+    let config = state.config.load();
     let state_hash = hex::encode(Sha256::digest(raw_state.as_bytes()));
     let row: Option<(String,)> = sqlx::query_as("DELETE FROM oauth_flows WHERE state_hash=? AND created_by=? AND expires_at>? RETURNING verifier_enc")
         .bind(state_hash).bind(user_id).bind(chrono::Utc::now().timestamp()).fetch_optional(&state.db).await?;
     let verifier = decrypt(
-        &state.config.encryption_key,
+        &config.encryption_key,
         &row.ok_or_else(|| AppError::bad_request("invalid or expired OAuth state"))?
             .0,
     )?;
@@ -101,31 +103,33 @@ pub async fn exchange(
         state,
         &[
             ("grant_type", "authorization_code"),
-            ("client_id", &state.config.oauth_client_id),
+            ("client_id", &config.oauth_client_id),
             ("code", code),
             ("code_verifier", &verifier),
-            ("redirect_uri", &state.config.oauth_redirect_uri),
+            ("redirect_uri", &config.oauth_redirect_uri),
         ],
     )
     .await
 }
 
 pub async fn refresh(state: &AppState, refresh_token: &str) -> Result<TokenResponse, AppError> {
+    let config = state.config.load();
     token_request(
         state,
         &[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
-            ("client_id", &state.config.oauth_client_id),
+            ("client_id", &config.oauth_client_id),
         ],
     )
     .await
 }
 
 async fn token_request(state: &AppState, form: &[(&str, &str)]) -> Result<TokenResponse, AppError> {
+    let token_url = state.config.load().oauth_token_url.clone();
     let response = state
         .client
-        .post(&state.config.oauth_token_url)
+        .post(token_url)
         .form(form)
         .send()
         .await

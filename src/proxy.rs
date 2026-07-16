@@ -8,10 +8,12 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
     AppError, AppState,
+    audit::AuditEvent,
     auth::{ApiIdentity, api_identity},
     balancer::{Lease, track_response},
     crypto::encrypt,
@@ -45,17 +47,14 @@ const PROXY_ONLY_HEADERS: &[&str] = &[
 ];
 
 struct CallContext {
-    state: AppState,
     request_id: String,
     model: Option<String>,
 }
 
 struct AuditTracker {
-    state: AppState,
-    runtime: tokio::runtime::Handle,
-    call_id: String,
+    permit: Option<mpsc::OwnedPermit<AuditEvent>>,
+    event: Option<AuditEvent>,
     started: Instant,
-    finalized: bool,
 }
 
 impl AuditTracker {
@@ -67,65 +66,116 @@ impl AuditTracker {
         path: &str,
         client_ip: &str,
     ) -> Result<Self, AppError> {
-        let call_id = Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO api_calls(id,request_id,api_key_id,user_id,method,path,status,latency_ms,client_ip,created_at) VALUES(?,?,?,?,?,?,0,0,?,?)")
-            .bind(&call_id).bind(request_id).bind(&identity.key_id).bind(&identity.user_id)
-            .bind(method.as_str()).bind(path).bind(client_ip).bind(chrono::Utc::now().timestamp())
-            .execute(&state.db).await?;
+        let permit = state
+            .audit
+            .reserve()
+            .await
+            .ok_or_else(|| AppError::unavailable("audit writer is unavailable"))?;
         Ok(Self {
-            state: state.clone(),
-            runtime: tokio::runtime::Handle::current(),
-            call_id,
+            permit: Some(permit),
+            event: Some(AuditEvent {
+                id: Uuid::new_v4().to_string(),
+                request_id: request_id.to_owned(),
+                api_key_id: identity.key_id.clone(),
+                user_id: identity.user_id.clone(),
+                channel_id: None,
+                method: method.as_str().to_owned(),
+                path: path.to_owned(),
+                model: None,
+                status: 0,
+                latency_ms: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                cached_tokens: 0,
+                error: None,
+                client_ip: client_ip.to_owned(),
+                created_at: chrono::Utc::now().timestamp(),
+            }),
             started: Instant::now(),
-            finalized: false,
         })
     }
 
-    async fn set_channel(&self, channel_id: &str) -> Result<(), AppError> {
-        sqlx::query("UPDATE api_calls SET channel_id=? WHERE id=?")
-            .bind(channel_id)
-            .bind(&self.call_id)
-            .execute(&self.state.db)
-            .await?;
-        Ok(())
+    fn set_channel(&mut self, channel_id: &str) {
+        if let Some(event) = &mut self.event {
+            event.channel_id = Some(channel_id.to_owned());
+        }
     }
 
-    async fn finish(
+    fn finish(
         &mut self,
         status: StatusCode,
         model: Option<&str>,
         usage: Usage,
         error: Option<&str>,
-    ) -> Result<(), AppError> {
-        sqlx::query("UPDATE api_calls SET model=?,status=?,latency_ms=?,input_tokens=?,output_tokens=?,cached_tokens=?,error=? WHERE id=?")
-            .bind(model).bind(status.as_u16() as i64).bind(self.started.elapsed().as_millis() as i64)
-            .bind(usage.input_tokens).bind(usage.output_tokens).bind(usage.cached_tokens).bind(error)
-            .bind(&self.call_id).execute(&self.state.db).await?;
-        self.finalized = true;
-        Ok(())
+    ) {
+        let Some(mut event) = self.event.take() else {
+            return;
+        };
+        settle(
+            &mut event,
+            status.as_u16() as i64,
+            model,
+            usage,
+            error,
+            self.started,
+        );
+        self.permit
+            .take()
+            .expect("audit queue capacity is reserved once")
+            .send(event);
+    }
+
+    fn take_stream(&mut self, status: StatusCode, model: Option<&str>) -> StreamCompletion {
+        let mut event = self.event.take().expect("audit event is available once");
+        event.status = status.as_u16() as i64;
+        event.model = model.map(str::to_owned);
+        StreamCompletion::new(
+            self.permit
+                .take()
+                .expect("audit queue capacity is reserved once"),
+            event,
+            self.started,
+        )
     }
 }
 
 impl Drop for AuditTracker {
     fn drop(&mut self) {
-        if self.finalized {
-            return;
+        if let Some(mut event) = self.event.take() {
+            settle(
+                &mut event,
+                499,
+                None,
+                Usage::default(),
+                Some("client_cancelled"),
+                self.started,
+            );
+            self.permit
+                .take()
+                .expect("audit queue capacity is reserved once")
+                .send(event);
         }
-        let db = self.state.db.clone();
-        let call_id = self.call_id.clone();
-        let task_call_id = call_id.clone();
-        let task = async move {
-            if let Err(error) = sqlx::query("UPDATE api_calls SET status=499,latency_ms=MAX(latency_ms,1),error='client_cancelled' WHERE id=? AND status=0")
-                .bind(&task_call_id).execute(&db).await
-            {
-                tracing::error!(call_id = task_call_id, %error, "failed to finalize cancelled pending audit");
-            }
-        };
-        self.runtime.spawn(task);
     }
 }
 
-pub async fn handle(
+fn settle(
+    event: &mut AuditEvent,
+    status: i64,
+    model: Option<&str>,
+    usage: Usage,
+    error: Option<&str>,
+    started: Instant,
+) {
+    event.status = status;
+    event.model = model.map(str::to_owned);
+    event.latency_ms = started.elapsed().as_millis().max(1) as i64;
+    event.input_tokens = usage.input_tokens;
+    event.output_tokens = usage.output_tokens;
+    event.cached_tokens = usage.cached_tokens;
+    event.error = error.map(str::to_owned);
+}
+
+pub async fn handle_json(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     OriginalUri(uri): OriginalUri,
@@ -133,12 +183,7 @@ pub async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let request_id = headers
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .filter(|v| !v.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let request_id = request_id(&headers);
     let identity = api_identity(&state, &headers).await?;
     let client_ip = peer.ip().to_string();
     let mut audit = AuditTracker::begin(
@@ -161,18 +206,88 @@ pub async fn handle(
     )
     .await;
     if let Err(error) = &result
-        && !audit.finalized
+        && audit.event.is_some()
     {
-        audit
-            .finish(
-                error.status(),
-                None,
-                Usage::default(),
-                Some(error.message()),
-            )
-            .await?;
+        audit.finish(
+            error.status(),
+            None,
+            Usage::default(),
+            Some(error.message()),
+        );
     }
     result
+}
+
+pub async fn handle_audio(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, AppError> {
+    let request_id = request_id(&headers);
+    let identity = api_identity(&state, &headers).await?;
+    let mut audit = AuditTracker::begin(
+        &state,
+        &identity,
+        &request_id,
+        &method,
+        uri.path(),
+        &peer.ip().to_string(),
+    )
+    .await?;
+    let result = dispatch_audio(
+        state,
+        identity,
+        request_id,
+        uri.path(),
+        &headers,
+        body,
+        &mut audit,
+    )
+    .await;
+    if let Err(error) = &result
+        && audit.event.is_some()
+    {
+        audit.finish(
+            error.status(),
+            None,
+            Usage::default(),
+            Some(error.message()),
+        );
+    }
+    result
+}
+
+pub async fn handle_models(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let request_id = request_id(&headers);
+    let identity = api_identity(&state, &headers).await?;
+    let mut audit = AuditTracker::begin(
+        &state,
+        &identity,
+        &request_id,
+        &method,
+        uri.path(),
+        &peer.ip().to_string(),
+    )
+    .await?;
+    models_response(&state, &mut audit).await
+}
+
+fn request_id(headers: &HeaderMap) -> String {
+    headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().to_string())
 }
 
 async fn dispatch(
@@ -184,9 +299,6 @@ async fn dispatch(
     body: &Bytes,
     audit: &mut AuditTracker,
 ) -> Result<Response, AppError> {
-    if path == "/v1/models" {
-        return models_response(&state, audit).await;
-    }
     let parsed = serde_json::from_slice::<Value>(body).ok();
     let model = parsed
         .as_ref()
@@ -195,12 +307,19 @@ async fn dispatch(
         .map(str::to_owned);
     let affinity =
         affinity_key(headers, parsed.as_ref()).map(|key| format!("{}:{key}", identity.key_id));
-    let mut payload = transform_request(path, parsed, body, &state)?;
+    let mut payload = transform_request(path, parsed, &state)?;
     let first = select_ready_channel(&state, affinity.as_deref()).await?;
-    audit.set_channel(&first.channel.id).await?;
+    audit.set_channel(&first.channel.id);
     let first_id = first.channel.id.clone();
-    let response =
-        send_upstream(&state, &first, path, headers, &request_id, payload.clone()).await?;
+    let response = send_upstream(
+        &state,
+        &first,
+        path,
+        headers,
+        &request_id,
+        payload.clone().into(),
+    )
+    .await?;
     track_response(&state, &first_id, response.status(), response.headers()).await?;
     let should_retry = retryable(response.status());
     let (lease, upstream) = if should_retry {
@@ -212,11 +331,7 @@ async fn dispatch(
             Ok(mut second) => {
                 if refresh_if_needed(&state, &mut second).await.is_err() {
                     return relay_response(
-                        CallContext {
-                            state,
-                            request_id,
-                            model,
-                        },
+                        CallContext { request_id, model },
                         first,
                         response,
                         audit,
@@ -225,15 +340,12 @@ async fn dispatch(
                 }
                 drop(response);
                 drop(first);
-                audit.set_channel(&second.channel.id).await?;
-                payload = transform_request(
-                    path,
-                    serde_json::from_slice::<Value>(body).ok(),
-                    body,
-                    &state,
-                )?;
+                audit.set_channel(&second.channel.id);
+                payload =
+                    transform_request(path, serde_json::from_slice::<Value>(body).ok(), &state)?;
                 let second_response =
-                    send_upstream(&state, &second, path, headers, &request_id, payload).await?;
+                    send_upstream(&state, &second, path, headers, &request_id, payload.into())
+                        .await?;
                 track_response(
                     &state,
                     &second.channel.id,
@@ -249,19 +361,51 @@ async fn dispatch(
         (first, response)
     };
     if path == "/v1/images/generations" {
-        let context = CallContext {
-            state,
-            request_id,
-            model,
-        };
+        let context = CallContext { request_id, model };
         return image_response(context, lease, upstream, audit).await;
     }
-    let context = CallContext {
-        state,
-        request_id,
-        model,
-    };
+    let context = CallContext { request_id, model };
     relay_response(context, lease, upstream, audit).await
+}
+
+async fn dispatch_audio(
+    state: AppState,
+    identity: ApiIdentity,
+    request_id: String,
+    path: &str,
+    headers: &HeaderMap,
+    body: Body,
+    audit: &mut AuditTracker,
+) -> Result<Response, AppError> {
+    let affinity = affinity_key(headers, None).map(|key| format!("{}:{key}", identity.key_id));
+    let lease = select_ready_channel(&state, affinity.as_deref()).await?;
+    audit.set_channel(&lease.channel.id);
+    let upstream = send_upstream(
+        &state,
+        &lease,
+        path,
+        headers,
+        &request_id,
+        reqwest::Body::wrap_stream(body.into_data_stream()),
+    )
+    .await?;
+    track_response(
+        &state,
+        &lease.channel.id,
+        upstream.status(),
+        upstream.headers(),
+    )
+    .await?;
+    relay_response(
+        CallContext {
+            request_id,
+            model: None,
+        },
+        lease,
+        upstream,
+        audit,
+    )
+    .await
 }
 
 async fn select_ready_channel(state: &AppState, affinity: Option<&str>) -> Result<Lease, AppError> {
@@ -282,12 +426,8 @@ async fn select_ready_channel(state: &AppState, affinity: Option<&str>) -> Resul
 fn transform_request(
     path: &str,
     mut parsed: Option<Value>,
-    raw: &Bytes,
     state: &AppState,
 ) -> Result<Bytes, AppError> {
-    if path == "/v1/audio/transcriptions" {
-        return Ok(raw.clone());
-    }
     let value = parsed
         .as_mut()
         .ok_or_else(|| AppError::bad_request("JSON request body required"))?;
@@ -329,7 +469,7 @@ fn transform_request(
             .and_then(Value::as_str)
             .unwrap_or("auto");
         let translated = json!({
-            "model": state.config.image_host_model,
+            "model": state.config.load().image_host_model,
             "instructions": "You are an image generator. You MUST call image_generation exactly once and return only that tool call. Mirror the user's request verbatim into the prompt argument.",
             "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":prompt}]}],
             "tools": [{"type":"image_generation","model":image_model,"size":size,"quality":quality,"background":background,"output_format":output_format,"output_compression":output_compression,"moderation":moderation}],
@@ -476,18 +616,21 @@ async fn refresh_if_needed(state: &AppState, lease: &mut Lease) -> Result<(), Ap
     .await?;
     let now = chrono::Utc::now().timestamp();
     if current.2.is_some_and(|expires| expires > now + 60) {
-        lease.access_token = crate::crypto::decrypt(&state.config.encryption_key, &current.0)?;
-        lease.refresh_token = crate::crypto::decrypt(&state.config.encryption_key, &current.1)?;
+        lease.access_token =
+            crate::crypto::decrypt(&state.config.load().encryption_key, &current.0)?;
+        lease.refresh_token =
+            crate::crypto::decrypt(&state.config.load().encryption_key, &current.1)?;
         lease.channel.expires_at = current.2;
         lease.channel.account_id = current.3;
         return Ok(());
     }
-    let refresh_token = crate::crypto::decrypt(&state.config.encryption_key, &current.1)?;
+    let refresh_token = crate::crypto::decrypt(&state.config.load().encryption_key, &current.1)?;
     let token = match oauth::refresh(state, &refresh_token).await {
         Ok(token) => token,
         Err(error) => {
             sqlx::query("UPDATE channels SET status='auth_error',last_error='credential refresh failed',updated_at=? WHERE id=? AND refresh_enc=?")
                 .bind(now).bind(&lease.channel.id).bind(&current.1).execute(&state.db).await?;
+            state.balancer.reload_channels(&state.db).await?;
             return Err(error);
         }
     };
@@ -495,8 +638,8 @@ async fn refresh_if_needed(state: &AppState, lease: &mut Lease) -> Result<(), Ap
         .unwrap_or_else(|_| lease.channel.account_id.clone());
     let expires_at = now + token.expires_in;
     let updated = sqlx::query("UPDATE channels SET access_enc=?,refresh_enc=?,account_id=?,expires_at=?,status='active',last_error=NULL,updated_at=? WHERE id=? AND refresh_enc=?")
-        .bind(encrypt(&state.config.encryption_key, &token.access_token)?)
-        .bind(encrypt(&state.config.encryption_key, &token.refresh_token)?)
+        .bind(encrypt(&state.config.load().encryption_key, &token.access_token)?)
+        .bind(encrypt(&state.config.load().encryption_key, &token.refresh_token)?)
         .bind(&account_id).bind(expires_at).bind(now).bind(&lease.channel.id).bind(&current.1).execute(&state.db).await?;
     if updated.rows_affected() == 0 {
         return Err(AppError::unavailable(
@@ -507,6 +650,7 @@ async fn refresh_if_needed(state: &AppState, lease: &mut Lease) -> Result<(), Ap
     lease.refresh_token = token.refresh_token;
     lease.channel.account_id = account_id;
     lease.channel.expires_at = Some(expires_at);
+    state.balancer.reload_channels(&state.db).await?;
     Ok(())
 }
 
@@ -516,7 +660,7 @@ async fn send_upstream(
     path: &str,
     inbound: &HeaderMap,
     request_id: &str,
-    body: Bytes,
+    body: reqwest::Body,
 ) -> Result<reqwest::Response, AppError> {
     let suffix = match path {
         "/v1/audio/transcriptions" => "/transcribe",
@@ -525,7 +669,7 @@ async fn send_upstream(
     };
     let mut request = state
         .client
-        .post(format!("{}{}", state.config.upstream_base, suffix));
+        .post(format!("{}{}", state.config.load().upstream_base, suffix));
     for (name, value) in inbound {
         if should_forward_request_header(path, name) {
             request = request.header(name, value);
@@ -584,24 +728,18 @@ async fn relay_response(
     if !is_stream {
         let bytes = upstream.bytes().await?;
         let usage = usage_from_bytes(&bytes);
-        audit
-            .finish(
-                status,
-                context.model.as_deref(),
-                usage,
-                error_from(status, &bytes).as_deref(),
-            )
-            .await?;
+        audit.finish(
+            status,
+            context.model.as_deref(),
+            usage,
+            error_from(status, &bytes).as_deref(),
+        );
         return build_response(status, headers, Body::from(bytes));
     }
-    audit
-        .finish(status, context.model.as_deref(), Usage::default(), None)
-        .await?;
-    let call_id = audit.call_id.clone();
-    let audit_state = context.state.clone();
+    let completion = audit.take_stream(status, context.model.as_deref());
     let mut stream = upstream.bytes_stream();
     let output = async_stream::stream! {
-        let mut completion = StreamCompletion::new(audit_state, call_id);
+        let mut completion = completion;
         let mut usage = Usage::default();
         let mut stream_failed = false;
         let mut pending = Vec::<u8>::new();
@@ -618,7 +756,7 @@ async fn relay_response(
                 }
             }
         }
-        completion.finish(usage, stream_failed).await;
+        completion.finish(usage, stream_failed);
         drop(lease);
     };
     build_response(status, headers, Body::from_stream(output))
@@ -639,9 +777,7 @@ async fn image_response(
     let envelope = serde_json::to_vec(
         &json!({"created": chrono::Utc::now().timestamp(), "data": images, "usage": usage}),
     )?;
-    audit
-        .finish(status, context.model.as_deref(), usage, None)
-        .await?;
+    audit.finish(status, context.model.as_deref(), usage, None);
     build_response(
         StatusCode::OK,
         vec![(
@@ -709,52 +845,59 @@ fn filtered_response_headers(headers: &HeaderMap) -> Vec<(HeaderName, HeaderValu
 }
 
 struct StreamCompletion {
-    state: AppState,
-    call_id: String,
-    done: bool,
+    permit: Option<mpsc::OwnedPermit<AuditEvent>>,
+    event: Option<AuditEvent>,
+    started: Instant,
 }
 
 impl StreamCompletion {
-    fn new(state: AppState, call_id: String) -> Self {
+    fn new(permit: mpsc::OwnedPermit<AuditEvent>, event: AuditEvent, started: Instant) -> Self {
         Self {
-            state,
-            call_id,
-            done: false,
+            permit: Some(permit),
+            event: Some(event),
+            started,
         }
     }
 
-    async fn finish(&mut self, usage: Usage, failed: bool) {
-        let status = if failed { Some(502_i64) } else { None };
+    fn finish(&mut self, usage: Usage, failed: bool) {
+        let Some(mut event) = self.event.take() else {
+            return;
+        };
+        let status = if failed { 502 } else { event.status };
         let error = failed.then_some("upstream_stream_error");
-        let result = sqlx::query("UPDATE api_calls SET input_tokens=?,output_tokens=?,cached_tokens=?,status=COALESCE(?,status),error=COALESCE(?,error) WHERE id=?")
-            .bind(usage.input_tokens).bind(usage.output_tokens).bind(usage.cached_tokens)
-            .bind(status).bind(error).bind(&self.call_id).execute(&self.state.db).await;
-        match result {
-            Ok(_) => self.done = true,
-            Err(error) => {
-                tracing::error!(call_id = self.call_id, %error, "failed to settle stream audit")
-            }
-        }
+        let model = event.model.clone();
+        settle(
+            &mut event,
+            status,
+            model.as_deref(),
+            usage,
+            error,
+            self.started,
+        );
+        self.permit
+            .take()
+            .expect("audit queue capacity is reserved once")
+            .send(event);
     }
 }
 
 impl Drop for StreamCompletion {
     fn drop(&mut self) {
-        if self.done {
-            return;
+        if let Some(mut event) = self.event.take() {
+            let model = event.model.clone();
+            settle(
+                &mut event,
+                499,
+                model.as_deref(),
+                Usage::default(),
+                Some("client_cancelled"),
+                self.started,
+            );
+            self.permit
+                .take()
+                .expect("audit queue capacity is reserved once")
+                .send(event);
         }
-        let state = self.state.clone();
-        let call_id = self.call_id.clone();
-        tokio::spawn(async move {
-            if let Err(error) =
-                sqlx::query("UPDATE api_calls SET status=499,error='client_cancelled' WHERE id=?")
-                    .bind(&call_id)
-                    .execute(&state.db)
-                    .await
-            {
-                tracing::error!(%call_id, %error, "failed to finalize cancelled stream audit");
-            }
-        });
     }
 }
 
@@ -853,9 +996,7 @@ async fn models_response(
         "gpt-image-1",
         "gpt-image-1.5",
     ];
-    audit
-        .finish(StatusCode::OK, None, Usage::default(), None)
-        .await?;
+    audit.finish(StatusCode::OK, None, Usage::default(), None);
     let body = serde_json::to_vec(
         &json!({"object":"list","data":models.map(|id| json!({"id":id,"object":"model","owned_by":"openai"}))}),
     )?;
@@ -973,10 +1114,25 @@ mod tests {
             .bind(crate::crypto::api_key_hash("sk-test-secret")).bind(now).execute(&state.db).await.unwrap();
         if channel {
             sqlx::query("INSERT INTO channels(id,name,account_id,access_enc,refresh_enc,status,created_at,updated_at) VALUES('channel-1','one','account-1',?,?,'active',?,?)")
-                .bind(crate::crypto::encrypt(&state.config.encryption_key, "access-token").unwrap())
-                .bind(crate::crypto::encrypt(&state.config.encryption_key, "refresh-token").unwrap())
+                .bind(crate::crypto::encrypt(&state.config.load().encryption_key, "access-token").unwrap())
+                .bind(crate::crypto::encrypt(&state.config.load().encryption_key, "refresh-token").unwrap())
                 .bind(now).bind(now).execute(&state.db).await.unwrap();
+            state.balancer.reload_channels(&state.db).await.unwrap();
         }
+    }
+
+    async fn wait_for_audits(state: &AppState, expected: i64) {
+        for _ in 0..100 {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_calls")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+            if count >= expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {expected} audit events");
     }
 
     fn proxy_request(
@@ -1052,22 +1208,87 @@ mod tests {
         )
         .await
         .unwrap();
-        audit
-            .finish(
-                StatusCode::OK,
-                None,
-                Usage {
-                    input_tokens: 12,
-                    output_tokens: 4,
-                    cached_tokens: 3,
-                },
-                None,
-            )
-            .await
-            .unwrap();
+        audit.finish(
+            StatusCode::OK,
+            None,
+            Usage {
+                input_tokens: 12,
+                output_tokens: 4,
+                cached_tokens: 3,
+            },
+            None,
+        );
+        wait_for_audits(&state, 1).await;
         let row: (i64, i64, i64, i64) = sqlx::query_as("SELECT input_tokens,output_tokens,cached_tokens,COUNT(*) FROM api_calls WHERE request_id='request-1'")
             .fetch_one(&state.db).await.unwrap();
         assert_eq!(row, (12, 4, 3, 1));
+    }
+
+    #[tokio::test]
+    async fn audit_survives_channel_deletion_during_an_inflight_call() {
+        let state = crate::test_state("http://token.invalid").await;
+        seed_proxy(&state, false).await;
+        let identity = ApiIdentity {
+            key_id: "key-1".to_owned(),
+            user_id: "user-1".to_owned(),
+        };
+        let mut audit = AuditTracker::begin(
+            &state,
+            &identity,
+            "deleted-channel-request",
+            &Method::POST,
+            "/v1/responses",
+            "127.0.0.1",
+        )
+        .await
+        .unwrap();
+        audit.set_channel("channel-1");
+        sqlx::query("DELETE FROM channels WHERE id='channel-1'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        audit.finish(StatusCode::OK, Some("gpt-5.4"), Usage::default(), None);
+
+        wait_for_audits(&state, 1).await;
+        let row: (i64, Option<String>) = sqlx::query_as(
+            "SELECT status,channel_id FROM api_calls WHERE request_id='deleted-channel-request'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(row, (200, None));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_model_calls_batch_audit_without_sqlite_contention() {
+        let state = crate::test_state("http://token.invalid").await;
+        seed_proxy(&state, false).await;
+        let app = crate::router(state.clone());
+        let mut tasks = Vec::new();
+        for _ in 0..200 {
+            let service = app.clone();
+            tasks.push(tokio::spawn(async move {
+                service
+                    .oneshot(proxy_request(
+                        "/v1/models",
+                        "application/json",
+                        Body::empty(),
+                    ))
+                    .await
+                    .unwrap()
+                    .status()
+            }));
+        }
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), StatusCode::OK);
+        }
+        wait_for_audits(&state, 200).await;
+        let row: (i64, i64) =
+            sqlx::query_as("SELECT COUNT(*),COUNT(DISTINCT request_id) FROM api_calls")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(row, (200, 200));
     }
 
     #[tokio::test]
@@ -1167,6 +1388,7 @@ mod tests {
         assert!(compact_body.get("store").is_none());
         assert_eq!(records[2].body, audio);
         drop(records);
+        wait_for_audits(&state, 4).await;
         let method: String =
             sqlx::query_scalar("SELECT method FROM api_calls WHERE path='/v1/models'")
                 .fetch_one(&state.db)
@@ -1197,6 +1419,7 @@ mod tests {
             assert_eq!(response.status(), expected);
             let body = response.into_body().collect().await.unwrap().to_bytes();
             assert!(std::str::from_utf8(&body).unwrap().contains("limited"));
+            wait_for_audits(&state, 1).await;
             let status: i64 = sqlx::query_scalar("SELECT status FROM api_calls")
                 .fetch_one(&state.db)
                 .await
@@ -1215,6 +1438,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        wait_for_audits(&state, 1).await;
         let status: i64 = sqlx::query_scalar("SELECT status FROM api_calls")
             .fetch_one(&state.db)
             .await
@@ -1235,15 +1459,7 @@ mod tests {
             json!({"prompt":"x","output_compression":-1}),
             json!({"prompt":"x","model":4}),
         ] {
-            assert!(
-                transform_request(
-                    "/v1/images/generations",
-                    Some(payload),
-                    &Bytes::new(),
-                    &state,
-                )
-                .is_err()
-            );
+            assert!(transform_request("/v1/images/generations", Some(payload), &state,).is_err());
         }
         let mut headers = HeaderMap::new();
         headers.insert("x-lb-affinity-key", HeaderValue::from_static("secret"));
@@ -1272,9 +1488,10 @@ mod tests {
         let state = crate::test_state(&format!("http://{address}/token")).await;
         let now = chrono::Utc::now().timestamp();
         sqlx::query("INSERT INTO channels(id,name,account_id,access_enc,refresh_enc,expires_at,status,created_at,updated_at) VALUES('channel-1','one','account-1',?,?,?,'active',?,?)")
-            .bind(crate::crypto::encrypt(&state.config.encryption_key, "access-old").unwrap())
-            .bind(crate::crypto::encrypt(&state.config.encryption_key, "refresh-old").unwrap())
+            .bind(crate::crypto::encrypt(&state.config.load().encryption_key, "access-old").unwrap())
+            .bind(crate::crypto::encrypt(&state.config.load().encryption_key, "refresh-old").unwrap())
             .bind(now - 1).bind(now).bind(now).execute(&state.db).await.unwrap();
+        state.balancer.reload_channels(&state.db).await.unwrap();
         let first = state.balancer.select(&state, None, None).await.unwrap();
         let second = state.balancer.select(&state, None, None).await.unwrap();
         let state_one = state.clone();
@@ -1310,24 +1527,13 @@ mod tests {
         )
         .await
         .unwrap();
-        audit
-            .finish(StatusCode::OK, Some("gpt-5.4"), Usage::default(), None)
-            .await
-            .unwrap();
-        drop(StreamCompletion::new(state.clone(), audit.call_id.clone()));
-        let mut status = 200_i64;
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-            status = sqlx::query_scalar(
-                "SELECT status FROM api_calls WHERE request_id='stream-request'",
-            )
-            .fetch_one(&state.db)
-            .await
-            .unwrap();
-            if status == 499 {
-                break;
-            }
-        }
+        drop(audit.take_stream(StatusCode::OK, Some("gpt-5.4")));
+        wait_for_audits(&state, 1).await;
+        let status: i64 =
+            sqlx::query_scalar("SELECT status FROM api_calls WHERE request_id='stream-request'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
         assert_eq!(status, 499);
     }
 
@@ -1366,17 +1572,11 @@ mod tests {
         started.notified().await;
         request_task.abort();
         assert!(request_task.await.unwrap_err().is_cancelled());
-        let mut status = 0_i64;
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-            status = sqlx::query_scalar("SELECT status FROM api_calls")
-                .fetch_one(&state.db)
-                .await
-                .unwrap();
-            if status == 499 {
-                break;
-            }
-        }
+        wait_for_audits(&state, 1).await;
+        let status: i64 = sqlx::query_scalar("SELECT status FROM api_calls")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
         assert_eq!(status, 499);
         let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_calls WHERE status=0")
             .fetch_one(&state.db)

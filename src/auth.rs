@@ -26,6 +26,13 @@ pub struct ApiIdentity {
     pub user_id: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct VerifiedIdentity {
+    pub id: String,
+    pub email: Option<String>,
+    pub name: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct Claims {
     sub: String,
@@ -141,77 +148,80 @@ impl AuthVerifier {
     }
 }
 
+#[derive(Clone)]
+pub struct AuthManager {
+    client: reqwest::Client,
+    verifier: Arc<RwLock<Option<AuthVerifier>>>,
+}
+
+impl AuthManager {
+    pub fn new(issuer: Option<String>, audience: Option<String>, client: reqwest::Client) -> Self {
+        let verifier = issuer.map(|issuer| AuthVerifier::new(issuer, audience, client.clone()));
+        Self {
+            client,
+            verifier: Arc::new(RwLock::new(verifier)),
+        }
+    }
+
+    pub async fn configure(&self, issuer: String, audience: Option<String>) {
+        *self.verifier.write().await =
+            Some(AuthVerifier::new(issuer, audience, self.client.clone()));
+    }
+
+    pub async fn verify_candidate(
+        &self,
+        issuer: String,
+        audience: Option<String>,
+        token: &str,
+    ) -> Result<VerifiedIdentity, AppError> {
+        let claims = AuthVerifier::new(issuer, audience, self.client.clone())
+            .verify(token)
+            .await?;
+        Ok(VerifiedIdentity {
+            id: claims.sub,
+            email: claims.email,
+            name: claims.name,
+        })
+    }
+
+    async fn verify(&self, token: &str) -> Result<Claims, AppError> {
+        let verifier = self
+            .verifier
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| AppError::unavailable("OpenAI-LB setup is not complete"))?;
+        verifier.verify(token).await
+    }
+}
+
 pub async fn browser_identity(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<UserIdentity, AppError> {
     let token = bearer(headers)?;
     let claims = state.auth.verify(token).await?;
-    upsert_user(&state.db, &claims, state.config.admin_user_id.as_deref()).await
+    upsert_user(&state.db, &claims).await
 }
 
-async fn upsert_user(
-    pool: &SqlitePool,
-    claims: &Claims,
-    configured_admin: Option<&str>,
-) -> Result<UserIdentity, AppError> {
-    let mut connection = pool.acquire().await?;
-    sqlx::query("BEGIN IMMEDIATE")
-        .execute(&mut *connection)
-        .await?;
-    if let Some(admin_id) = configured_admin {
-        sqlx::query("UPDATE users SET role=CASE WHEN id=? THEN 'admin' ELSE 'user' END")
-            .bind(admin_id)
-            .execute(&mut *connection)
-            .await?;
-    }
-    let existing = sqlx::query("SELECT email, display_name, role FROM users WHERE id=?")
-        .bind(&claims.sub)
-        .fetch_optional(&mut *connection)
-        .await?;
-    if let Some(row) = existing {
-        let role: String = if configured_admin == Some(claims.sub.as_str()) {
-            sqlx::query("UPDATE users SET role='admin' WHERE id=?")
-                .bind(&claims.sub)
-                .execute(&mut *connection)
-                .await?;
-            "admin".to_owned()
-        } else {
-            row.get(2)
-        };
-        sqlx::query("COMMIT").execute(&mut *connection).await?;
-        return Ok(UserIdentity {
-            id: claims.sub.clone(),
-            email: row.get(0),
-            name: row.get(1),
-            role,
-        });
-    }
-    let role = match configured_admin {
-        Some(admin_id) if admin_id == claims.sub => "admin",
-        Some(_) => "user",
-        None => {
-            let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role='admin'")
-                .fetch_one(&mut *connection)
-                .await?;
-            if admins == 0 { "admin" } else { "user" }
-        }
-    };
+async fn upsert_user(pool: &SqlitePool, claims: &Claims) -> Result<UserIdentity, AppError> {
     let now = chrono::Utc::now().timestamp();
-    sqlx::query("INSERT INTO users(id,email,display_name,role,created_at) VALUES(?,?,?,?,?)")
+    sqlx::query("INSERT INTO users(id,email,display_name,role,created_at) VALUES(?,?,?,'user',?) ON CONFLICT(id) DO UPDATE SET email=excluded.email,display_name=excluded.display_name")
         .bind(&claims.sub)
         .bind(&claims.email)
         .bind(&claims.name)
-        .bind(role)
         .bind(now)
-        .execute(&mut *connection)
+        .execute(pool)
         .await?;
-    sqlx::query("COMMIT").execute(&mut *connection).await?;
+    let row = sqlx::query("SELECT email,display_name,role FROM users WHERE id=?")
+        .bind(&claims.sub)
+        .fetch_one(pool)
+        .await?;
     Ok(UserIdentity {
         id: claims.sub.clone(),
-        email: claims.email.clone(),
-        name: claims.name.clone(),
-        role: role.to_owned(),
+        email: row.get(0),
+        name: row.get(1),
+        role: row.get(2),
     })
 }
 
@@ -230,21 +240,26 @@ pub async fn api_identity(state: &AppState, headers: &HeaderMap) -> Result<ApiId
         key_id: row.get(0),
         user_id: row.get(1),
     };
-    sqlx::query("UPDATE api_keys SET last_used_at=? WHERE id=?")
-        .bind(chrono::Utc::now().timestamp())
-        .bind(&identity.key_id)
-        .execute(&state.db)
-        .await?;
     Ok(identity)
 }
 
 pub fn require_admin(identity: &UserIdentity) -> Result<(), AppError> {
-    (identity.role == "admin")
+    is_admin(identity)
         .then_some(())
         .ok_or_else(|| AppError::forbidden("administrator access required"))
 }
 
-fn bearer(headers: &HeaderMap) -> Result<&str, AppError> {
+pub fn is_admin(identity: &UserIdentity) -> bool {
+    matches!(identity.role.as_str(), "root" | "admin")
+}
+
+pub fn require_root(identity: &UserIdentity) -> Result<(), AppError> {
+    (identity.role == "root")
+        .then_some(())
+        .ok_or_else(|| AppError::forbidden("root access required"))
+}
+
+pub(crate) fn bearer(headers: &HeaderMap) -> Result<&str, AppError> {
     headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -306,47 +321,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_admin_bootstrap_is_atomic() {
-        let path =
-            std::env::temp_dir().join(format!("openai-lb-admin-{}.sqlite", uuid::Uuid::new_v4()));
-        let pool = crate::db::connect(&format!("sqlite://{}?mode=rwc", path.display()))
-            .await
-            .unwrap();
-        let first_pool = pool.clone();
-        let second_pool = pool.clone();
-        let first = tokio::spawn(async move {
-            upsert_user(&first_pool, &claims("first"), None)
-                .await
-                .unwrap()
-        });
-        let second = tokio::spawn(async move {
-            upsert_user(&second_pool, &claims("second"), None)
-                .await
-                .unwrap()
-        });
-        let (first, second) = tokio::join!(first, second);
-        let roles = [first.unwrap().role, second.unwrap().role];
-        assert_eq!(
-            roles.iter().filter(|role| role.as_str() == "admin").count(),
-            1
-        );
-        pool.close().await;
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-        }
-    }
-
-    #[tokio::test]
-    async fn configured_admin_disables_first_user_bootstrap() {
+    async fn ordinary_login_never_bootstraps_privilege() {
         let state = crate::test_state("http://token.invalid").await;
-        let ordinary = upsert_user(&state.db, &claims("ordinary"), Some("configured"))
-            .await
-            .unwrap();
-        let configured = upsert_user(&state.db, &claims("configured"), Some("configured"))
-            .await
-            .unwrap();
+        let ordinary = upsert_user(&state.db, &claims("ordinary")).await.unwrap();
         assert_eq!(ordinary.role, "user");
-        assert_eq!(configured.role, "admin");
     }
 
     fn sign_token(key: &SigningKey, issuer: &str, typ: &str, exp: i64) -> String {

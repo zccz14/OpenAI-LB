@@ -1,4 +1,5 @@
 pub mod api;
+pub mod audit;
 pub mod auth;
 pub mod balancer;
 pub mod config;
@@ -9,9 +10,10 @@ pub mod proxy;
 
 use std::{sync::Arc, time::Duration};
 
+use arc_swap::ArcSwap;
 use axum::{
     Router,
-    http::{HeaderValue, Method, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
 };
@@ -19,62 +21,59 @@ use dashmap::DashMap;
 use rust_embed::RustEmbed;
 use serde_json::json;
 use sqlx::SqlitePool;
-use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
+use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 
-use crate::{auth::AuthVerifier, balancer::Balancer, config::Config};
+use crate::audit::AuditWriter;
+use crate::{auth::AuthManager, balancer::Balancer, config::Config};
 
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Arc<Config>,
+    pub config: Arc<ArcSwap<Config>>,
     pub db: SqlitePool,
     pub client: reqwest::Client,
-    pub auth: AuthVerifier,
+    pub auth: AuthManager,
+    pub audit: AuditWriter,
     pub balancer: Balancer,
     pub refresh_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl AppState {
-    pub fn new(config: Config, db: SqlitePool) -> anyhow::Result<Self> {
+    pub async fn new(config: Config, db: SqlitePool) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(600))
             .build()?;
-        let auth = AuthVerifier::new(
+        let auth = AuthManager::new(
             config.auth_issuer.clone(),
             config.auth_audience.clone(),
             client.clone(),
         );
+        let audit = AuditWriter::new(db.clone());
+        let balancer = Balancer::default();
+        balancer.hydrate(&db).await?;
+        balancer.start_maintenance(db.clone());
         Ok(Self {
-            config: Arc::new(config),
+            config: Arc::new(ArcSwap::from_pointee(config)),
             db,
             client,
             auth,
-            balancer: Balancer::default(),
+            audit,
+            balancer,
             refresh_locks: Arc::new(DashMap::new()),
         })
     }
 }
 
 pub fn router(state: AppState) -> Router {
-    let cors = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE])
-        .allow_headers([
-            axum::http::header::AUTHORIZATION,
-            axum::http::header::CONTENT_TYPE,
-            HeaderNameExt::x_request_id(),
-        ])
-        .allow_origin(
-            state
-                .config
-                .allowed_origins
-                .iter()
-                .filter_map(|origin| origin.parse::<HeaderValue>().ok())
-                .collect::<Vec<_>>(),
-        );
-    let limit = state.config.max_body_bytes;
+    let config = state.config.load();
+    let response_limit = config.response_body_limit;
+    let image_limit = config.image_body_limit;
+    let audio_limit = config.audio_body_limit;
+    drop(config);
     Router::new()
         .route("/api/health", get(api::health))
         .route("/api/config", get(api::public_config))
+        .route("/api/setup", get(api::setup_status).post(api::setup))
         .route("/api/me", get(api::me))
         .route("/api/keys", get(api::list_keys).post(api::create_key))
         .route("/api/keys/{id}", delete(api::revoke_key))
@@ -92,26 +91,41 @@ pub fn router(state: AppState) -> Router {
         .route("/api/audit", get(api::audit))
         .route("/api/admin-audit", get(api::list_admin_audit))
         .route("/api/dashboard", get(api::dashboard))
-        .route("/api/settings", get(api::settings))
-        .route("/v1/responses", post(proxy::handle))
-        .route("/v1/responses/compact", post(proxy::handle))
-        .route("/backend-api/codex/responses", post(proxy::handle))
-        .route("/backend-api/codex/responses/compact", post(proxy::handle))
-        .route("/v1/audio/transcriptions", post(proxy::handle))
-        .route("/v1/images/generations", post(proxy::handle))
-        .route("/v1/models", get(proxy::handle))
+        .route(
+            "/api/settings",
+            get(api::settings).patch(api::update_settings),
+        )
+        .route("/api/users", get(api::list_users))
+        .route("/api/users/{id}", patch(api::update_user_role))
+        .route(
+            "/v1/responses",
+            post(proxy::handle_json).layer(RequestBodyLimitLayer::new(response_limit)),
+        )
+        .route(
+            "/v1/responses/compact",
+            post(proxy::handle_json).layer(RequestBodyLimitLayer::new(response_limit)),
+        )
+        .route(
+            "/backend-api/codex/responses",
+            post(proxy::handle_json).layer(RequestBodyLimitLayer::new(response_limit)),
+        )
+        .route(
+            "/backend-api/codex/responses/compact",
+            post(proxy::handle_json).layer(RequestBodyLimitLayer::new(response_limit)),
+        )
+        .route(
+            "/v1/audio/transcriptions",
+            post(proxy::handle_audio).layer(RequestBodyLimitLayer::new(audio_limit)),
+        )
+        .route(
+            "/v1/images/generations",
+            post(proxy::handle_json).layer(RequestBodyLimitLayer::new(image_limit)),
+        )
+        .route("/v1/models", get(proxy::handle_models))
         .fallback(static_asset)
-        .layer(RequestBodyLimitLayer::new(limit))
-        .layer(cors)
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
-}
-
-struct HeaderNameExt;
-impl HeaderNameExt {
-    fn x_request_id() -> axum::http::HeaderName {
-        axum::http::HeaderName::from_static("x-request-id")
-    }
 }
 
 #[derive(RustEmbed)]
@@ -257,25 +271,27 @@ pub(crate) async fn test_state_with_upstream(
     oauth_token_url: &str,
     upstream_base: &str,
 ) -> AppState {
+    let pool = db::connect_memory().await.unwrap();
     let config = Config {
         listen: "127.0.0.1:0".parse().unwrap(),
-        database_url: "sqlite::memory:".to_owned(),
+        data_dir: std::env::temp_dir(),
+        database_path: std::path::PathBuf::from(":memory:"),
         encryption_key: [9_u8; 32],
-        auth_issuer: "http://auth.invalid".to_owned(),
+        setup_complete: true,
+        auth_issuer: Some("http://auth.invalid".to_owned()),
         auth_audience: None,
-        admin_user_id: None,
         upstream_base: upstream_base.to_owned(),
         image_host_model: "gpt-5.4".to_owned(),
         oauth_authorize_url: "http://auth.invalid/oauth/authorize".to_owned(),
         oauth_token_url: oauth_token_url.to_owned(),
         oauth_redirect_uri: "http://localhost:1455/auth/callback".to_owned(),
         oauth_client_id: "test-client".to_owned(),
-        allowed_origins: vec!["http://localhost".to_owned()],
-        max_body_bytes: 1024 * 1024,
+        response_body_limit: 1024 * 1024,
+        image_body_limit: 1024 * 1024,
+        audio_body_limit: 1024 * 1024,
         affinity_ttl_seconds: 3600,
     };
-    let pool = db::connect(&config.database_url).await.unwrap();
-    AppState::new(config, pool).unwrap()
+    AppState::new(config, pool).await.unwrap()
 }
 
 #[cfg(test)]

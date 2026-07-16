@@ -8,6 +8,8 @@ OpenAI-LB 是一个面向 OpenAI / CodeX OAuth 渠道的反向代理和负载均
 
 从 [GitHub Releases](https://github.com/zccz14/OpenAI-LB/releases) 下载当前平台的压缩包并校验同名 `.sha256` 文件，然后运行：
 
+预构建发布覆盖 Linux x86_64、Linux arm64 和 Apple Silicon macOS。Windows 与 Intel macOS 不进入官方 Release 构建矩阵。
+
 ```bash
 ./openai-lb
 ```

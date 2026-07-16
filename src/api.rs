@@ -408,6 +408,7 @@ pub async fn read_channel_tokens(
 
 #[derive(Deserialize)]
 pub struct ReplaceChannelTokens {
+    name: String,
     access_key: String,
     refresh_key: String,
 }
@@ -424,6 +425,7 @@ pub async fn replace_channel_tokens(
     let result = replace_channel_token_values(
         &state,
         &id,
+        input.name.trim(),
         input.access_key.trim(),
         input.refresh_key.trim(),
     )
@@ -440,24 +442,45 @@ pub async fn replace_channel_tokens(
 async fn replace_channel_token_values(
     state: &AppState,
     id: &str,
+    name: &str,
     access_token: &str,
     refresh_token: &str,
 ) -> Result<Json<Value>, AppError> {
-    if access_token.is_empty() || refresh_token.is_empty() {
+    if name.is_empty() || access_token.is_empty() || refresh_token.is_empty() {
         return Err(AppError::bad_request(
-            "access_key and refresh_key are required",
+            "name, access_key and refresh_key are required",
         ));
     }
     let account_id = oauth::account_id_from_jwt(access_token)?;
     let expires_at = oauth::expires_at_from_jwt(access_token);
-    let updated = sqlx::query("UPDATE channels SET access_token=?,refresh_token=?,account_id=?,expires_at=?,status=CASE WHEN manual_disabled=1 THEN 'disabled' ELSE 'active' END,cooldown_until=NULL,last_error=NULL,updated_at=? WHERE id=?")
-        .bind(access_token).bind(refresh_token).bind(&account_id).bind(expires_at)
+    let updated = sqlx::query("UPDATE channels SET name=?,access_token=?,refresh_token=?,account_id=?,expires_at=?,status=CASE WHEN manual_disabled=1 THEN 'disabled' ELSE 'active' END,cooldown_until=NULL,last_error=NULL,updated_at=? WHERE id=?")
+        .bind(name).bind(access_token).bind(refresh_token).bind(&account_id).bind(expires_at)
         .bind(chrono::Utc::now().timestamp()).bind(id).execute(&state.db).await?;
     if updated.rows_affected() == 0 {
         return Err(AppError::not_found("channel not found"));
     }
     state.balancer.reload_channels(&state.db).await?;
-    Ok(Json(json!({"ok":true,"account_id":account_id})))
+    Ok(Json(json!({"ok":true,"name":name,"account_id":account_id})))
+}
+
+pub async fn list_channel_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let user = browser_identity(&state, &headers).await?;
+    require_admin(&user)?;
+    let ids = sqlx::query_scalar::<_, String>("SELECT id FROM channels ORDER BY created_at DESC")
+        .fetch_all(&state.db)
+        .await?;
+    let mut channels = serde_json::Map::new();
+    for id in ids {
+        let value = match channel_usage_value(&state, &id).await {
+            Ok(usage) => json!({"usage": usage}),
+            Err(error) => json!({"error": error.message()}),
+        };
+        channels.insert(id, value);
+    }
+    Ok(Json(json!({"channels": channels})))
 }
 
 pub async fn test_channel(
@@ -479,6 +502,12 @@ pub async fn test_channel(
 }
 
 async fn channel_usage(state: &AppState, id: &str) -> Result<Json<Value>, AppError> {
+    Ok(Json(
+        json!({"ok":true,"usage":channel_usage_value(state, id).await?}),
+    ))
+}
+
+async fn channel_usage_value(state: &AppState, id: &str) -> Result<Value, AppError> {
     let row: (String, String) =
         sqlx::query_as("SELECT access_token,account_id FROM channels WHERE id=?")
             .bind(id)
@@ -506,7 +535,7 @@ async fn channel_usage(state: &AppState, id: &str) -> Result<Json<Value>, AppErr
         .json::<Value>()
         .await
         .map_err(|_| AppError::upstream(502, "channel Usage API returned invalid JSON"))?;
-    Ok(Json(json!({"ok":true,"usage":usage})))
+    Ok(usage)
 }
 
 pub async fn delete_channel(
@@ -1143,18 +1172,26 @@ mod tests {
         assert_eq!(stored, (access, "refresh-old".to_owned()));
 
         let replacement = channel_access_token("account-new");
-        let _ = replace_channel_token_values(&state, &id, &replacement, "refresh-new")
-            .await
-            .unwrap();
-        let updated: (String, String, String) =
-            sqlx::query_as("SELECT access_token,refresh_token,account_id FROM channels WHERE id=?")
-                .bind(&id)
-                .fetch_one(&state.db)
-                .await
-                .unwrap();
+        let _ = replace_channel_token_values(
+            &state,
+            &id,
+            "channel renamed",
+            &replacement,
+            "refresh-new",
+        )
+        .await
+        .unwrap();
+        let updated: (String, String, String, String) = sqlx::query_as(
+            "SELECT name,access_token,refresh_token,account_id FROM channels WHERE id=?",
+        )
+        .bind(&id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
         assert_eq!(
             updated,
             (
+                "channel renamed".to_owned(),
                 replacement,
                 "refresh-new".to_owned(),
                 "account-new".to_owned()
@@ -1219,7 +1256,7 @@ mod tests {
                     if headers[header::AUTHORIZATION] == "Bearer denied" {
                         return (StatusCode::UNAUTHORIZED, "denied").into_response();
                     }
-                    Json(json!({"plan_type":"team","rate_limit":{"primary_window":{"used_percent":10}}})).into_response()
+                    Json(json!({"email":"ops@example.com","plan_type":"team","rate_limit":{"primary_window":{"used_percent":10,"reset_after_seconds":1800}}})).into_response()
                 }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1279,7 +1316,9 @@ mod tests {
                 Method::PUT,
                 &format!("/api/channels/{channel_id}"),
                 &browser_token,
-                Some(json!({"access_key":replacement,"refresh_key":"refresh-new"})),
+                Some(
+                    json!({"name":"renamed","access_key":replacement,"refresh_key":"refresh-new"}),
+                ),
             )
             .await;
             assert_eq!(update.status(), StatusCode::OK);
@@ -1292,6 +1331,25 @@ mod tests {
             )
             .await;
             assert_eq!(test.status(), StatusCode::OK);
+            let usage_list = channel_request(
+                &state,
+                Method::GET,
+                "/api/channels/usage",
+                &browser_token,
+                None,
+            )
+            .await;
+            assert_eq!(usage_list.status(), StatusCode::OK);
+            let usage_body = usage_list.into_body().collect().await.unwrap().to_bytes();
+            let usage_value: Value = serde_json::from_slice(&usage_body).unwrap();
+            assert_eq!(
+                usage_value.pointer(&format!("/channels/{channel_id}/usage/plan_type")),
+                Some(&json!("team"))
+            );
+            assert_eq!(
+                usage_value.pointer(&format!("/channels/{channel_id}/usage/email")),
+                Some(&json!("ops@example.com"))
+            );
             let delete = channel_request(
                 &state,
                 Method::DELETE,
@@ -1314,11 +1372,14 @@ mod tests {
             .bind(now).bind(now).execute(&state.db).await.unwrap();
         let tenant_token = setup_token(&signing, &issuer, "tenant-user");
         for (method, path, body) in [
+            (Method::GET, "/api/channels/usage", None),
             (Method::GET, "/api/channels/tenant-channel", None),
             (
                 Method::PUT,
                 "/api/channels/tenant-channel",
-                Some(json!({"access_key":channel_access_token("tenant"),"refresh_key":"refresh"})),
+                Some(
+                    json!({"name":"tenant","access_key":channel_access_token("tenant"),"refresh_key":"refresh"}),
+                ),
             ),
             (Method::POST, "/api/channels/tenant-channel/test", None),
             (Method::DELETE, "/api/channels/tenant-channel", None),

@@ -1325,11 +1325,13 @@ mod tests {
 
     async fn seed_proxy(state: &AppState, channel: bool) {
         let now = chrono::Utc::now().timestamp();
-        sqlx::query("INSERT INTO users(id,role,created_at) VALUES('user-1','user',?)")
-            .bind(now)
-            .execute(&state.db)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO users(id,role,channel_access,created_at) VALUES('user-1','user',1,?)",
+        )
+        .bind(now)
+        .execute(&state.db)
+        .await
+        .unwrap();
         sqlx::query("INSERT INTO api_keys(id,user_id,name,prefix,secret_hash,created_at) VALUES('key-1','user-1','test','sk-test',?,?)")
             .bind(crate::crypto::api_key_hash("sk-test-secret")).bind(now).execute(&state.db).await.unwrap();
         if channel {

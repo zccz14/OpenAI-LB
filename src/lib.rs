@@ -102,7 +102,7 @@ pub fn router(state: AppState) -> Router {
             get(api::settings).patch(api::update_settings),
         )
         .route("/api/users", get(api::list_users))
-        .route("/api/users/{id}", patch(api::update_user_role))
+        .route("/api/users/{id}", patch(api::update_user))
         .route(
             "/v1/responses",
             post(proxy::handle_json).layer(RequestBodyLimitLayer::new(response_limit)),

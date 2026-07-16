@@ -101,6 +101,18 @@ cargo build --release --locked
 
 `build.rs` 不启动 npm，因此 Rust 构建环境不需要 Node。GitHub Release 工作流先构建一次前端，再复用相同产物生成各平台二进制。
 
+## 生产部署
+
+生产环境运行在 AWS Singapore 的 `openai-lb` EC2，并通过 <https://openai.ntnl.io> 提供 HTTPS 服务。Nginx 只负责 TLS 和流式反向代理；SQLite、master key 与应用配置保存在实例的 `/var/lib/openai-lb/.openai-lb/`。
+
+推送 `v*` tag 后，Release workflow 会先发布三个官方平台资产，再使用 GitHub OIDC 和 AWS Systems Manager 将 Linux x86_64 资产部署到 EC2。部署过程校验 Release 的 SHA-256，使用 systemd 重启服务并执行本机健康检查；健康检查失败时恢复上一版本。仓库不保存 AWS 长期密钥，也不开放 SSH 入站端口。
+
+部署 Action 使用以下 Repository variables：
+
+- `AWS_DEPLOY_ROLE_ARN`
+- `AWS_REGION`
+- `EC2_INSTANCE_ID`
+
 ## 验证
 
 ```bash

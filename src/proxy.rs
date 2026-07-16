@@ -1824,7 +1824,7 @@ mod tests {
                 .oneshot(proxy_request(
                     "/v1/responses",
                     "application/json",
-                    Body::from(r#"{"model":"gpt-5.4","input":"stream"}"#),
+                    Body::from(r#"{"model":"gpt-5.4","input":"stream","stream":true}"#),
                 ))
                 .await
                 .unwrap();

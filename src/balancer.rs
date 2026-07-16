@@ -13,17 +13,17 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, Row};
 
-use crate::{AppError, AppState, crypto::decrypt};
+use crate::{AppError, AppState};
 
-#[derive(Clone, Debug, FromRow, Serialize)]
+#[derive(Clone, FromRow, Serialize)]
 pub struct Channel {
     pub id: String,
     pub name: String,
     pub account_id: String,
     #[serde(skip_serializing)]
-    pub access_enc: String,
+    pub access_token: String,
     #[serde(skip_serializing)]
-    pub refresh_enc: String,
+    pub refresh_token: String,
     pub expires_at: Option<i64>,
     pub status: String,
     pub manual_disabled: i64,
@@ -126,8 +126,8 @@ impl Balancer {
             .or_default()
             .fetch_add(1, Ordering::Relaxed);
         Ok(Lease {
-            access_token: decrypt(&state.config.load().encryption_key, &chosen.access_enc)?,
-            refresh_token: decrypt(&state.config.load().encryption_key, &chosen.refresh_enc)?,
+            access_token: chosen.access_token.clone(),
+            refresh_token: chosen.refresh_token.clone(),
             channel: chosen,
             inflight: self.inflight.clone(),
         })
@@ -213,6 +213,33 @@ impl Balancer {
         Ok(())
     }
 
+    pub fn forget_channel(&self, channel_id: &str) {
+        let mut channels = (**self.channels.load()).clone();
+        channels.retain(|channel| channel.id != channel_id);
+        self.channels.store(Arc::new(channels));
+        self.inflight.remove(channel_id);
+        self.channel_updates.remove(channel_id);
+
+        let hashes = self
+            .affinities
+            .iter()
+            .filter(|entry| entry.value().channel_id == channel_id)
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        for hash in hashes {
+            let removed = self
+                .affinities
+                .remove_if(&hash, |_, entry| entry.channel_id == channel_id)
+                .is_some();
+            if removed {
+                self.dirty_affinities.remove(&hash);
+                if self.affinities.contains_key(&hash) {
+                    self.dirty_affinities.insert(hash);
+                }
+            }
+        }
+    }
+
     pub fn start_maintenance(&self, pool: sqlx::SqlitePool) {
         let balancer = self.clone();
         tokio::spawn(async move {
@@ -249,10 +276,12 @@ impl Balancer {
                 .bind(&update.last_error).bind(update.last_used_at).bind(update.updated_at).bind(id)
                 .execute(&mut *transaction).await?;
         }
-        for (hash, entry) in &affinities {
-            sqlx::query("INSERT INTO affinities(affinity_hash,channel_id,expires_at,updated_at) VALUES(?,?,?,?) ON CONFLICT(affinity_hash) DO UPDATE SET channel_id=excluded.channel_id,expires_at=excluded.expires_at,updated_at=excluded.updated_at")
-                .bind(hash).bind(&entry.channel_id).bind(entry.expires_at).bind(entry.updated_at)
-                .execute(&mut *transaction).await?;
+        let mut persisted_affinities = Vec::with_capacity(affinities.len());
+        for (hash, entry) in affinities {
+            let persisted = sqlx::query("INSERT INTO affinities(affinity_hash,channel_id,expires_at,updated_at) SELECT ?,?,?,? FROM channels WHERE id=? ON CONFLICT(affinity_hash) DO UPDATE SET channel_id=excluded.channel_id,expires_at=excluded.expires_at,updated_at=excluded.updated_at")
+                .bind(&hash).bind(&entry.channel_id).bind(entry.expires_at).bind(entry.updated_at)
+                .bind(&entry.channel_id).execute(&mut *transaction).await?.rows_affected() > 0;
+            persisted_affinities.push((hash, entry, persisted));
         }
         sqlx::query("UPDATE channels SET status='active',cooldown_until=NULL,last_error=NULL,updated_at=? WHERE manual_disabled=0 AND status='cooldown' AND cooldown_until<=?")
             .bind(now).bind(now).execute(&mut *transaction).await?;
@@ -270,13 +299,20 @@ impl Balancer {
                 self.channel_updates.remove(&id);
             }
         }
-        for (hash, entry) in affinities {
+        for (hash, entry, persisted) in persisted_affinities {
             if self
                 .affinities
                 .get(&hash)
                 .is_some_and(|current| *current == entry)
             {
+                if !persisted {
+                    self.affinities
+                        .remove_if(&hash, |_, current| *current == entry);
+                }
                 self.dirty_affinities.remove(&hash);
+                if self.affinities.contains_key(&hash) && !persisted {
+                    self.dirty_affinities.insert(hash);
+                }
             }
         }
         self.affinities.retain(|_, entry| entry.expires_at > now);
@@ -449,10 +485,10 @@ mod tests {
         let state = crate::test_state("http://token.invalid").await;
         let now = chrono::Utc::now().timestamp();
         for (id, created) in [("channel-a", now), ("channel-b", now + 1)] {
-            sqlx::query("INSERT INTO channels(id,name,account_id,access_enc,refresh_enc,status,created_at,updated_at) VALUES(?,?,?,?,?,'active',?,?)")
+            sqlx::query("INSERT INTO channels(id,name,account_id,access_token,refresh_token,status,created_at,updated_at) VALUES(?,?,?,?,?,'active',?,?)")
                 .bind(id).bind(id).bind(format!("account-{id}"))
-                .bind(crate::crypto::encrypt(&state.config.load().encryption_key, "access").unwrap())
-                .bind(crate::crypto::encrypt(&state.config.load().encryption_key, "refresh").unwrap())
+                .bind("access")
+                .bind("refresh")
                 .bind(created).bind(created).execute(&state.db).await.unwrap();
         }
         state.balancer.reload_channels(&state.db).await.unwrap();
@@ -483,5 +519,71 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(reallocated.channel.id, first_id);
+    }
+
+    #[tokio::test]
+    async fn deleted_channel_dirt_is_discarded_without_blocking_maintenance() {
+        let pool = crate::db::connect_memory().await.unwrap();
+        let balancer = Balancer::default();
+        let now = chrono::Utc::now().timestamp();
+        for id in ["deleted", "survivor"] {
+            sqlx::query("INSERT INTO channels(id,name,account_id,access_token,refresh_token,status,created_at,updated_at) VALUES(?,?,?,?,?,'active',?,?)")
+                .bind(id).bind(id).bind(id).bind("access").bind("refresh")
+                .bind(now).bind(now).execute(&pool).await.unwrap();
+        }
+        balancer.reload_channels(&pool).await.unwrap();
+        balancer.remember_affinity("before-delete", "deleted", now, 3_600);
+        balancer.observe(
+            "deleted",
+            ChannelUpdate {
+                status: "cooldown".to_owned(),
+                cooldown_until: Some(now + 60),
+                rate_limit_json: "before-delete".to_owned(),
+                last_error: None,
+                last_used_at: Some(now),
+                updated_at: now,
+            },
+        );
+
+        sqlx::query("DELETE FROM channels WHERE id='deleted'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        balancer.forget_channel("deleted");
+        assert!(balancer.affinities.is_empty());
+        assert!(balancer.dirty_affinities.is_empty());
+        assert!(!balancer.channel_updates.contains_key("deleted"));
+
+        balancer.remember_affinity("concurrent-select", "deleted", now, 3_600);
+        for (id, rate_limit_json) in [("deleted", "stale"), ("survivor", "committed")] {
+            balancer.observe(
+                id,
+                ChannelUpdate {
+                    status: "cooldown".to_owned(),
+                    cooldown_until: Some(now + 60),
+                    rate_limit_json: rate_limit_json.to_owned(),
+                    last_error: None,
+                    last_used_at: Some(now),
+                    updated_at: now,
+                },
+            );
+        }
+
+        balancer.maintain(&pool).await.unwrap();
+        let deleted_affinities: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM affinities WHERE channel_id='deleted'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(deleted_affinities, 0);
+        assert!(balancer.affinities.is_empty());
+        assert!(balancer.dirty_affinities.is_empty());
+        assert!(balancer.channel_updates.is_empty());
+        let survivor: (String, String) =
+            sqlx::query_as("SELECT status,rate_limit_json FROM channels WHERE id='survivor'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(survivor, ("cooldown".to_owned(), "committed".to_owned()));
     }
 }

@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use axum::{
     Json,
     extract::{ConnectInfo, Path, Query, State},
-    http::HeaderMap,
+    http::{HeaderMap, HeaderValue, header},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
@@ -16,7 +16,7 @@ use crate::{
     AppError, AppState,
     auth::{bearer, browser_identity, is_admin, require_admin, require_root},
     balancer::Channel,
-    crypto::{api_key_hash, encrypt},
+    crypto::api_key_hash,
     oauth,
 };
 
@@ -290,9 +290,9 @@ async fn insert_channel(
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp();
     let expires_at = expires_at.or_else(|| oauth::expires_at_from_jwt(access));
-    sqlx::query("INSERT INTO channels(id,name,account_id,access_enc,refresh_enc,expires_at,status,created_at,updated_at) VALUES(?,?,?,?,?,?,'active',?,?)")
-        .bind(&id).bind(name.trim()).bind(&account_id).bind(encrypt(&state.config.load().encryption_key, access)?)
-        .bind(encrypt(&state.config.load().encryption_key, refresh)?).bind(expires_at).bind(now).bind(now).execute(&state.db).await?;
+    sqlx::query("INSERT INTO channels(id,name,account_id,access_token,refresh_token,expires_at,status,created_at,updated_at) VALUES(?,?,?,?,?,?,'active',?,?)")
+        .bind(&id).bind(name.trim()).bind(&account_id).bind(access.trim())
+        .bind(refresh.trim()).bind(expires_at).bind(now).bind(now).execute(&state.db).await?;
     state.balancer.reload_channels(&state.db).await?;
     Ok(Json(
         json!({"id":id,"name":name.trim(),"account_id":account_id,"status":"active"}),
@@ -351,22 +351,20 @@ async fn refresh_channel(state: &AppState, id: &str) -> Result<(), AppError> {
         .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
         .clone();
     let _guard = lock.lock().await;
-    let row = sqlx::query("SELECT refresh_enc,account_id FROM channels WHERE id=?")
+    let row = sqlx::query("SELECT refresh_token,account_id FROM channels WHERE id=?")
         .bind(id)
         .fetch_optional(&state.db)
         .await?
         .ok_or_else(|| AppError::not_found("channel not found"))?;
-    let refresh =
-        crate::crypto::decrypt(&state.config.load().encryption_key, row.get::<&str, _>(0))?;
+    let refresh: String = row.get(0);
     let token = oauth::refresh(state, &refresh).await?;
     let account_id =
         oauth::account_id_from_jwt(&token.access_token).unwrap_or_else(|_| row.get::<String, _>(1));
     let now = chrono::Utc::now().timestamp();
-    let refresh_enc: String = row.get(0);
-    let updated = sqlx::query("UPDATE channels SET access_enc=?,refresh_enc=?,account_id=?,expires_at=?,status=CASE WHEN manual_disabled=1 THEN 'disabled' ELSE 'active' END,cooldown_until=NULL,last_error=NULL,updated_at=? WHERE id=? AND refresh_enc=?")
-        .bind(encrypt(&state.config.load().encryption_key, &token.access_token)?)
-        .bind(encrypt(&state.config.load().encryption_key, &token.refresh_token)?)
-        .bind(account_id).bind(now + token.expires_in).bind(now).bind(id).bind(refresh_enc).execute(&state.db).await?;
+    let updated = sqlx::query("UPDATE channels SET access_token=?,refresh_token=?,account_id=?,expires_at=?,status=CASE WHEN manual_disabled=1 THEN 'disabled' ELSE 'active' END,cooldown_until=NULL,last_error=NULL,updated_at=? WHERE id=? AND refresh_token=?")
+        .bind(&token.access_token)
+        .bind(&token.refresh_token)
+        .bind(account_id).bind(now + token.expires_in).bind(now).bind(id).bind(refresh).execute(&state.db).await?;
     if updated.rows_affected() == 0 {
         return Err(AppError::unavailable(
             "channel credential changed during refresh",
@@ -374,6 +372,141 @@ async fn refresh_channel(state: &AppState, id: &str) -> Result<(), AppError> {
     }
     state.balancer.reload_channels(&state.db).await?;
     Ok(())
+}
+
+pub async fn read_channel_tokens(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<(HeaderMap, Json<Value>), AppError> {
+    let user = browser_identity(&state, &headers).await?;
+    require_admin(&user)?;
+    let result: Result<(HeaderMap, Json<Value>), AppError> = async {
+        let row: (String, String) =
+            sqlx::query_as("SELECT access_token,refresh_token FROM channels WHERE id=?")
+                .bind(&id)
+                .fetch_optional(&state.db)
+                .await?
+                .ok_or_else(|| AppError::not_found("channel not found"))?;
+        let mut response_headers = HeaderMap::new();
+        response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        Ok((
+            response_headers,
+            Json(json!({"access_key":row.0,"refresh_key":row.1})),
+        ))
+    }
+    .await;
+    let action = if result.is_ok() {
+        "channel.tokens.read"
+    } else {
+        "channel.tokens.read.failed"
+    };
+    write_admin_audit(&state, &user.id, action, Some(&id), &peer.ip().to_string()).await?;
+    result
+}
+
+#[derive(Deserialize)]
+pub struct ReplaceChannelTokens {
+    access_key: String,
+    refresh_key: String,
+}
+
+pub async fn replace_channel_tokens(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<ReplaceChannelTokens>,
+) -> Result<Json<Value>, AppError> {
+    let user = browser_identity(&state, &headers).await?;
+    require_admin(&user)?;
+    let result = replace_channel_token_values(
+        &state,
+        &id,
+        input.access_key.trim(),
+        input.refresh_key.trim(),
+    )
+    .await;
+    let action = if result.is_ok() {
+        "channel.tokens.update"
+    } else {
+        "channel.tokens.update.failed"
+    };
+    write_admin_audit(&state, &user.id, action, Some(&id), &peer.ip().to_string()).await?;
+    result
+}
+
+async fn replace_channel_token_values(
+    state: &AppState,
+    id: &str,
+    access_token: &str,
+    refresh_token: &str,
+) -> Result<Json<Value>, AppError> {
+    if access_token.is_empty() || refresh_token.is_empty() {
+        return Err(AppError::bad_request(
+            "access_key and refresh_key are required",
+        ));
+    }
+    let account_id = oauth::account_id_from_jwt(access_token)?;
+    let expires_at = oauth::expires_at_from_jwt(access_token);
+    let updated = sqlx::query("UPDATE channels SET access_token=?,refresh_token=?,account_id=?,expires_at=?,status=CASE WHEN manual_disabled=1 THEN 'disabled' ELSE 'active' END,cooldown_until=NULL,last_error=NULL,updated_at=? WHERE id=?")
+        .bind(access_token).bind(refresh_token).bind(&account_id).bind(expires_at)
+        .bind(chrono::Utc::now().timestamp()).bind(id).execute(&state.db).await?;
+    if updated.rows_affected() == 0 {
+        return Err(AppError::not_found("channel not found"));
+    }
+    state.balancer.reload_channels(&state.db).await?;
+    Ok(Json(json!({"ok":true,"account_id":account_id})))
+}
+
+pub async fn test_channel(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let user = browser_identity(&state, &headers).await?;
+    require_admin(&user)?;
+    let result = channel_usage(&state, &id).await;
+    let action = if result.is_ok() {
+        "channel.test"
+    } else {
+        "channel.test.failed"
+    };
+    write_admin_audit(&state, &user.id, action, Some(&id), &peer.ip().to_string()).await?;
+    result
+}
+
+async fn channel_usage(state: &AppState, id: &str) -> Result<Json<Value>, AppError> {
+    let row: (String, String) =
+        sqlx::query_as("SELECT access_token,account_id FROM channels WHERE id=?")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or_else(|| AppError::not_found("channel not found"))?;
+    let mut usage_url = url::Url::parse(&state.config.load().upstream_base)?;
+    usage_url.set_path("/backend-api/wham/usage");
+    usage_url.set_query(None);
+    let response = state
+        .client
+        .get(usage_url)
+        .bearer_auth(row.0)
+        .header("chatgpt-account-id", row.1)
+        .send()
+        .await
+        .map_err(|_| AppError::upstream(502, "channel Usage API request failed"))?;
+    if !response.status().is_success() {
+        return Err(AppError::upstream(
+            502,
+            format!("channel Usage API returned {}", response.status()),
+        ));
+    }
+    let usage = response
+        .json::<Value>()
+        .await
+        .map_err(|_| AppError::upstream(502, "channel Usage API returned invalid JSON"))?;
+    Ok(Json(json!({"ok":true,"usage":usage})))
 }
 
 pub async fn delete_channel(
@@ -392,6 +525,7 @@ pub async fn delete_channel(
         if deleted.rows_affected() == 0 {
             return Err(AppError::not_found("channel not found"));
         }
+        state.balancer.forget_channel(&id);
         state.balancer.reload_channels(&state.db).await?;
         Ok(Json(json!({"ok":true})))
     }
@@ -814,8 +948,16 @@ async fn write_admin_audit(
 
 #[cfg(test)]
 mod tests {
-    use axum::{Router, routing::get};
+    use axum::{
+        Router,
+        body::Body,
+        http::{Method, Request, StatusCode},
+        response::{IntoResponse, Response},
+        routing::get,
+    };
     use ed25519_dalek::{Signer, SigningKey};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
 
     use super::*;
 
@@ -836,6 +978,43 @@ mod tests {
             "{input}.{}",
             URL_SAFE_NO_PAD.encode(signing.sign(input.as_bytes()).to_bytes())
         )
+    }
+
+    fn channel_access_token(account_id: &str) -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "https://api.openai.com/auth": {"chatgpt_account_id":account_id},
+                "exp":chrono::Utc::now().timestamp() + 3600
+            }))
+            .unwrap(),
+        );
+        format!("{header}.{payload}.signature")
+    }
+
+    async fn channel_request(
+        state: &AppState,
+        method: Method,
+        path: &str,
+        token: &str,
+        body: Option<Value>,
+    ) -> Response {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .extension(ConnectInfo("127.0.0.1:9000".parse::<SocketAddr>().unwrap()));
+        let body = match body {
+            Some(value) => {
+                builder = builder.header(header::CONTENT_TYPE, "application/json");
+                Body::from(value.to_string())
+            }
+            None => Body::empty(),
+        };
+        crate::router(state.clone())
+            .oneshot(builder.body(body).unwrap())
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -942,5 +1121,278 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(row, ("channel.create".to_owned(), "127.0.0.1".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn channel_tokens_are_stored_and_replaced_as_plaintext() {
+        let state = crate::test_state("http://token.invalid").await;
+        let access = channel_access_token("account-old");
+        let _ = insert_channel(&state, "channel", &access, "refresh-old", None)
+            .await
+            .unwrap();
+        let id: String = sqlx::query_scalar("SELECT id FROM channels")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        let stored: (String, String) =
+            sqlx::query_as("SELECT access_token,refresh_token FROM channels WHERE id=?")
+                .bind(&id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(stored, (access, "refresh-old".to_owned()));
+
+        let replacement = channel_access_token("account-new");
+        let _ = replace_channel_token_values(&state, &id, &replacement, "refresh-new")
+            .await
+            .unwrap();
+        let updated: (String, String, String) =
+            sqlx::query_as("SELECT access_token,refresh_token,account_id FROM channels WHERE id=?")
+                .bind(&id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(
+            updated,
+            (
+                replacement,
+                "refresh-new".to_owned(),
+                "account-new".to_owned()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_test_calls_usage_with_server_side_credentials() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let usage = Router::new().route(
+            "/backend-api/wham/usage",
+            get(move |headers: HeaderMap| {
+                let sender = sender.clone();
+                async move {
+                    sender.send(headers).await.unwrap();
+                    Json(json!({
+                        "plan_type":"team",
+                        "rate_limit":{"primary_window":{"used_percent":25.0}}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, usage).await.unwrap() });
+        let state = crate::test_state_with_upstream(
+            "http://token.invalid",
+            &format!("http://{address}/backend-api/codex"),
+        )
+        .await;
+        let now = chrono::Utc::now().timestamp();
+        sqlx::query("INSERT INTO channels(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES('channel','Channel','account','access','refresh',?,?)")
+            .bind(now).bind(now).execute(&state.db).await.unwrap();
+
+        let result = channel_usage(&state, "channel").await.unwrap();
+        assert_eq!(result.0["usage"]["plan_type"], "team");
+        assert_eq!(
+            result.0["usage"]["rate_limit"]["primary_window"]["used_percent"],
+            25.0
+        );
+        let headers = receiver.recv().await.unwrap();
+        assert_eq!(headers[axum::http::header::AUTHORIZATION], "Bearer access");
+        assert_eq!(headers["chatgpt-account-id"], "account");
+    }
+
+    #[tokio::test]
+    async fn channel_routes_enforce_roles_audit_actions_and_preserve_call_history() {
+        let signing = SigningKey::from_bytes(&[31_u8; 32]);
+        let x = URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes());
+        let external = Router::new()
+            .route(
+                "/jwks",
+                get(move || {
+                    let x = x.clone();
+                    async move { Json(json!({"keys":[{"kid":"setup","kty":"OKP","crv":"Ed25519","alg":"EdDSA","use":"sig","x":x}]})) }
+                }),
+            )
+            .route(
+                "/backend-api/wham/usage",
+                get(|headers: HeaderMap| async move {
+                    if headers[header::AUTHORIZATION] == "Bearer denied" {
+                        return (StatusCode::UNAUTHORIZED, "denied").into_response();
+                    }
+                    Json(json!({"plan_type":"team","rate_limit":{"primary_window":{"used_percent":10}}})).into_response()
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, external).await.unwrap() });
+        let issuer = format!("http://{address}");
+        let state = crate::test_state_with_upstream(
+            "http://token.invalid",
+            &format!("{issuer}/backend-api/codex"),
+        )
+        .await;
+        state.auth.configure(issuer.clone(), None).await;
+        let now = chrono::Utc::now().timestamp();
+        for (id, role) in [
+            ("root-user", "root"),
+            ("admin-user", "admin"),
+            ("tenant-user", "user"),
+        ] {
+            sqlx::query("INSERT INTO users(id,role,created_at) VALUES(?,?,?)")
+                .bind(id)
+                .bind(role)
+                .bind(now)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO api_keys(id,user_id,name,prefix,secret_hash,created_at) VALUES('history-key','root-user','history','sk-history','hash-history',?)")
+            .bind(now).execute(&state.db).await.unwrap();
+
+        for user_id in ["root-user", "admin-user"] {
+            let channel_id = format!("channel-{user_id}");
+            let call_id = format!("call-{user_id}");
+            let access = channel_access_token(&format!("account-{user_id}"));
+            sqlx::query("INSERT INTO channels(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+                .bind(&channel_id).bind(user_id).bind(format!("account-{user_id}"))
+                .bind(access).bind("refresh").bind(now).bind(now).execute(&state.db).await.unwrap();
+            sqlx::query("INSERT INTO api_calls(id,request_id,api_key_id,user_id,channel_id,method,path,status,latency_ms,created_at) VALUES(?,?,'history-key','root-user',?,'POST','/v1/responses',200,1,?)")
+                .bind(&call_id).bind(&call_id).bind(&channel_id).bind(now).execute(&state.db).await.unwrap();
+            let browser_token = setup_token(&signing, &issuer, user_id);
+
+            let read = channel_request(
+                &state,
+                Method::GET,
+                &format!("/api/channels/{channel_id}"),
+                &browser_token,
+                None,
+            )
+            .await;
+            assert_eq!(read.status(), StatusCode::OK);
+            assert_eq!(read.headers()[header::CACHE_CONTROL], "no-store");
+            let read_body = read.into_body().collect().await.unwrap().to_bytes();
+            assert!(std::str::from_utf8(&read_body).unwrap().contains("refresh"));
+
+            let replacement = channel_access_token(&format!("replacement-{user_id}"));
+            let update = channel_request(
+                &state,
+                Method::PUT,
+                &format!("/api/channels/{channel_id}"),
+                &browser_token,
+                Some(json!({"access_key":replacement,"refresh_key":"refresh-new"})),
+            )
+            .await;
+            assert_eq!(update.status(), StatusCode::OK);
+            let test = channel_request(
+                &state,
+                Method::POST,
+                &format!("/api/channels/{channel_id}/test"),
+                &browser_token,
+                None,
+            )
+            .await;
+            assert_eq!(test.status(), StatusCode::OK);
+            let delete = channel_request(
+                &state,
+                Method::DELETE,
+                &format!("/api/channels/{channel_id}"),
+                &browser_token,
+                None,
+            )
+            .await;
+            assert_eq!(delete.status(), StatusCode::OK);
+            let historical_channel: Option<String> =
+                sqlx::query_scalar("SELECT channel_id FROM api_calls WHERE id=?")
+                    .bind(call_id)
+                    .fetch_one(&state.db)
+                    .await
+                    .unwrap();
+            assert_eq!(historical_channel, None);
+        }
+
+        sqlx::query("INSERT INTO channels(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES('tenant-channel','tenant','tenant','access','refresh',?,?)")
+            .bind(now).bind(now).execute(&state.db).await.unwrap();
+        let tenant_token = setup_token(&signing, &issuer, "tenant-user");
+        for (method, path, body) in [
+            (Method::GET, "/api/channels/tenant-channel", None),
+            (
+                Method::PUT,
+                "/api/channels/tenant-channel",
+                Some(json!({"access_key":channel_access_token("tenant"),"refresh_key":"refresh"})),
+            ),
+            (Method::POST, "/api/channels/tenant-channel/test", None),
+            (Method::DELETE, "/api/channels/tenant-channel", None),
+        ] {
+            let response = channel_request(&state, method, path, &tenant_token, body).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+
+        sqlx::query("INSERT INTO channels(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES('denied-channel','denied','denied','denied','refresh',?,?)")
+            .bind(now).bind(now).execute(&state.db).await.unwrap();
+        let admin_token = setup_token(&signing, &issuer, "admin-user");
+        let denied = channel_request(
+            &state,
+            Method::POST,
+            "/api/channels/denied-channel/test",
+            &admin_token,
+            None,
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::BAD_GATEWAY);
+
+        for (action, expected) in [
+            ("channel.tokens.read", 2_i64),
+            ("channel.tokens.update", 2),
+            ("channel.test", 2),
+            ("channel.delete", 2),
+            ("channel.test.failed", 1),
+        ] {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_audit WHERE action=?")
+                .bind(action)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+            assert_eq!(count, expected, "unexpected audit count for {action}");
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_usage_maps_invalid_json_to_bad_gateway() {
+        let invalid = Router::new().route(
+            "/backend-api/wham/usage",
+            get(|| async { (StatusCode::OK, "not-json") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, invalid).await.unwrap() });
+        let state = crate::test_state_with_upstream(
+            "http://token.invalid",
+            &format!("http://{address}/backend-api/codex"),
+        )
+        .await;
+        let now = chrono::Utc::now().timestamp();
+        sqlx::query("INSERT INTO channels(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES('invalid','invalid','account','access','refresh',?,?)")
+            .bind(now).bind(now).execute(&state.db).await.unwrap();
+        let error = channel_usage(&state, "invalid").await.unwrap_err();
+        assert_eq!(error.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(error.message(), "channel Usage API returned invalid JSON");
+    }
+
+    #[tokio::test]
+    async fn channel_usage_maps_network_failure_to_bad_gateway() {
+        let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = unavailable.local_addr().unwrap();
+        drop(unavailable);
+        let state = crate::test_state_with_upstream(
+            "http://token.invalid",
+            &format!("http://{address}/backend-api/codex"),
+        )
+        .await;
+        let now = chrono::Utc::now().timestamp();
+        sqlx::query("INSERT INTO channels(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES('offline','offline','account','access','refresh',?,?)")
+            .bind(now).bind(now).execute(&state.db).await.unwrap();
+        let error = channel_usage(&state, "offline").await.unwrap_err();
+        assert_eq!(error.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(error.message(), "channel Usage API request failed");
     }
 }

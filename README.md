@@ -30,7 +30,7 @@ OpenAI-LB 连接现有的品牌 Auth Mini 实例。用户不需要为 OpenAI-LB 
 - 注册多组 CodeX OAuth `access_key` / `refresh_key`，支持 PKCE OAuth 和自动刷新。
 - 以 API Key 为租户调用凭据，密钥只显示一次，数据库只保存 SHA-256 哈希。
 - 按 API Key 汇总请求、Token、缓存 Token、错误和延迟。
-- 每次代理调用保留请求 ID、用户、API Key、渠道、接口、模型、状态、耗时和用量。
+- 每次代理调用保留请求 ID、用户、API Key、渠道、接口、模型、状态、耗时和用量，并在 SQLite 中逐请求保存请求/响应诊断记录；失败和客户端取消同样保存。
 - 支持显式亲和键、会话头和 Responses 会话字段；亲和键在持久化前进行 SHA-256 哈希。
 - 跟踪 `Retry-After` 与 `x-ratelimit-*`，对 429 渠道自动冷却并在到期后恢复。
 - 对 401/403 渠道标记认证错误；手工禁用渠道不会自动恢复。
@@ -74,7 +74,7 @@ curl http://localhost:8080/v1/images/generations \
 
 SQLite 为单实例数据层。连接池中的每条连接统一启用 WAL、foreign keys、5 秒 busy timeout 和 `synchronous=NORMAL`，连接池上限为 4。
 
-代理热路径使用内存渠道快照和亲和映射。渠道 Rate Limit 观测、亲和持久化、过期清理和 cooldown 恢复由后台任务批量提交。逐调用审计进入容量为 4096 的有界队列，由单 writer 以最多 128 条的事务写入；客户端取消仍结算为 HTTP 499。
+代理热路径使用内存渠道快照和亲和映射。渠道 Rate Limit 观测、亲和持久化、过期清理和 cooldown 恢复由后台任务批量提交。逐调用审计与请求/响应诊断记录进入容量为 4096 的有界队列，由单 writer 以最多 128 条的事务写入；客户端取消仍结算为 HTTP 499。诊断正文保存最多 1 MiB 的预览并标记是否截断，认证、Cookie、Token、Secret 和 API Key 类请求头不会写入。诊断记录默认保留 7 天，可由 root 在“设置”中配置为 1–365 天；后台每小时自动清理过期诊断记录，长期用量审计不受影响。写入或清理失败会在服务边界记录错误并持续重试，不会覆盖原始代理故障。
 
 音频 multipart 不会整体读入内存。请求体从 Axum `Body` 直接流入 Reqwest；因为流式请求体无法安全重放，音频上传开始后不执行跨渠道重试。Responses 和图像使用独立的小型 JSON 请求限制。
 
@@ -128,7 +128,8 @@ Pull Request 工作流还会运行 RustSec 依赖审计。
 
 - `master.key` 不进入 SQLite 或可执行文件。丢失该文件后，现有 OAuth 凭据无法解密。
 - 入站 `Authorization`、Cookie、hop-by-hop headers 和代理专用亲和头不会转发到上游。
-- 审计不保存 prompt、请求正文、API Key 或 OAuth 凭据。
+- 请求/响应诊断记录会保存最多 1 MiB 的正文预览以便排查；SQLite 文件因此可能包含 prompt、输出或音频片段，应按敏感业务数据保护并使用较短保留期。
+- 诊断记录不会保存 Authorization、Cookie、Token、Secret、API Key 类请求头或 OAuth 凭据。
 - SQLite 文件和 `master.key` 应位于本机磁盘；不要让多个实例通过网络文件系统同时写入同一数据库。
 - 生产部署应在 OpenAI-LB 前提供 TLS，并限制数据目录的系统账户访问权限。
 

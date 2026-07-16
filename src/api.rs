@@ -607,7 +607,8 @@ pub async fn settings(
         "response_body_limit":config.response_body_limit,
         "image_body_limit":config.image_body_limit,
         "audio_body_limit":config.audio_body_limit,
-        "affinity_ttl_seconds":config.affinity_ttl_seconds
+        "affinity_ttl_seconds":config.affinity_ttl_seconds,
+        "request_archive_retention_days":config.request_archive_retention_days
     })))
 }
 
@@ -623,6 +624,7 @@ pub struct UpdateSettings {
     image_body_limit: usize,
     audio_body_limit: usize,
     affinity_ttl_seconds: i64,
+    request_archive_retention_days: i64,
 }
 
 pub async fn update_settings(
@@ -643,6 +645,7 @@ pub async fn update_settings(
         || !(1_024..=16 * 1_024 * 1_024).contains(&input.image_body_limit)
         || !(1_024 * 1_024..=2_000_000_000).contains(&input.audio_body_limit)
         || !(60..=2_592_000).contains(&input.affinity_ttl_seconds)
+        || !(1..=365).contains(&input.request_archive_retention_days)
     {
         return Err(AppError::bad_request(
             "one or more numeric settings are outside the allowed range",
@@ -661,6 +664,10 @@ pub async fn update_settings(
         (
             "affinity_ttl_seconds",
             input.affinity_ttl_seconds.to_string(),
+        ),
+        (
+            "request_archive_retention_days",
+            input.request_archive_retention_days.to_string(),
         ),
     ];
     let now = chrono::Utc::now().timestamp();
@@ -685,6 +692,7 @@ pub async fn update_settings(
     config.image_body_limit = input.image_body_limit;
     config.audio_body_limit = input.audio_body_limit;
     config.affinity_ttl_seconds = input.affinity_ttl_seconds;
+    config.request_archive_retention_days = input.request_archive_retention_days;
     state.config.store(std::sync::Arc::new(config));
     write_admin_audit(
         &state,

@@ -21,7 +21,6 @@ use crate::{
     audit::AuditEvent,
     auth::{ApiIdentity, api_identity},
     balancer::{Lease, track_response},
-    crypto::encrypt,
     oauth,
 };
 
@@ -754,26 +753,24 @@ async fn refresh_if_needed(state: &AppState, lease: &mut Lease) -> Result<(), Ap
         .clone();
     let _guard = lock.lock().await;
     let current: (String, String, Option<i64>, String) = sqlx::query_as(
-        "SELECT access_enc,refresh_enc,expires_at,account_id FROM channels WHERE id=?",
+        "SELECT access_token,refresh_token,expires_at,account_id FROM channels WHERE id=?",
     )
     .bind(&lease.channel.id)
     .fetch_one(&state.db)
     .await?;
     let now = chrono::Utc::now().timestamp();
     if current.2.is_some_and(|expires| expires > now + 60) {
-        lease.access_token =
-            crate::crypto::decrypt(&state.config.load().encryption_key, &current.0)?;
-        lease.refresh_token =
-            crate::crypto::decrypt(&state.config.load().encryption_key, &current.1)?;
+        lease.access_token = current.0;
+        lease.refresh_token = current.1;
         lease.channel.expires_at = current.2;
         lease.channel.account_id = current.3;
         return Ok(());
     }
-    let refresh_token = crate::crypto::decrypt(&state.config.load().encryption_key, &current.1)?;
+    let refresh_token = current.1.clone();
     let token = match oauth::refresh(state, &refresh_token).await {
         Ok(token) => token,
         Err(error) => {
-            sqlx::query("UPDATE channels SET status='auth_error',last_error='credential refresh failed',updated_at=? WHERE id=? AND refresh_enc=?")
+            sqlx::query("UPDATE channels SET status='auth_error',last_error='credential refresh failed',updated_at=? WHERE id=? AND refresh_token=?")
                 .bind(now).bind(&lease.channel.id).bind(&current.1).execute(&state.db).await?;
             state.balancer.reload_channels(&state.db).await?;
             return Err(error);
@@ -782,9 +779,9 @@ async fn refresh_if_needed(state: &AppState, lease: &mut Lease) -> Result<(), Ap
     let account_id = oauth::account_id_from_jwt(&token.access_token)
         .unwrap_or_else(|_| lease.channel.account_id.clone());
     let expires_at = now + token.expires_in;
-    let updated = sqlx::query("UPDATE channels SET access_enc=?,refresh_enc=?,account_id=?,expires_at=?,status='active',last_error=NULL,updated_at=? WHERE id=? AND refresh_enc=?")
-        .bind(encrypt(&state.config.load().encryption_key, &token.access_token)?)
-        .bind(encrypt(&state.config.load().encryption_key, &token.refresh_token)?)
+    let updated = sqlx::query("UPDATE channels SET access_token=?,refresh_token=?,account_id=?,expires_at=?,status='active',last_error=NULL,updated_at=? WHERE id=? AND refresh_token=?")
+        .bind(&token.access_token)
+        .bind(&token.refresh_token)
         .bind(&account_id).bind(expires_at).bind(now).bind(&lease.channel.id).bind(&current.1).execute(&state.db).await?;
     if updated.rows_affected() == 0 {
         return Err(AppError::unavailable(
@@ -1336,9 +1333,9 @@ mod tests {
         sqlx::query("INSERT INTO api_keys(id,user_id,name,prefix,secret_hash,created_at) VALUES('key-1','user-1','test','sk-test',?,?)")
             .bind(crate::crypto::api_key_hash("sk-test-secret")).bind(now).execute(&state.db).await.unwrap();
         if channel {
-            sqlx::query("INSERT INTO channels(id,name,account_id,access_enc,refresh_enc,status,created_at,updated_at) VALUES('channel-1','one','account-1',?,?,'active',?,?)")
-                .bind(crate::crypto::encrypt(&state.config.load().encryption_key, "access-token").unwrap())
-                .bind(crate::crypto::encrypt(&state.config.load().encryption_key, "refresh-token").unwrap())
+            sqlx::query("INSERT INTO channels(id,name,account_id,access_token,refresh_token,status,created_at,updated_at) VALUES('channel-1','one','account-1',?,?,'active',?,?)")
+                .bind("access-token")
+                .bind("refresh-token")
                 .bind(now).bind(now).execute(&state.db).await.unwrap();
             state.balancer.reload_channels(&state.db).await.unwrap();
         }
@@ -2014,9 +2011,9 @@ mod tests {
         });
         let state = crate::test_state(&format!("http://{address}/token")).await;
         let now = chrono::Utc::now().timestamp();
-        sqlx::query("INSERT INTO channels(id,name,account_id,access_enc,refresh_enc,expires_at,status,created_at,updated_at) VALUES('channel-1','one','account-1',?,?,?,'active',?,?)")
-            .bind(crate::crypto::encrypt(&state.config.load().encryption_key, "access-old").unwrap())
-            .bind(crate::crypto::encrypt(&state.config.load().encryption_key, "refresh-old").unwrap())
+        sqlx::query("INSERT INTO channels(id,name,account_id,access_token,refresh_token,expires_at,status,created_at,updated_at) VALUES('channel-1','one','account-1',?,?,?,'active',?,?)")
+            .bind("access-old")
+            .bind("refresh-old")
             .bind(now - 1).bind(now).bind(now).execute(&state.db).await.unwrap();
         state.balancer.reload_channels(&state.db).await.unwrap();
         let first = state.balancer.select(&state, None, None).await.unwrap();

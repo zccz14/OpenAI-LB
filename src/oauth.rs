@@ -16,7 +16,7 @@ pub struct OAuthStart {
     pub state: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct TokenResponse {
     pub access_token: String,
     pub refresh_token: String,

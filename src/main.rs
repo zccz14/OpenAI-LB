@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
         .init();
     let bootstrap = BootstrapConfig::load()?;
     let listen = bootstrap.listen;
-    let pool = db::connect(&bootstrap.database_path).await?;
+    let pool = db::connect(&bootstrap.database_path, &bootstrap.encryption_key).await?;
     let config = Config::load(bootstrap, &pool).await?;
     let state = AppState::new(config, pool).await?;
     let listener = tokio::net::TcpListener::bind(listen).await?;

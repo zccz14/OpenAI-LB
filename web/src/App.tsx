@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react"
 import { createBrowserSdk } from "auth-mini/sdk/browser"
 import {
   ActivityIcon, BoxesIcon, CheckCircle2Icon, ChevronRightIcon,
   CircleGaugeIcon, ClipboardIcon, KeyRoundIcon, LanguagesIcon, LogInIcon, LogOutIcon, PlusIcon,
-  RefreshCwIcon, ScrollTextIcon, SettingsIcon, ShieldAlertIcon, SlidersHorizontalIcon, UserRoundCogIcon, XCircleIcon,
+  RefreshCwIcon, ScrollTextIcon, SettingsIcon, ShieldAlertIcon, SlidersHorizontalIcon, Trash2Icon, UserRoundCogIcon, XCircleIcon,
 } from "lucide-react"
 import { toast } from "sonner"
 
@@ -46,6 +46,11 @@ type ManagedUser = { id: string; email?: string; display_name?: string; role: Ro
 type PublicConfig = { setup_required: boolean; auth_issuer?: string }
 type Key = { id: string; name: string; prefix: string; created_at: number; last_used_at?: number; revoked_at?: number }
 type Channel = { id: string; name: string; account_id: string; status: string; manual_disabled: number; cooldown_until?: number; rate_limit_json?: string; last_error?: string; inflight: number; updated_at: number }
+type ChannelTokens = { access_key: string; refresh_key: string }
+type UsageWindow = { used_percent?: number; reset_at?: number; reset_after_seconds?: number }
+type ChannelUsage = { plan_type?: string; rate_limit?: { primary_window?: UsageWindow; secondary_window?: UsageWindow }; credits?: { balance?: number | string | null; unlimited?: boolean }; [key: string]: unknown }
+type ChannelTokenDialogState = { channel: Channel; loading: boolean; tokens?: ChannelTokens; error?: string }
+type ChannelTestState = { channel: Channel; status: "loading" | "success" | "error"; usage?: ChannelUsage; error?: string }
 type Usage = { key_id: string; name: string; prefix: string; requests: number; input_tokens: number; output_tokens: number; cached_tokens: number; errors: number; avg_latency_ms: number }
 type Audit = { id: string; request_id: string; user_id: string; key_prefix: string; channel_id?: string; path: string; model?: string; status: number; latency_ms: number; input_tokens: number; output_tokens: number; cached_tokens: number; error?: string; created_at: number }
 type AdminAudit = { id: string; admin_user_id: string; admin_email?: string; action: string; target_id?: string; client_ip?: string; created_at: number }
@@ -57,8 +62,9 @@ const copy = {
     loginDescription:"使用 Auth Mini 登录运维控制台",email:"邮箱",authRedirectTitle:"在 Auth Mini 完成身份验证",authRedirectHelp:"邮箱验证码、Passkey 和 ED25519 登录均在 Auth Mini 页面完成；成功后会自动返回 OpenAI-LB。",continueAuthMini:"前往 Auth Mini 登录",loading:"正在加载 OpenAI-LB…",
     pageDashboard:"查看渠道容量与当前租户的 24 小时运行摘要。",pageChannels:"注册、刷新、停用并观察 CodeX OAuth 渠道。",pageKeys:"创建和吊销租户调用凭据；密钥仅显示一次。",pageUsage:"按 API Key 核算请求、Token、错误和延迟。",pageAudit:"逐次追踪请求、渠道、结果与用量；诊断内容按配置期限保留。",pageUsers:"由 root 管理本地授权角色；用户身份仍由 Auth Mini 提供。",pageSettings:"确认身份边界、上游与部署限制。",
     operationalStatus:"运行状态",operationalDescription:"当前租户与渠道池的可行动摘要",availableChannels:"可用渠道",activeKeys:"有效 API Key",calls24h:"24 小时调用",errors24h:"24 小时错误",
-    channelPool:"OAuth 渠道池",channelDescription:"凭据只加密存储；状态包含原因与恢复时间。",addChannel:"添加渠道",noChannels:"尚无渠道",noChannelsDescription:"添加 access_key 与 refresh_key，或开始 PKCE OAuth。",name:"名称",account:"账户",status:"状态",recoveryReason:"恢复 / 原因",actions:"操作",refresh:"刷新",channelUpdated:"渠道已更新",channelAdded:"渠道已添加",oauthChannelAdded:"OAuth 渠道已添加",
-    addChannelTitle:"添加 CodeX OAuth 渠道",addChannelDescription:"直接导入凭据，或用 PKCE 授权后粘贴回调中的 code。凭据保存后不会再次显示。",accessClaimHelp:"必须是包含 CodeX account_id claim 的 JWT。",oauthCode:"OAuth code",oauthStateHelp:"State 已在服务器中一次性保存，有效期 10 分钟。",startOauth:"开始 OAuth",completeOauth:"完成 OAuth",importCredentials:"导入凭据",
+    channelPool:"OAuth 渠道池",channelDescription:"Token 以明文保存在 SQLite；管理员读取与变更会进入操作审计。",addChannel:"添加渠道",noChannels:"尚无渠道",noChannelsDescription:"添加 access_key 与 refresh_key，或开始 PKCE OAuth。",name:"名称",account:"账户",status:"状态",recoveryReason:"恢复 / 原因",actions:"操作",refresh:"刷新",channelUpdated:"渠道已更新",channelAdded:"渠道已添加",oauthChannelAdded:"OAuth 渠道已添加",
+    addChannelTitle:"添加 CodeX OAuth 渠道",addChannelDescription:"直接导入凭据，或用 PKCE 授权后粘贴回调中的 code。Token 将以明文保存在 SQLite，并可由管理员再次读取和编辑。",accessClaimHelp:"必须是包含 CodeX account_id claim 的 JWT。",oauthCode:"OAuth code",oauthStateHelp:"State 已在服务器中一次性保存，有效期 10 分钟。",startOauth:"开始 OAuth",completeOauth:"完成 OAuth",importCredentials:"导入凭据",
+    manageTokens:"Token",tokenTitle:"读取与编辑渠道 Token",tokenDescription:"以下 Token 来自 SQLite 明文存储。保存时 access_key 与 refresh_key 会作为一组原子替换。",loadingTokens:"正在读取 Token…",saveTokens:"保存 Token",tokensSaved:"渠道 Token 已保存",deleteChannel:"删除",deleteChannelTitle:"删除 OAuth 渠道？",deleteChannelDescription:"此操作会永久删除该渠道及 Token；依赖该渠道的亲和记录也会一并删除。",confirmDeleteChannel:"确认删除",channelDeleted:"渠道已删除",testChannel:"测试",testingChannel:"正在获取渠道 Usage…",testTitle:"渠道 Usage 测试",testDescription:"服务端使用该渠道 OAuth Token 调用 Usage API，Token 不会随测试结果返回浏览器。",testSucceeded:"渠道测试成功",usagePlan:"套餐",primaryRemaining:"主要额度剩余",secondaryRemaining:"次要额度剩余",resetsAt:"重置时间",credits:"Credits",rawUsage:"Usage 原始字段",usageUnavailable:"Usage API 未返回可识别的额度字段，请查看原始字段。",
     tenantKeys:"租户 API Key",keysDescription:"Key 只在创建后显示一次，服务器仅保存 SHA-256 哈希。",create:"创建",noKeys:"尚无 API Key",noKeysDescription:"创建第一个 Key 后即可调用代理。",prefix:"前缀",createdAt:"创建时间",lastUsed:"最近使用",revoked:"已吊销",active:"有效",revoke:"吊销",revokeTitle:"吊销 API Key？",revokeDescription:"此操作不可撤销；使用该 Key 的所有调用将立即失败。",cancel:"取消",confirmRevoke:"确认吊销",keyNameHelp:"为环境或应用使用可辨识名称，便于按 Key 统计和吊销。",saveKeyTitle:"立即保存 API Key",saveKeyDescription:"关闭后无法再次查看。不要将它写入浏览器代码、日志或聊天记录。",savedKey:"我已安全保存",copied:"已复制",keyRevoked:"API Key 已吊销",
     usageTitle:"按 API Key 用量",usageDescription:"请求、Token、缓存命中、错误与延迟均归属到调用 Key。",noUsage:"暂无用量",noUsageDescription:"发起 API 调用后，用量会在此按 Key 汇总。",requests:"请求",errors:"错误",averageLatency:"平均延迟",
     auditTitle:"逐调用审计",auditDescription:"请求/响应诊断预览保存在 SQLite；不记录 Authorization 或 OAuth 凭据。",noAudit:"暂无审计事件",noAuditDescription:"每次代理调用结束后都会写入基础审计记录。",time:"时间",requestId:"请求 ID",channel:"渠道",endpointModel:"接口 / 模型",latency:"延迟",cachedInput:"缓存输入",
@@ -70,8 +76,9 @@ const copy = {
     loginDescription:"Sign in to the operations console with Auth Mini",email:"Email",authRedirectTitle:"Verify your identity in Auth Mini",authRedirectHelp:"Email codes, passkeys, and ED25519 sign-in stay on the Auth Mini page. You will return to OpenAI-LB after signing in.",continueAuthMini:"Continue to Auth Mini",loading:"Loading OpenAI-LB…",
     pageDashboard:"Review channel capacity and the tenant's 24-hour operating summary.",pageChannels:"Register, refresh, disable, and observe CodeX OAuth channels.",pageKeys:"Create and revoke tenant credentials; secrets are shown once.",pageUsage:"Attribute requests, tokens, errors, and latency to each API key.",pageAudit:"Trace each request, channel, result, and usage; diagnostic content follows the configured retention.",pageUsers:"Root manages local authorization roles while Auth Mini remains the identity provider.",pageSettings:"Confirm identity boundaries, upstream, and deployment limits.",
     operationalStatus:"Operational status",operationalDescription:"Actionable tenant and channel-pool summary",availableChannels:"Available channels",activeKeys:"Active API keys",calls24h:"Calls in 24h",errors24h:"Errors in 24h",
-    channelPool:"OAuth channel pool",channelDescription:"Credentials stay encrypted; states include cause and recovery time.",addChannel:"Add channel",noChannels:"No channels",noChannelsDescription:"Add access_key and refresh_key, or start PKCE OAuth.",name:"Name",account:"Account",status:"Status",recoveryReason:"Recovery / reason",actions:"Actions",refresh:"Refresh",channelUpdated:"Channel updated",channelAdded:"Channel added",oauthChannelAdded:"OAuth channel added",
-    addChannelTitle:"Add CodeX OAuth channel",addChannelDescription:"Import credentials directly, or authorize with PKCE and paste the callback code. Credentials are never shown again.",accessClaimHelp:"Must be a JWT containing the CodeX account_id claim.",oauthCode:"OAuth code",oauthStateHelp:"State is stored once on the server and expires in 10 minutes.",startOauth:"Start OAuth",completeOauth:"Complete OAuth",importCredentials:"Import credentials",
+    channelPool:"OAuth channel pool",channelDescription:"Tokens are stored as plaintext in SQLite; administrator reads and changes are audited.",addChannel:"Add channel",noChannels:"No channels",noChannelsDescription:"Add access_key and refresh_key, or start PKCE OAuth.",name:"Name",account:"Account",status:"Status",recoveryReason:"Recovery / reason",actions:"Actions",refresh:"Refresh",channelUpdated:"Channel updated",channelAdded:"Channel added",oauthChannelAdded:"OAuth channel added",
+    addChannelTitle:"Add CodeX OAuth channel",addChannelDescription:"Import credentials directly, or authorize with PKCE and paste the callback code. Tokens are stored as plaintext in SQLite and can be read and edited by administrators.",accessClaimHelp:"Must be a JWT containing the CodeX account_id claim.",oauthCode:"OAuth code",oauthStateHelp:"State is stored once on the server and expires in 10 minutes.",startOauth:"Start OAuth",completeOauth:"Complete OAuth",importCredentials:"Import credentials",
+    manageTokens:"Tokens",tokenTitle:"Read and edit channel Tokens",tokenDescription:"These Tokens come from plaintext SQLite storage. Saving atomically replaces access_key and refresh_key as a pair.",loadingTokens:"Loading Tokens…",saveTokens:"Save Tokens",tokensSaved:"Channel Tokens saved",deleteChannel:"Delete",deleteChannelTitle:"Delete OAuth channel?",deleteChannelDescription:"This permanently deletes the channel and its Tokens. Affinity records that depend on it are deleted too.",confirmDeleteChannel:"Delete channel",channelDeleted:"Channel deleted",testChannel:"Test",testingChannel:"Fetching channel Usage…",testTitle:"Channel Usage test",testDescription:"The server calls the Usage API with this channel's OAuth Token. The Token is not returned with the test result.",testSucceeded:"Channel test succeeded",usagePlan:"Plan",primaryRemaining:"Primary remaining",secondaryRemaining:"Secondary remaining",resetsAt:"Resets",credits:"Credits",rawUsage:"Raw Usage fields",usageUnavailable:"The Usage API returned no recognized quota fields. Review the raw fields below.",
     tenantKeys:"Tenant API keys",keysDescription:"Keys are shown once; the server stores only SHA-256 hashes.",create:"Create",noKeys:"No API keys",noKeysDescription:"Create the first key to call the proxy.",prefix:"Prefix",createdAt:"Created",lastUsed:"Last used",revoked:"Revoked",active:"Active",revoke:"Revoke",revokeTitle:"Revoke API key?",revokeDescription:"This cannot be undone. Every caller using this key will fail immediately.",cancel:"Cancel",confirmRevoke:"Revoke key",keyNameHelp:"Use a recognizable environment or application name for attribution and revocation.",saveKeyTitle:"Save this API key now",saveKeyDescription:"It cannot be viewed again after closing. Do not put it in browser code, logs, or chat.",savedKey:"I stored it safely",copied:"Copied",keyRevoked:"API key revoked",
     usageTitle:"Usage by API key",usageDescription:"Requests, tokens, cache hits, errors, and latency are attributed to the calling key.",noUsage:"No usage yet",noUsageDescription:"Usage appears here by key after API calls.",requests:"Requests",errors:"Errors",averageLatency:"Average latency",
     auditTitle:"Per-call audit",auditDescription:"Request/response diagnostic previews are stored in SQLite; Authorization and OAuth credentials are excluded.",noAudit:"No audit events",noAuditDescription:"A basic audit record is written when each proxy call terminates.",time:"Time",requestId:"Request ID",channel:"Channel",endpointModel:"Endpoint / model",latency:"Latency",cachedInput:"Cached input",
@@ -264,13 +271,74 @@ function Dashboard({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
 function Channels({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
   const t = copy[locale]
   const [version, setVersion] = useState(0); const [open, setOpen] = useState(false); const [oauth, setOauth] = useState<{ state: string; authorize_url: string } | null>(null)
+  const [tokenDialog, setTokenDialog] = useState<ChannelTokenDialogState | null>(null); const [testState, setTestState] = useState<ChannelTestState | null>(null); const [deleteTarget, setDeleteTarget] = useState<Channel | null>(null); const [deletePending, setDeletePending] = useState(false)
+  const tokenRequest = useRef<AbortController | null>(null); const testRequest = useRef<AbortController | null>(null)
   const { data, error, loading } = useData<Channel[]>(sdk, "/api/channels", version)
+  useEffect(() => () => { tokenRequest.current?.abort(); testRequest.current?.abort() }, [])
   async function mutate(id: string, body: object) { try { await api(sdk, `/api/channels/${id}`, { method: "PATCH", body: JSON.stringify(body) }); setVersion((v) => v + 1); toast.success(t.channelUpdated) } catch (cause) { toast.error(message(cause, t)) } }
+  async function openTokens(channel: Channel) {
+    tokenRequest.current?.abort()
+    const request = new AbortController(); tokenRequest.current = request
+    setTokenDialog({ channel, loading: true })
+    try { const tokens = await api<ChannelTokens>(sdk, `/api/channels/${channel.id}`, { signal: request.signal }); if (tokenRequest.current === request) setTokenDialog({ channel, loading: false, tokens }) }
+    catch (cause) { if (!isAbortError(cause) && tokenRequest.current === request) setTokenDialog({ channel, loading: false, error: message(cause, t) }) }
+    finally { if (tokenRequest.current === request) tokenRequest.current = null }
+  }
+  async function test(channel: Channel) {
+    testRequest.current?.abort()
+    const request = new AbortController(); testRequest.current = request
+    setTestState({ channel, status: "loading" })
+    try { const result = await api<{ usage: ChannelUsage }>(sdk, `/api/channels/${channel.id}/test`, { method: "POST", signal: request.signal }); if (testRequest.current === request) { setTestState({ channel, status: "success", usage: result.usage }); toast.success(t.testSucceeded) } }
+    catch (cause) { if (!isAbortError(cause) && testRequest.current === request) setTestState({ channel, status: "error", error: message(cause, t) }) }
+    finally { if (testRequest.current === request) testRequest.current = null }
+  }
+  async function remove() {
+    if (!deleteTarget || deletePending) return; setDeletePending(true)
+    try { await api(sdk, `/api/channels/${deleteTarget.id}`, { method: "DELETE" }); setDeleteTarget(null); setVersion((value) => value + 1); toast.success(t.channelDeleted) }
+    catch (cause) { toast.error(message(cause, t)) }
+    finally { setDeletePending(false) }
+  }
+  function closeTokens() { tokenRequest.current?.abort(); tokenRequest.current = null; setTokenDialog(null) }
+  function closeTest() { testRequest.current?.abort(); testRequest.current = null; setTestState(null) }
   if (loading) return <LoadingTable />; if (error) return <ErrorState message={error} />
-  return <Card><CardHeader className="flex-row items-start justify-between"><div><CardTitle>{t.channelPool}</CardTitle><CardDescription>{t.channelDescription}</CardDescription></div><Button onClick={() => setOpen(true)}><PlusIcon data-icon="inline-start" />{t.addChannel}</Button></CardHeader><CardContent>
-    {!data?.length ? <EmptyState icon={<BoxesIcon />} title={t.noChannels} description={t.noChannelsDescription} action={<Button onClick={() => setOpen(true)}>{t.addChannel}</Button>} /> : <DataTable><Table><TableHeader><TableRow><TableHead>{t.name}</TableHead><TableHead>{t.account}</TableHead><TableHead>{t.status}</TableHead><TableHead>{t.inflight}</TableHead><TableHead>{t.recoveryReason}</TableHead><TableHead className="text-right">{t.actions}</TableHead></TableRow></TableHeader><TableBody>{data.map((channel) => <TableRow key={channel.id}><TableCell className="font-medium">{channel.name}</TableCell><TableCell className="font-mono text-xs">{channel.account_id}</TableCell><TableCell><StatusBadge status={channel.status} locale={locale} /></TableCell><TableCell className="tabular-nums">{channel.inflight}</TableCell><TableCell className="max-w-64 text-xs text-muted-foreground">{channel.last_error || (channel.cooldown_until ? formatTime(channel.cooldown_until, locale) : "—")}</TableCell><TableCell><div className="flex justify-end gap-2"><Button size="sm" variant="outline" onClick={() => void mutate(channel.id, { refresh: true })}><RefreshCwIcon data-icon="inline-start" />{t.refresh}</Button><Switch aria-label={`${t.status}: ${channel.name}`} checked={!channel.manual_disabled} onCheckedChange={(checked) => void mutate(channel.id, { enabled: checked })} /></div></TableCell></TableRow>)}</TableBody></Table></DataTable>}
-    <ChannelDialog sdk={sdk} locale={locale} open={open} onOpenChange={setOpen} oauth={oauth} setOauth={setOauth} onDone={() => { setOpen(false); setVersion((v) => v + 1) }} />
+  return <><Card><CardHeader className="flex-row items-start justify-between"><div><CardTitle>{t.channelPool}</CardTitle><CardDescription>{t.channelDescription}</CardDescription></div><Button onClick={() => setOpen(true)}><PlusIcon data-icon="inline-start" />{t.addChannel}</Button></CardHeader><CardContent>
+    {!data?.length ? <EmptyState icon={<BoxesIcon />} title={t.noChannels} description={t.noChannelsDescription} action={<Button onClick={() => setOpen(true)}>{t.addChannel}</Button>} /> : <DataTable><Table><TableHeader><TableRow><TableHead>{t.name}</TableHead><TableHead>{t.account}</TableHead><TableHead>{t.status}</TableHead><TableHead>{t.inflight}</TableHead><TableHead>{t.recoveryReason}</TableHead><TableHead className="text-right">{t.actions}</TableHead></TableRow></TableHeader><TableBody>{data.map((channel) => <TableRow key={channel.id}><TableCell className="font-medium">{channel.name}</TableCell><TableCell className="font-mono text-xs">{channel.account_id}</TableCell><TableCell><StatusBadge status={channel.status} locale={locale} /></TableCell><TableCell className="tabular-nums">{channel.inflight}</TableCell><TableCell className="max-w-64 text-xs text-muted-foreground">{channel.last_error || (channel.cooldown_until ? formatTime(channel.cooldown_until, locale) : "—")}</TableCell><TableCell><div className="flex justify-end gap-2"><Button size="sm" variant="outline" disabled={tokenDialog?.channel.id === channel.id && tokenDialog.loading} onClick={() => void openTokens(channel)}>{tokenDialog?.channel.id === channel.id && tokenDialog.loading ? <Spinner data-icon="inline-start" /> : <KeyRoundIcon data-icon="inline-start" />}{t.manageTokens}</Button><Button size="sm" variant="outline" disabled={testState?.channel.id === channel.id && testState.status === "loading"} onClick={() => void test(channel)}>{testState?.channel.id === channel.id && testState.status === "loading" ? <Spinner data-icon="inline-start" /> : <ActivityIcon data-icon="inline-start" />}{t.testChannel}</Button><Button size="sm" variant="outline" onClick={() => void mutate(channel.id, { refresh: true })}><RefreshCwIcon data-icon="inline-start" />{t.refresh}</Button><Switch aria-label={`${t.status}: ${channel.name}`} checked={!channel.manual_disabled} onCheckedChange={(checked) => void mutate(channel.id, { enabled: checked })} /><Button size="icon-sm" variant="ghost" aria-label={`${t.deleteChannel}: ${channel.name}`} onClick={() => setDeleteTarget(channel)}><Trash2Icon /></Button></div></TableCell></TableRow>)}</TableBody></Table></DataTable>}
   </CardContent></Card>
+    <ChannelDialog sdk={sdk} locale={locale} open={open} onOpenChange={setOpen} oauth={oauth} setOauth={setOauth} onDone={() => { setOpen(false); setVersion((v) => v + 1) }} />
+    <ChannelTokensDialog sdk={sdk} locale={locale} state={tokenDialog} onClose={closeTokens} onSaved={() => { closeTokens(); setVersion((value) => value + 1) }} />
+    <ChannelTestDialog locale={locale} state={testState} onClose={closeTest} />
+    <AlertDialog open={Boolean(deleteTarget)} onOpenChange={(next) => !next && !deletePending && setDeleteTarget(null)}><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>{t.deleteChannelTitle}</AlertDialogTitle><AlertDialogDescription>{t.deleteChannelDescription}</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel disabled={deletePending}>{t.cancel}</AlertDialogCancel><AlertDialogAction variant="destructive" disabled={deletePending} onClick={() => void remove()}>{deletePending && <Spinner data-icon="inline-start" />}{t.confirmDeleteChannel}</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
+  </>
+}
+
+function ChannelTokensDialog({ sdk, locale, state, onClose, onSaved }: { sdk: AuthSdk; locale: Locale; state: ChannelTokenDialogState | null; onClose: () => void; onSaved: () => void }) {
+  const t = copy[locale]
+  const [access, setAccess] = useState(""); const [refresh, setRefresh] = useState(""); const [pending, setPending] = useState(false)
+  const saveRequest = useRef<AbortController | null>(null)
+  useEffect(() => { saveRequest.current?.abort(); saveRequest.current = null; setPending(false); setAccess(state?.tokens?.access_key ?? ""); setRefresh(state?.tokens?.refresh_key ?? "") }, [state])
+  async function save(event: FormEvent) {
+    event.preventDefault(); if (!state || pending) return
+    const request = new AbortController(); saveRequest.current = request; setPending(true)
+    try { await api(sdk, `/api/channels/${state.channel.id}`, { method: "PUT", body: JSON.stringify({ access_key: access, refresh_key: refresh }), signal: request.signal }); if (saveRequest.current === request) { toast.success(t.tokensSaved); onSaved() } }
+    catch (cause) { if (!isAbortError(cause) && saveRequest.current === request) toast.error(message(cause, t)) }
+    finally { if (saveRequest.current === request) { saveRequest.current = null; setPending(false) } }
+  }
+  function close() { saveRequest.current?.abort(); saveRequest.current = null; setPending(false); onClose() }
+  return <Dialog open={Boolean(state)} onOpenChange={(next) => !next && close()}><DialogContent><DialogHeader><DialogTitle>{t.tokenTitle}: {state?.channel.name}</DialogTitle><DialogDescription>{t.tokenDescription}</DialogDescription></DialogHeader>
+    {state?.loading ? <div className="flex items-center gap-2 text-sm text-muted-foreground"><Spinner />{t.loadingTokens}</div> : state?.error ? <ErrorState message={state.error} /> : <form onSubmit={save}><FieldGroup><Field><FieldLabel htmlFor="edit-access-key">{t.accessKey}</FieldLabel><Input id="edit-access-key" autoComplete="off" value={access} onChange={(event) => setAccess(event.target.value)} required /><FieldDescription>{t.accessClaimHelp}</FieldDescription></Field><Field><FieldLabel htmlFor="edit-refresh-key">{t.refreshKey}</FieldLabel><Input id="edit-refresh-key" autoComplete="off" value={refresh} onChange={(event) => setRefresh(event.target.value)} required /></Field><DialogFooter><Button type="button" variant="outline" onClick={close}>{t.cancel}</Button><Button type="submit" disabled={pending || !access.trim() || !refresh.trim()}>{pending && <Spinner data-icon="inline-start" />}{t.saveTokens}</Button></DialogFooter></FieldGroup></form>}
+  </DialogContent></Dialog>
+}
+
+function ChannelTestDialog({ locale, state, onClose }: { locale: Locale; state: ChannelTestState | null; onClose: () => void }) {
+  const t = copy[locale]
+  const usage = state?.usage
+  const primary = usage?.rate_limit?.primary_window
+  const secondary = usage?.rate_limit?.secondary_window
+  const hasSummary = Boolean(usage?.plan_type || primary || secondary || usage?.credits)
+  return <Dialog open={Boolean(state)} onOpenChange={(next) => !next && onClose()}><DialogContent className="sm:max-w-2xl"><DialogHeader><DialogTitle>{t.testTitle}: {state?.channel.name}</DialogTitle><DialogDescription>{t.testDescription}</DialogDescription></DialogHeader>
+    {state?.status === "loading" ? <div className="flex items-center gap-2 text-sm text-muted-foreground"><Spinner />{t.testingChannel}</div> : state?.status === "error" ? <ErrorState message={state.error || t.unknownError} /> : usage && <div className="flex flex-col gap-4">{hasSummary ? <Definition rows={[[t.usagePlan, usage.plan_type || "—"], [t.primaryRemaining, remainingPercent(primary)], [t.secondaryRemaining, remainingPercent(secondary)], [t.resetsAt, usageReset(primary, secondary, locale)], [t.credits, usage.credits?.unlimited ? "∞" : usage.credits?.balance ?? "—"]]} /> : <Alert><AlertTitle>{t.usageUnavailable}</AlertTitle></Alert>}<div className="flex flex-col gap-2"><h3 className="text-sm font-medium">{t.rawUsage}</h3><ScrollArea className="max-h-72 rounded-lg border bg-muted p-3"><pre className="text-xs whitespace-pre-wrap break-all">{JSON.stringify(usage, null, 2)}</pre></ScrollArea></div></div>}
+    <DialogFooter><Button onClick={onClose}>{t.close}</Button></DialogFooter>
+  </DialogContent></Dialog>
 }
 
 function ChannelDialog({ sdk, locale, open, onOpenChange, oauth, setOauth, onDone }: { sdk: AuthSdk; locale: Locale; open: boolean; onOpenChange: (open: boolean) => void; oauth: { state: string; authorize_url: string } | null; setOauth: (value: { state: string; authorize_url: string } | null) => void; onDone: () => void }) {
@@ -400,7 +468,15 @@ function useData<T>(sdk: AuthSdk, path: string, version = 0) {
 }
 function currentMessages() { return copy[document.documentElement.lang.startsWith("zh") ? "zh" : "en"] }
 function message(cause: unknown, t = currentMessages()) { return cause instanceof Error ? cause.message : t.unknownError }
+function isAbortError(cause: unknown) { return cause instanceof DOMException && cause.name === "AbortError" }
 function formatTime(timestamp: number | undefined, locale: Locale) { return timestamp ? new Intl.DateTimeFormat(locale === "zh" ? "zh-CN" : "en-US", { dateStyle: "short", timeStyle: "medium" }).format(timestamp * 1000) : "—" }
+function remainingPercent(window: UsageWindow | undefined) { return typeof window?.used_percent === "number" ? `${Math.max(0, 100 - window.used_percent).toFixed(1)}%` : "—" }
+function usageReset(primary: UsageWindow | undefined, secondary: UsageWindow | undefined, locale: Locale) {
+  const reset = primary?.reset_at ?? secondary?.reset_at
+  if (reset) return formatTime(reset, locale)
+  const seconds = primary?.reset_after_seconds ?? secondary?.reset_after_seconds
+  return typeof seconds === "number" ? `${seconds.toLocaleString()} s` : "—"
+}
 function roleLabel(role: User["role"], locale: Locale) { const t = copy[locale]; return role === "root" ? t.roleRoot : role === "admin" ? t.roleAdmin : t.roleUser }
 function statusLabel(status: string, locale: Locale) { const t = copy[locale]; return ({active:t.statusActive,cooldown:t.statusCooldown,auth_error:t.statusAuthError,disabled:t.statusDisabled})[status] || t.statusUnknown }
 function pageDescription(page: Page, locale: Locale) { const t = copy[locale]; return ({dashboard:t.pageDashboard,channels:t.pageChannels,keys:t.pageKeys,usage:t.pageUsage,audit:t.pageAudit,users:t.pageUsers,settings:t.pageSettings})[page] }

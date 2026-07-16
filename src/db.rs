@@ -1,16 +1,16 @@
 use std::{path::Path, time::Duration};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use sqlx::{
-    SqlitePool,
+    Acquire, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
-pub async fn connect(path: &Path) -> Result<SqlitePool> {
+pub async fn connect(path: &Path, encryption_key: &[u8; 32]) -> Result<SqlitePool> {
     let options = options(path, true)?;
-    let pool = connect_with_options(options, 4).await?;
+    let pool = connect_with_options(options, 4, encryption_key).await?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -25,13 +25,13 @@ pub async fn connect_memory() -> Result<SqlitePool> {
         .parse::<SqliteConnectOptions>()?
         .foreign_keys(true)
         .busy_timeout(Duration::from_secs(5));
-    connect_with_options(options, 1).await
+    connect_with_options(options, 1, &[0_u8; 32]).await
 }
 
 #[cfg(test)]
-pub async fn connect_test_file(path: &Path) -> Result<SqlitePool> {
+pub async fn connect_test_file(path: &Path, encryption_key: &[u8; 32]) -> Result<SqlitePool> {
     let options = options(path, true)?;
-    connect_with_options(options, 4).await
+    connect_with_options(options, 4, encryption_key).await
 }
 
 fn options(path: &Path, create: bool) -> Result<SqliteConnectOptions> {
@@ -47,6 +47,7 @@ fn options(path: &Path, create: bool) -> Result<SqliteConnectOptions> {
 async fn connect_with_options(
     options: SqliteConnectOptions,
     max_connections: u32,
+    encryption_key: &[u8; 32],
 ) -> Result<SqlitePool> {
     let pool = SqlitePoolOptions::new()
         .max_connections(max_connections)
@@ -57,6 +58,7 @@ async fn connect_with_options(
         .execute(&mut *connection)
         .await?;
     MIGRATOR.run(&mut *connection).await?;
+    migrate_channel_tokens(&mut connection, encryption_key).await?;
     let foreign_key_violations: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
             .fetch_one(&mut *connection)
@@ -72,6 +74,42 @@ async fn connect_with_options(
     Ok(pool)
 }
 
+async fn migrate_channel_tokens(
+    connection: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+    encryption_key: &[u8; 32],
+) -> Result<()> {
+    let plaintext: String =
+        sqlx::query_scalar("SELECT value FROM app_meta WHERE key='channel_tokens_plaintext'")
+            .fetch_one(&mut **connection)
+            .await?;
+    if plaintext == "true" {
+        return Ok(());
+    }
+
+    let mut transaction = connection.begin().await?;
+    let channels: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT id,access_token,refresh_token FROM channels")
+            .fetch_all(&mut *transaction)
+            .await?;
+    for (id, access_token, refresh_token) in channels {
+        let access_token = crate::crypto::decrypt(encryption_key, &access_token)
+            .with_context(|| format!("failed to migrate access Token for channel {id}"))?;
+        let refresh_token = crate::crypto::decrypt(encryption_key, &refresh_token)
+            .with_context(|| format!("failed to migrate refresh Token for channel {id}"))?;
+        sqlx::query("UPDATE channels SET access_token=?,refresh_token=? WHERE id=?")
+            .bind(access_token)
+            .bind(refresh_token)
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    sqlx::query("UPDATE app_meta SET value='true',updated_at=unixepoch() WHERE key='channel_tokens_plaintext'")
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use sqlx::Row;
@@ -82,7 +120,7 @@ mod tests {
     async fn every_pooled_connection_has_required_pragmas() {
         let path =
             std::env::temp_dir().join(format!("openai-lb-db-{}.sqlite3", uuid::Uuid::new_v4()));
-        let pool = connect_test_file(&path).await.unwrap();
+        let pool = connect_test_file(&path, &[0_u8; 32]).await.unwrap();
         let mut connections = Vec::new();
         for _ in 0..4 {
             connections.push(pool.acquire().await.unwrap());
@@ -130,21 +168,31 @@ mod tests {
         for statement in schema {
             sqlx::query(statement).execute(&legacy).await.unwrap();
         }
+        let encryption_key = [11_u8; 32];
         let fixtures = [
             "INSERT INTO users(id,email,role,created_at) VALUES('legacy-admin','admin@example.com','admin',1)",
             "INSERT INTO api_keys(id,user_id,name,prefix,secret_hash,created_at) VALUES('key','legacy-admin','legacy','sk-old','hash',2)",
-            "INSERT INTO channels(id,name,account_id,access_enc,refresh_enc,created_at,updated_at) VALUES('channel','legacy','account','access','refresh',3,3)",
             "INSERT INTO oauth_flows(state_hash,verifier_enc,created_by,expires_at) VALUES('flow','verifier','legacy-admin',100)",
-            "INSERT INTO affinities(affinity_hash,channel_id,expires_at,updated_at) VALUES('affinity','channel',100,4)",
-            "INSERT INTO api_calls(id,request_id,api_key_id,user_id,channel_id,method,path,status,latency_ms,created_at) VALUES('call','request','key','legacy-admin','channel','POST','/v1/responses',200,5,5)",
             "INSERT INTO admin_audit(id,admin_user_id,action,created_at) VALUES('audit','legacy-admin','legacy.action',6)",
         ];
         for statement in fixtures {
             sqlx::query(statement).execute(&legacy).await.unwrap();
         }
+        sqlx::query("INSERT INTO channels(id,name,account_id,access_enc,refresh_enc,created_at,updated_at) VALUES('channel','legacy','account',?,?,3,3)")
+            .bind(crate::crypto::encrypt(&encryption_key, "access").unwrap())
+            .bind(crate::crypto::encrypt(&encryption_key, "refresh").unwrap())
+            .execute(&legacy)
+            .await
+            .unwrap();
+        for statement in [
+            "INSERT INTO affinities(affinity_hash,channel_id,expires_at,updated_at) VALUES('affinity','channel',100,4)",
+            "INSERT INTO api_calls(id,request_id,api_key_id,user_id,channel_id,method,path,status,latency_ms,created_at) VALUES('call','request','key','legacy-admin','channel','POST','/v1/responses',200,5,5)",
+        ] {
+            sqlx::query(statement).execute(&legacy).await.unwrap();
+        }
         legacy.close().await;
 
-        let pool = connect_test_file(&path).await.unwrap();
+        let pool = connect_test_file(&path, &encryption_key).await.unwrap();
         let role: String = sqlx::query_scalar("SELECT role FROM users WHERE id='legacy-admin'")
             .fetch_one(&pool)
             .await
@@ -171,6 +219,12 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(foreign_key_violations, 0);
+        let tokens: (String, String) =
+            sqlx::query_as("SELECT access_token,refresh_token FROM channels WHERE id='channel'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(tokens, ("access".to_owned(), "refresh".to_owned()));
         sqlx::query("INSERT INTO users(id,role,created_at) VALUES('root','root',2)")
             .execute(&pool)
             .await

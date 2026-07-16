@@ -84,8 +84,12 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/channels/{id}",
-            patch(api::update_channel).delete(api::delete_channel),
+            get(api::read_channel_tokens)
+                .put(api::replace_channel_tokens)
+                .patch(api::update_channel)
+                .delete(api::delete_channel),
         )
+        .route("/api/channels/{id}/test", post(api::test_channel))
         .route("/api/oauth/start", post(api::oauth_start))
         .route("/api/oauth/complete", post(api::oauth_complete))
         .route("/api/usage", get(api::usage))

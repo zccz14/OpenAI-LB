@@ -88,6 +88,7 @@ import {
 } from "@/components/ui/empty"
 import {
   Field,
+  FieldContent,
   FieldDescription,
   FieldError,
   FieldGroup,
@@ -170,6 +171,7 @@ type Consumer = {
   created_at: number
   last_used_at?: number
   revoked_at?: number
+  request_archive: boolean
 }
 type Provider = {
   id: string
@@ -241,6 +243,7 @@ type PivotColumn = { id: string; label: string }
 type Audit = {
   id: string
   request_id: string
+  thread_id?: string
   user_id: string
   consumer_name: string
   provider_id?: string
@@ -322,7 +325,7 @@ const copy = {
     pageConsumers: "按 AI App 隔离下游消费者，分别跟踪调用量并独立吊销凭据。",
     pageUsage: "按消费者核算请求、Token、错误和延迟。",
     pageAudit: "逐次追踪请求、上游提供商、结果与用量；诊断内容按配置期限保留。",
-    pageRequestDetail: "查看调用上下文、消息结构与同一亲和链的相邻请求。",
+    pageRequestDetail: "查看调用上下文、消息结构与同一 Thread ID 的相邻请求。",
     pageUsers: "由 root 管理本地授权角色；用户身份仍由 Auth Mini 提供。",
     pageSettings: "确认身份边界、上游与部署限制。",
     operationalStatus: "运行状态",
@@ -392,6 +395,9 @@ const copy = {
     prefix: "前缀",
     createdAt: "创建时间",
     lastUsed: "最近使用",
+    requestArchive: "诊断入库",
+    requestArchiveHelp: "打开后，该 Consumer 的请求/响应诊断预览才会保存到 SQLite。",
+    requestArchiveUpdated: "诊断入库开关已更新",
     revoked: "已吊销",
     active: "有效",
     revoke: "吊销",
@@ -447,8 +453,9 @@ const copy = {
     noAuditDescription: "每次代理调用结束后都会写入基础审计记录。",
     time: "时间",
     requestId: "请求 ID",
+    threadId: "Thread ID",
+    copyThreadId: "复制 Thread ID",
     provider: "上游提供商",
-    endpointModel: "接口 / 模型",
     latency: "延迟",
     cachedInput: "缓存输入",
     details: "详情",
@@ -584,7 +591,7 @@ const copy = {
     pageAudit:
       "Trace each request, provider, result, and usage; diagnostic content follows the configured retention.",
     pageRequestDetail:
-      "Review call context, message structure, and adjacent requests in the same affinity chain.",
+      "Review call context, message structure, and adjacent requests with the same Thread ID.",
     pageUsers:
       "Root manages local authorization roles while Auth Mini remains the identity provider.",
     pageSettings:
@@ -659,6 +666,10 @@ const copy = {
     prefix: "Prefix",
     createdAt: "Created",
     lastUsed: "Last used",
+    requestArchive: "Archive diagnostics",
+    requestArchiveHelp:
+      "When enabled, this Consumer's request/response diagnostic previews are saved to SQLite.",
+    requestArchiveUpdated: "Diagnostic archive setting updated",
     revoked: "Revoked",
     active: "Active",
     revoke: "Revoke",
@@ -717,8 +728,9 @@ const copy = {
       "A basic audit record is written when each proxy call terminates.",
     time: "Time",
     requestId: "Request ID",
+    threadId: "Thread ID",
+    copyThreadId: "Copy Thread ID",
     provider: "Provider",
-    endpointModel: "Endpoint / model",
     latency: "Latency",
     cachedInput: "Cached input",
     details: "Details",
@@ -2114,6 +2126,7 @@ function Consumers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
   const t = copy[locale]
   const queryClient = useQueryClient()
   const [name, setName] = useState("")
+  const [requestArchive, setRequestArchive] = useState(false)
   const [open, setOpen] = useState(false)
   const [secret, setSecret] = useState("")
   const [revokeId, setRevokeId] = useState<string | null>(null)
@@ -2129,11 +2142,24 @@ function Consumers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
     try {
       const value = await api<{ secret: string }>(sdk, "/api/consumers", {
         method: "POST",
-        body: JSON.stringify({ name }),
+        body: JSON.stringify({ name, request_archive: requestArchive }),
       })
       setSecret(value.secret)
       setName("")
+      setRequestArchive(false)
       refreshConsumers()
+    } catch (cause) {
+      toast.error(message(cause, t))
+    }
+  }
+  async function updateArchive(id: string, checked: boolean) {
+    try {
+      await api(sdk, `/api/consumers/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ request_archive: checked }),
+      })
+      refreshConsumers()
+      toast.success(t.requestArchiveUpdated)
     } catch (cause) {
       toast.error(message(cause, t))
     }
@@ -2203,6 +2229,7 @@ function Consumers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                     <TableHead>{t.prefix}</TableHead>
                     <TableHead>{t.createdAt}</TableHead>
                     <TableHead>{t.lastUsed}</TableHead>
+                    <TableHead>{t.requestArchive}</TableHead>
                     <TableHead>{t.status}</TableHead>
                     <TableHead />
                   </TableRow>
@@ -2219,6 +2246,16 @@ function Consumers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                       </TableCell>
                       <TableCell>
                         {formatTime(consumer.last_used_at, locale)}
+                      </TableCell>
+                      <TableCell>
+                        <Switch
+                          aria-label={`${t.requestArchive}: ${consumer.name}`}
+                          checked={consumer.request_archive}
+                          disabled={Boolean(consumer.revoked_at)}
+                          onCheckedChange={(checked) =>
+                            void updateArchive(consumer.id, checked)
+                          }
+                        />
                       </TableCell>
                       <TableCell>
                         <Badge
@@ -2270,6 +2307,19 @@ function Consumers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                   value={name}
                   onChange={(e) => setName(e.target.value)}
                   required
+                />
+              </Field>
+              <Field orientation="horizontal">
+                <FieldContent>
+                  <FieldLabel htmlFor="consumer-request-archive">
+                    {t.requestArchive}
+                  </FieldLabel>
+                  <FieldDescription>{t.requestArchiveHelp}</FieldDescription>
+                </FieldContent>
+                <Switch
+                  id="consumer-request-archive"
+                  checked={requestArchive}
+                  onCheckedChange={setRequestArchive}
                 />
               </Field>
               <DialogFooter>
@@ -2874,7 +2924,8 @@ function AuditPage({
                 <TableHeader>
                   <TableRow>
                     <TableHead>{t.time}</TableHead>
-                    <TableHead>{t.endpointModel}</TableHead>
+                    <TableHead>{t.threadId}</TableHead>
+                    <TableHead>{t.model}</TableHead>
                     <TableHead>{t.consumer}</TableHead>
                     <TableHead>{t.userId}</TableHead>
                     <TableHead>{t.provider}</TableHead>
@@ -2890,22 +2941,42 @@ function AuditPage({
                         {formatTime(row.created_at, locale)}
                       </TableCell>
                       <TableCell>
-                        <div className="flex max-w-56 flex-col gap-0.5">
-                          <span className="font-medium">{row.path}</span>
-                          <code>{row.model || "—"}</code>
-                          <code
-                            title={row.request_id}
-                            aria-label={`${t.requestId}: ${row.request_id}`}
-                          >
-                            {row.request_id.slice(0, 12)}…
-                          </code>
-                        </div>
+                        {row.thread_id ? (
+                          <div className="flex items-center gap-1">
+                            <code
+                              title={row.thread_id}
+                              aria-label={`${t.threadId}: ${row.thread_id}`}
+                            >
+                              {row.thread_id.slice(0, 12)}
+                              {row.thread_id.length > 12 && "…"}
+                            </code>
+                            <Button
+                              size="icon-xs"
+                              variant="ghost"
+                              aria-label={`${t.copyThreadId}: ${row.thread_id}`}
+                              onClick={() =>
+                                void navigator.clipboard
+                                  .writeText(row.thread_id!)
+                                  .then(() => toast.success(t.copied))
+                              }
+                            >
+                              <ClipboardIcon />
+                            </Button>
+                          </div>
+                        ) : (
+                          "—"
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        <code>{row.model || "—"}</code>
                       </TableCell>
                       <TableCell className="font-medium">
                         {row.consumer_name}
                       </TableCell>
                       <TableCell>
-                        <code>{row.user_id}</code>
+                        <code title={row.user_id}>
+                          {row.user_id.slice(0, 8)}
+                        </code>
                       </TableCell>
                       <TableCell title={row.provider_id}>
                         {row.provider_name || "—"}
@@ -3028,10 +3099,11 @@ function RequestDetailPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
           <Definition
             rows={[
               [t.requestId, data.request_id],
+              [t.threadId, data.thread_id || "—"],
               [t.consumer, data.consumer_name],
               [t.userId, data.user_id],
               [t.provider, data.provider_name || data.provider_id || "—"],
-              [t.endpointModel, data.model || "—"],
+              [t.model, data.model || "—"],
               [t.status, data.status],
               [t.affinitySource, data.affinity_source || "—"],
               [t.affinityRequestId, affinityId || "—"],

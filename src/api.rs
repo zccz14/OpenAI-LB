@@ -644,17 +644,88 @@ pub struct Page {
     offset: Option<i64>,
 }
 
+#[derive(Deserialize)]
+pub struct UsageQuery {
+    period: Option<UsagePeriod>,
+}
+
+#[derive(Deserialize)]
+enum UsagePeriod {
+    #[serde(rename = "24h")]
+    Last24Hours,
+    #[serde(rename = "7d")]
+    Last7Days,
+}
+
+impl UsagePeriod {
+    fn seconds(&self) -> i64 {
+        match self {
+            Self::Last24Hours => 24 * 60 * 60,
+            Self::Last7Days => 7 * 24 * 60 * 60,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Last24Hours => "24h",
+            Self::Last7Days => "7d",
+        }
+    }
+}
+
 pub async fn usage(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<UsageQuery>,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
-    let rows = sqlx::query("SELECT k.id,k.name,k.prefix,COUNT(c.id),COALESCE(SUM(c.input_tokens),0),COALESCE(SUM(c.output_tokens),0),COALESCE(SUM(c.cached_tokens),0),COALESCE(SUM(CASE WHEN c.status>=400 THEN 1 ELSE 0 END),0),COALESCE(AVG(c.latency_ms),0) FROM consumers k LEFT JOIN api_calls c ON c.consumer_id=k.id WHERE k.user_id=? GROUP BY k.id ORDER BY k.created_at DESC")
-        .bind(&user.id).fetch_all(&state.db).await?;
-    Ok(Json(Value::Array(rows.into_iter().map(|row| json!({
-        "consumer_id":row.get::<String,_>(0),"name":row.get::<String,_>(1),"prefix":row.get::<String,_>(2),"requests":row.get::<i64,_>(3),
-        "input_tokens":row.get::<i64,_>(4),"output_tokens":row.get::<i64,_>(5),"cached_tokens":row.get::<i64,_>(6),"errors":row.get::<i64,_>(7),"avg_latency_ms":row.get::<f64,_>(8)
-    })).collect())))
+    let period = query.period.unwrap_or(UsagePeriod::Last24Hours);
+    let since = chrono::Utc::now().timestamp() - period.seconds();
+    Ok(Json(json!({
+        "period": period.label(),
+        "since": since,
+        "rows": usage_rows(&state, &user, since).await?
+    })))
+}
+
+async fn usage_rows(
+    state: &AppState,
+    user: &crate::auth::UserIdentity,
+    since: i64,
+) -> Result<Vec<Value>, AppError> {
+    let sql = "SELECT c.user_id,u.email,u.display_name,k.id,k.name,k.prefix,COALESCE(NULLIF(c.model,''),'unknown'),date(c.created_at,'unixepoch'),COUNT(c.id),COALESCE(SUM(c.input_tokens),0),COALESCE(SUM(c.cached_tokens),0),COALESCE(SUM(c.output_tokens),0) FROM api_calls c JOIN users u ON u.id=c.user_id JOIN consumers k ON k.id=c.consumer_id WHERE c.created_at>=?";
+    let group = " GROUP BY c.user_id,u.email,u.display_name,k.id,k.name,k.prefix,COALESCE(NULLIF(c.model,''),'unknown'),date(c.created_at,'unixepoch') ORDER BY date(c.created_at,'unixepoch') ASC";
+    let rows = if is_admin(user) {
+        sqlx::query(&format!("{sql}{group}"))
+            .bind(since)
+            .fetch_all(&state.db)
+            .await?
+    } else {
+        sqlx::query(&format!("{sql} AND c.user_id=?{group}"))
+            .bind(since)
+            .bind(&user.id)
+            .fetch_all(&state.db)
+            .await?
+    };
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "user_id": row.get::<String, _>(0),
+                "user_email": row.get::<Option<String>, _>(1),
+                "user_name": row.get::<Option<String>, _>(2),
+                "consumer_id": row.get::<String, _>(3),
+                "consumer_name": row.get::<String, _>(4),
+                "consumer_prefix": row.get::<String, _>(5),
+                "model": row.get::<String, _>(6),
+                "date": row.get::<String, _>(7),
+                "requests": row.get::<i64, _>(8),
+                "input_tokens": row.get::<i64, _>(9),
+                "cached_tokens": row.get::<i64, _>(10),
+                "output_tokens": row.get::<i64, _>(11)
+            })
+        })
+        .collect())
 }
 
 pub async fn audit(
@@ -667,12 +738,12 @@ pub async fn audit(
     let offset = page.offset.unwrap_or(0).max(0);
     let (sql, scope) = if is_admin(&user) {
         (
-            "SELECT c.id,c.request_id,c.user_id,k.prefix,c.provider_id,ch.name,c.path,c.method,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id ORDER BY c.created_at DESC LIMIT ? OFFSET ?",
+            "SELECT c.id,c.request_id,c.user_id,k.name,c.provider_id,ch.name,c.path,c.method,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id ORDER BY c.created_at DESC LIMIT ? OFFSET ?",
             None,
         )
     } else {
         (
-            "SELECT c.id,c.request_id,c.user_id,k.prefix,c.provider_id,ch.name,c.path,c.method,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id WHERE c.user_id=? ORDER BY c.created_at DESC LIMIT ? OFFSET ?",
+            "SELECT c.id,c.request_id,c.user_id,k.name,c.provider_id,ch.name,c.path,c.method,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id WHERE c.user_id=? ORDER BY c.created_at DESC LIMIT ? OFFSET ?",
             Some(user.id),
         )
     };
@@ -682,7 +753,7 @@ pub async fn audit(
     }
     let rows = query.bind(limit).bind(offset).fetch_all(&state.db).await?;
     Ok(Json(Value::Array(rows.into_iter().map(|row| json!({
-        "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"user_id":row.get::<String,_>(2),"consumer_prefix":row.get::<String,_>(3),"provider_id":row.get::<Option<String>,_>(4),"provider_name":row.get::<Option<String>,_>(5),
+        "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"user_id":row.get::<String,_>(2),"consumer_name":row.get::<String,_>(3),"provider_id":row.get::<Option<String>,_>(4),"provider_name":row.get::<Option<String>,_>(5),
         "path":row.get::<String,_>(6),"method":row.get::<String,_>(7),"model":row.get::<Option<String>,_>(8),"status":row.get::<i64,_>(9),"latency_ms":row.get::<i64,_>(10),
         "input_tokens":row.get::<i64,_>(11),"output_tokens":row.get::<i64,_>(12),"cached_tokens":row.get::<i64,_>(13),"error":row.get::<Option<String>,_>(14),"client_ip":row.get::<Option<String>,_>(15),"created_at":row.get::<i64,_>(16)
     })).collect())))
@@ -696,12 +767,12 @@ pub async fn audit_detail(
     let user = browser_identity(&state, &headers).await?;
     let (sql, scope) = if is_admin(&user) {
         (
-            "SELECT c.id,c.request_id,c.user_id,k.prefix,c.provider_id,ch.name,c.method,c.path,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=?",
+            "SELECT c.id,c.request_id,c.user_id,k.name,c.provider_id,ch.name,c.method,c.path,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=?",
             None,
         )
     } else {
         (
-            "SELECT c.id,c.request_id,c.user_id,k.prefix,c.provider_id,ch.name,c.method,c.path,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=? AND c.user_id=?",
+            "SELECT c.id,c.request_id,c.user_id,k.name,c.provider_id,ch.name,c.method,c.path,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=? AND c.user_id=?",
             Some(user.id.clone()),
         )
     };
@@ -751,7 +822,7 @@ pub async fn audit_detail(
         .and_then(|index| navigation_rows.get(index));
     let next = position.and_then(|index| navigation_rows.get(index + 1));
     Ok(Json(json!({
-        "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"user_id":row.get::<String,_>(2),"consumer_prefix":row.get::<String,_>(3),
+        "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"user_id":row.get::<String,_>(2),"consumer_name":row.get::<String,_>(3),
         "provider_id":row.get::<Option<String>,_>(4),"provider_name":row.get::<Option<String>,_>(5),"method":row.get::<String,_>(6),"path":row.get::<String,_>(7),
         "model":row.get::<Option<String>,_>(8),"status":row.get::<i64,_>(9),"latency_ms":row.get::<i64,_>(10),"input_tokens":row.get::<i64,_>(11),
         "output_tokens":row.get::<i64,_>(12),"cached_tokens":row.get::<i64,_>(13),"error":row.get::<Option<String>,_>(14),"client_ip":row.get::<Option<String>,_>(15),
@@ -797,7 +868,7 @@ pub async fn dashboard(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
-    let consumers: i64 =
+    let keys: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM consumers WHERE user_id=? AND revoked_at IS NULL")
             .bind(&user.id)
             .fetch_one(&state.db)
@@ -825,7 +896,7 @@ pub async fn dashboard(
         0
     };
     Ok(Json(
-        json!({"active_consumers":consumers,"calls_24h":calls,"errors_24h":errors,"available_providers":providers}),
+        json!({"active_consumers":keys,"calls_24h":calls,"errors_24h":errors,"available_providers":providers}),
     ))
 }
 
@@ -1236,6 +1307,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn usage_rows_groups_current_window_by_user_key_and_model() {
+        let state = crate::test_state("http://token.invalid").await;
+        let now = chrono::Utc::now().timestamp();
+        for (id, email, role) in [
+            ("tenant-a", "a@example.com", "user"),
+            ("tenant-b", "b@example.com", "user"),
+            ("admin", "admin@example.com", "admin"),
+        ] {
+            sqlx::query(
+                "INSERT INTO users(id,email,display_name,role,created_at) VALUES(?,?,?, ?,?)",
+            )
+            .bind(id)
+            .bind(email)
+            .bind(id)
+            .bind(role)
+            .bind(now)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+        for (id, user_id) in [("key-a", "tenant-a"), ("key-b", "tenant-b")] {
+            sqlx::query("INSERT INTO consumers(id,user_id,name,prefix,secret_hash,created_at) VALUES(?,?,?,? ,?,?)")
+                .bind(id)
+                .bind(user_id)
+                .bind(id)
+                .bind(format!("sk-{id}"))
+                .bind(format!("hash-{id}"))
+                .bind(now)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+        for (id, consumer_id, user_id, model, input, cached, output, created_at) in [
+            ("a-1", "key-a", "tenant-a", "gpt-5", 10, 3, 4, now - 60),
+            ("a-2", "key-a", "tenant-a", "gpt-5", 6, 2, 8, now - 120),
+            ("b-1", "key-b", "tenant-b", "gpt-4.1", 5, 1, 2, now - 60),
+            (
+                "a-old",
+                "key-a",
+                "tenant-a",
+                "gpt-5",
+                99,
+                0,
+                0,
+                now - 8 * 24 * 60 * 60,
+            ),
+        ] {
+            sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,method,path,model,status,latency_ms,input_tokens,cached_tokens,output_tokens,created_at) VALUES(?,?,?,?,'POST','/v1/responses',?,200,1,?,?,?,?)")
+                .bind(id)
+                .bind(id)
+                .bind(consumer_id)
+                .bind(user_id)
+                .bind(model)
+                .bind(input)
+                .bind(cached)
+                .bind(output)
+                .bind(created_at)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+
+        let tenant = crate::auth::UserIdentity {
+            id: "tenant-a".to_owned(),
+            email: Some("a@example.com".to_owned()),
+            name: Some("tenant-a".to_owned()),
+            role: "user".to_owned(),
+        };
+        let tenant_rows = usage_rows(&state, &tenant, now - 24 * 60 * 60)
+            .await
+            .unwrap();
+        assert_eq!(tenant_rows.len(), 1);
+        assert_eq!(tenant_rows[0]["requests"], 2);
+        assert_eq!(tenant_rows[0]["input_tokens"], 16);
+        assert_eq!(tenant_rows[0]["cached_tokens"], 5);
+        assert_eq!(tenant_rows[0]["output_tokens"], 12);
+        assert_eq!(tenant_rows[0]["model"], "gpt-5");
+
+        let admin = crate::auth::UserIdentity {
+            id: "admin".to_owned(),
+            email: Some("admin@example.com".to_owned()),
+            name: Some("admin".to_owned()),
+            role: "admin".to_owned(),
+        };
+        let admin_rows = usage_rows(&state, &admin, now - 24 * 60 * 60)
+            .await
+            .unwrap();
+        assert_eq!(admin_rows.len(), 2);
+        assert_eq!(
+            admin_rows
+                .iter()
+                .map(|row| row["requests"].as_i64().unwrap())
+                .sum::<i64>(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_rows_split_dates_at_utc_midnight() {
+        let state = crate::test_state("http://token.invalid").await;
+        let midnight_utc = 1_704_067_200_i64;
+        sqlx::query("INSERT INTO users(id,role,created_at) VALUES('tenant','user',?)")
+            .bind(midnight_utc)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO consumers(id,user_id,name,prefix,secret_hash,created_at) VALUES('key','tenant','key','sk-utc','hash-utc',?)")
+            .bind(midnight_utc)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        for (id, created_at) in [("before", midnight_utc - 1), ("after", midnight_utc)] {
+            sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,method,path,status,latency_ms,created_at) VALUES(?,?, 'key','tenant','POST','/v1/responses',200,1,?)")
+                .bind(id)
+                .bind(id)
+                .bind(created_at)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+        let user = crate::auth::UserIdentity {
+            id: "tenant".to_owned(),
+            email: None,
+            name: None,
+            role: "user".to_owned(),
+        };
+        let rows = usage_rows(&state, &user, midnight_utc - 60).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["date"], "2023-12-31");
+        assert_eq!(rows[1]["date"], "2024-01-01");
+    }
+
+    #[tokio::test]
     async fn sensitive_admin_action_is_audited() {
         let state = crate::test_state("http://token.invalid").await;
         sqlx::query("INSERT INTO users(id,role,created_at) VALUES('admin','admin',?)")
@@ -1510,6 +1714,15 @@ mod tests {
                     .and_then(|audit| audit["provider_name"].as_str()),
                 Some("renamed")
             );
+            assert_eq!(
+                audits
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|audit| audit["id"] == call_id)
+                    .and_then(|audit| audit["consumer_name"].as_str()),
+                Some("history")
+            );
             let detail = provider_request(
                 &state,
                 Method::GET,
@@ -1525,6 +1738,7 @@ mod tests {
             assert_eq!(detail["archive_available"], true);
             assert_eq!(detail["request_body"], json!(r#"{"input":"audit detail"}"#));
             assert_eq!(detail["response_body"], json!(r#"{"output":"diagnostic"}"#));
+            assert_eq!(detail["consumer_name"], "history");
             assert_eq!(detail["previous"]["id"], previous_id);
             let test = provider_request(
                 &state,

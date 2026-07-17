@@ -145,6 +145,21 @@ pub struct CreateConsumer {
     name: String,
 }
 
+#[derive(Deserialize)]
+pub struct UpdateConsumer {
+    name: String,
+}
+
+fn consumer_name(value: &str) -> Result<&str, AppError> {
+    let name = value.trim();
+    if name.is_empty() || name.len() > 80 {
+        return Err(AppError::bad_request(
+            "consumer name must be 1-80 characters",
+        ));
+    }
+    Ok(name)
+}
+
 pub async fn list_consumers(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -164,10 +179,7 @@ pub async fn create_consumer(
     Json(input): Json<CreateConsumer>,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
-    let name = input.name.trim();
-    if name.is_empty() || name.len() > 80 {
-        return Err(AppError::bad_request("key name must be 1-80 characters"));
-    }
+    let name = consumer_name(&input.name)?;
     let mut random = [0_u8; 32];
     rand::rng().fill_bytes(&mut random);
     let secret = format!("sk-{}", URL_SAFE_NO_PAD.encode(random));
@@ -187,6 +199,26 @@ pub async fn create_consumer(
     Ok(Json(
         json!({"id":id,"name":name,"prefix":prefix,"secret":secret}),
     ))
+}
+
+pub async fn update_consumer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<UpdateConsumer>,
+) -> Result<Json<Value>, AppError> {
+    let user = browser_identity(&state, &headers).await?;
+    let name = consumer_name(&input.name)?;
+    let result = sqlx::query("UPDATE consumers SET name=? WHERE id=? AND user_id=?")
+        .bind(name)
+        .bind(&id)
+        .bind(&user.id)
+        .execute(&state.db)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::not_found("consumer not found"));
+    }
+    Ok(Json(json!({"id":id,"name":name})))
 }
 
 pub async fn revoke_consumer(
@@ -1855,6 +1887,92 @@ mod tests {
                 .unwrap();
             assert_eq!(count, expected, "unexpected audit count for {action}");
         }
+    }
+
+    #[tokio::test]
+    async fn consumer_name_update_is_scoped_and_validated() {
+        let signing = SigningKey::from_bytes(&[37_u8; 32]);
+        let x = URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes());
+        let jwks = Router::new().route("/jwks", get(move || {
+            let x = x.clone();
+            async move {
+                Json(json!({
+                    "keys":[{"kid":"setup","kty":"OKP","crv":"Ed25519","alg":"EdDSA","use":"sig","x":x}]
+                }))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, jwks).await.unwrap() });
+        let issuer = format!("http://{address}");
+        let state = crate::test_state("http://token.invalid").await;
+        state.auth.configure(issuer.clone(), None).await;
+        let now = chrono::Utc::now().timestamp();
+        for user_id in ["consumer-owner", "other-owner"] {
+            sqlx::query("INSERT INTO users(id,role,created_at) VALUES(?,'user',?)")
+                .bind(user_id)
+                .bind(now)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO consumers(id,user_id,name,prefix,secret_hash,created_at) VALUES('owned-consumer','consumer-owner','Original','sk-owned','hash-owned',?)")
+            .bind(now)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO consumers(id,user_id,name,prefix,secret_hash,created_at) VALUES('foreign-consumer','other-owner','Foreign','sk-foreign','hash-foreign',?)")
+            .bind(now)
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        let token = setup_token(&signing, &issuer, "consumer-owner");
+        let updated = provider_request(
+            &state,
+            Method::PATCH,
+            "/api/consumers/owned-consumer",
+            &token,
+            Some(json!({"name":"Renamed app"})),
+        )
+        .await;
+        assert_eq!(updated.status(), StatusCode::OK);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT name FROM consumers WHERE id='owned-consumer'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap(),
+            "Renamed app"
+        );
+
+        let invalid = provider_request(
+            &state,
+            Method::PATCH,
+            "/api/consumers/owned-consumer",
+            &token,
+            Some(json!({"name":"   "})),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+        let foreign = provider_request(
+            &state,
+            Method::PATCH,
+            "/api/consumers/foreign-consumer",
+            &token,
+            Some(json!({"name":"Should not change"})),
+        )
+        .await;
+        assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT name FROM consumers WHERE id='foreign-consumer'"
+            )
+            .fetch_one(&state.db)
+            .await
+            .unwrap(),
+            "Foreign"
+        );
     }
 
     #[tokio::test]

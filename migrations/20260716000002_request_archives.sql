@@ -11,4 +11,4 @@ CREATE TABLE request_archives (
 CREATE INDEX request_archives_created_at_idx ON request_archives(created_at);
 
 INSERT INTO app_meta(key,value,updated_at)
-VALUES('request_archive_retention_days','1',unixepoch());
+VALUES('request_archive_retention_days','7',unixepoch());

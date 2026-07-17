@@ -25,6 +25,7 @@ pub struct ApiIdentity {
     pub consumer_id: String,
     pub user_id: String,
     pub request_archive: bool,
+    pub all_providers: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -239,16 +240,11 @@ pub async fn api_identity(state: &AppState, headers: &HeaderMap) -> Result<ApiId
             .await?
             .ok_or_else(|| AppError::unauthorized("invalid consumer credential"))?;
     let role: String = row.get(2);
-    let provider_access = row.get::<i64, _>(3) != 0;
-    if role == "user" && !provider_access {
-        return Err(AppError::forbidden(
-            "provider access is not enabled for this user",
-        ));
-    }
     let identity = ApiIdentity {
         consumer_id: row.get(0),
         user_id: row.get(1),
         request_archive: row.get::<i64, _>(4) != 0,
+        all_providers: role != "user" || row.get::<i64, _>(3) != 0,
     };
     Ok(identity)
 }
@@ -322,7 +318,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tenant_consumers_require_an_explicit_provider_grant_but_administrators_bypass_it() {
+    async fn consumer_identity_carries_global_provider_access() {
         let state = crate::test_state("http://token.invalid").await;
         let now = chrono::Utc::now().timestamp();
         for (id, role, secret) in [
@@ -352,18 +348,33 @@ mod tests {
             axum::http::header::AUTHORIZATION,
             HeaderValue::from_static("Bearer sk-tenant-secret"),
         );
-        assert!(api_identity(&state, &tenant_headers).await.is_err());
+        assert!(
+            !api_identity(&state, &tenant_headers)
+                .await
+                .unwrap()
+                .all_providers
+        );
         sqlx::query("UPDATE users SET provider_access=1 WHERE id='tenant'")
             .execute(&state.db)
             .await
             .unwrap();
-        assert!(api_identity(&state, &tenant_headers).await.is_ok());
+        assert!(
+            api_identity(&state, &tenant_headers)
+                .await
+                .unwrap()
+                .all_providers
+        );
         let mut admin_headers = HeaderMap::new();
         admin_headers.insert(
             axum::http::header::AUTHORIZATION,
             HeaderValue::from_static("Bearer sk-admin-secret"),
         );
-        assert!(api_identity(&state, &admin_headers).await.is_ok());
+        assert!(
+            api_identity(&state, &admin_headers)
+                .await
+                .unwrap()
+                .all_providers
+        );
     }
 
     fn claims(sub: &str) -> Claims {

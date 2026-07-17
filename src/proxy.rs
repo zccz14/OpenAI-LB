@@ -468,7 +468,7 @@ async fn dispatch(
         affinity_key.as_ref().map(|key| key.source),
     );
     let mut payload = transform_request(path, parsed, &state)?;
-    let first = select_ready_provider(&state, affinity.as_deref()).await?;
+    let first = select_ready_provider(&state, &identity, affinity.as_deref()).await?;
     audit.set_provider(&first.provider.id);
     let first_id = first.provider.id.clone();
     let response = send_upstream(
@@ -485,7 +485,13 @@ async fn dispatch(
     let (lease, upstream) = if should_retry {
         let second = state
             .balancer
-            .select(&state, affinity.as_deref(), Some(&first_id))
+            .select(
+                &state,
+                &identity.user_id,
+                identity.all_providers,
+                affinity.as_deref(),
+                Some(&first_id),
+            )
             .await;
         match second {
             Ok(mut second) => {
@@ -557,7 +563,7 @@ async fn dispatch_audio(
         affinity.as_deref(),
         affinity_key.as_ref().map(|key| key.source),
     );
-    let lease = select_ready_provider(&state, affinity.as_deref()).await?;
+    let lease = select_ready_provider(&state, &identity, affinity.as_deref()).await?;
     audit.set_provider(&lease.provider.id);
     let preview = Arc::new(Mutex::new(StreamingPreview::default()));
     let capture = preview.clone();
@@ -607,9 +613,19 @@ async fn dispatch_audio(
 
 async fn select_ready_provider(
     state: &AppState,
+    identity: &ApiIdentity,
     affinity: Option<&str>,
 ) -> Result<Lease, AppError> {
-    let mut first = state.balancer.select(state, affinity, None).await?;
+    let mut first = state
+        .balancer
+        .select(
+            state,
+            &identity.user_id,
+            identity.all_providers,
+            affinity,
+            None,
+        )
+        .await?;
     if refresh_if_needed(state, &mut first).await.is_ok() {
         return Ok(first);
     }
@@ -617,7 +633,13 @@ async fn select_ready_provider(
     drop(first);
     let mut second = state
         .balancer
-        .select(state, affinity, Some(&failed_id))
+        .select(
+            state,
+            &identity.user_id,
+            identity.all_providers,
+            affinity,
+            Some(&failed_id),
+        )
         .await?;
     refresh_if_needed(state, &mut second).await?;
     Ok(second)
@@ -1584,6 +1606,7 @@ mod tests {
             consumer_id: "key-1".to_owned(),
             user_id: "user-1".to_owned(),
             request_archive: false,
+            all_providers: false,
         };
         let mut audit = AuditTracker::begin(
             &state,
@@ -1639,6 +1662,7 @@ mod tests {
             consumer_id: "key-1".to_owned(),
             user_id: "user-1".to_owned(),
             request_archive: true,
+            all_providers: false,
         };
         let mut audit = AuditTracker::begin(
             &state,
@@ -1710,6 +1734,7 @@ mod tests {
             consumer_id: "key-1".to_owned(),
             user_id: "user-1".to_owned(),
             request_archive: true,
+            all_providers: false,
         };
         let mut audit = AuditTracker::begin(
             &state,
@@ -2161,8 +2186,16 @@ mod tests {
             .bind("refresh-old")
             .bind(now - 1).bind(now).bind(now).execute(&state.db).await.unwrap();
         state.balancer.reload_providers(&state.db).await.unwrap();
-        let first = state.balancer.select(&state, None, None).await.unwrap();
-        let second = state.balancer.select(&state, None, None).await.unwrap();
+        let first = state
+            .balancer
+            .select(&state, "test-user", true, None, None)
+            .await
+            .unwrap();
+        let second = state
+            .balancer
+            .select(&state, "test-user", true, None, None)
+            .await
+            .unwrap();
         let state_one = state.clone();
         let state_two = state.clone();
         let one = tokio::spawn(async move {
@@ -2186,6 +2219,7 @@ mod tests {
             consumer_id: "key-1".to_owned(),
             user_id: "user-1".to_owned(),
             request_archive: true,
+            all_providers: false,
         };
         let mut audit = AuditTracker::begin(
             &state,

@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     AppError, AppState,
-    auth::{bearer, browser_identity, is_admin, require_admin, require_root},
+    auth::{UserIdentity, bearer, browser_identity, is_admin, require_admin, require_root},
     balancer::Provider,
     crypto::consumer_secret_hash,
     oauth,
@@ -77,6 +77,10 @@ pub async fn setup(
         .bind(&identity.email)
         .bind(&identity.name)
         .bind(now)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("UPDATE providers SET owner_id=? WHERE owner_id IS NULL")
+        .bind(&identity.id)
         .execute(&mut *transaction)
         .await?;
     for (key, value) in [
@@ -278,11 +282,18 @@ pub async fn list_providers(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
-    require_admin(&user)?;
-    let providers =
+    let providers = if is_admin(&user) {
         sqlx::query_as::<_, Provider>("SELECT * FROM providers ORDER BY created_at DESC")
             .fetch_all(&state.db)
-            .await?;
+            .await?
+    } else {
+        sqlx::query_as::<_, Provider>(
+            "SELECT * FROM providers WHERE owner_id=? ORDER BY created_at DESC",
+        )
+        .bind(&user.id)
+        .fetch_all(&state.db)
+        .await?
+    };
     Ok(Json(Value::Array(
         providers
             .into_iter()
@@ -303,9 +314,9 @@ pub async fn create_provider(
     Json(input): Json<CreateProvider>,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
-    require_admin(&user)?;
     let result = insert_provider(
         &state,
+        &user.id,
         &input.name,
         &input.access_key,
         &input.refresh_key,
@@ -334,6 +345,7 @@ pub async fn create_provider(
 
 async fn insert_provider(
     state: &AppState,
+    owner_id: &str,
     name: &str,
     access: &str,
     refresh: &str,
@@ -348,13 +360,39 @@ async fn insert_provider(
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp();
     let expires_at = expires_at.or_else(|| oauth::expires_at_from_jwt(access));
-    sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,expires_at,status,created_at,updated_at) VALUES(?,?,?,?,?,?,'active',?,?)")
+    sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,expires_at,status,created_at,updated_at,owner_id) VALUES(?,?,?,?,?,?,'active',?,?,?)")
         .bind(&id).bind(name.trim()).bind(&account_id).bind(access.trim())
-        .bind(refresh.trim()).bind(expires_at).bind(now).bind(now).execute(&state.db).await?;
+        .bind(refresh.trim()).bind(expires_at).bind(now).bind(now).bind(owner_id)
+        .execute(&state.db).await?;
     state.balancer.reload_providers(&state.db).await?;
     Ok(Json(
-        json!({"id":id,"name":name.trim(),"account_id":account_id,"status":"active"}),
+        json!({"id":id,"name":name.trim(),"account_id":account_id,"owner_id":owner_id,"status":"active"}),
     ))
+}
+
+async fn require_provider_manager(
+    state: &AppState,
+    user: &UserIdentity,
+    provider_id: &str,
+) -> Result<(), AppError> {
+    if is_admin(user) {
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM providers WHERE id=?)")
+            .bind(provider_id)
+            .fetch_one(&state.db)
+            .await?;
+        return exists
+            .then_some(())
+            .ok_or_else(|| AppError::not_found("provider not found"));
+    }
+    let owned: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM providers WHERE id=? AND owner_id=?)")
+            .bind(provider_id)
+            .bind(&user.id)
+            .fetch_one(&state.db)
+            .await?;
+    owned
+        .then_some(())
+        .ok_or_else(|| AppError::not_found("provider not found"))
 }
 
 #[derive(Deserialize)]
@@ -372,7 +410,7 @@ pub async fn update_provider(
     Json(input): Json<ProviderUpdate>,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
-    require_admin(&user)?;
+    require_provider_manager(&state, &user, &id).await?;
     let operation: Result<Json<Value>, AppError> = async {
         if let Some(name) = input.name.filter(|name| !name.trim().is_empty()) {
             sqlx::query("UPDATE providers SET name=?,updated_at=? WHERE id=?")
@@ -439,7 +477,7 @@ pub async fn read_provider_tokens(
     Path(id): Path<String>,
 ) -> Result<(HeaderMap, Json<Value>), AppError> {
     let user = browser_identity(&state, &headers).await?;
-    require_admin(&user)?;
+    require_provider_manager(&state, &user, &id).await?;
     let result: Result<(HeaderMap, Json<Value>), AppError> = async {
         let row: (String, String) =
             sqlx::query_as("SELECT access_token,refresh_token FROM providers WHERE id=?")
@@ -479,7 +517,7 @@ pub async fn replace_provider_tokens(
     Json(input): Json<ReplaceProviderTokens>,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
-    require_admin(&user)?;
+    require_provider_manager(&state, &user, &id).await?;
     let result = replace_provider_token_values(
         &state,
         &id,
@@ -526,10 +564,18 @@ pub async fn list_provider_usage(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
-    require_admin(&user)?;
-    let ids = sqlx::query_scalar::<_, String>("SELECT id FROM providers ORDER BY created_at DESC")
+    let ids = if is_admin(&user) {
+        sqlx::query_scalar::<_, String>("SELECT id FROM providers ORDER BY created_at DESC")
+            .fetch_all(&state.db)
+            .await?
+    } else {
+        sqlx::query_scalar::<_, String>(
+            "SELECT id FROM providers WHERE owner_id=? ORDER BY created_at DESC",
+        )
+        .bind(&user.id)
         .fetch_all(&state.db)
-        .await?;
+        .await?
+    };
     let mut providers = serde_json::Map::new();
     for id in ids {
         let value = match provider_usage_value(&state, &id).await {
@@ -548,7 +594,7 @@ pub async fn test_provider(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
-    require_admin(&user)?;
+    require_provider_manager(&state, &user, &id).await?;
     let result = provider_usage(&state, &id).await;
     let action = if result.is_ok() {
         "provider.test"
@@ -603,7 +649,7 @@ pub async fn delete_provider(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
-    require_admin(&user)?;
+    require_provider_manager(&state, &user, &id).await?;
     let result: Result<Json<Value>, AppError> = async {
         let deleted = sqlx::query("DELETE FROM providers WHERE id=?")
             .bind(&id)
@@ -626,13 +672,124 @@ pub async fn delete_provider(
     result
 }
 
+pub async fn list_provider_grants(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let user = browser_identity(&state, &headers).await?;
+    require_provider_manager(&state, &user, &id).await?;
+    let rows = sqlx::query(
+        "SELECT user_id,created_at FROM provider_grants WHERE provider_id=? ORDER BY created_at,user_id",
+    )
+    .bind(id)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(Value::Array(
+        rows.into_iter()
+            .map(|row| {
+                json!({
+                    "user_id": row.get::<String, _>(0),
+                    "created_at": row.get::<i64, _>(1)
+                })
+            })
+            .collect(),
+    )))
+}
+
+#[derive(Deserialize)]
+pub struct CreateProviderGrant {
+    user_id: String,
+}
+
+pub async fn create_provider_grant(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<CreateProviderGrant>,
+) -> Result<Json<Value>, AppError> {
+    let user = browser_identity(&state, &headers).await?;
+    require_provider_manager(&state, &user, &id).await?;
+    let target_user_id = input.user_id.trim();
+    if target_user_id.is_empty() || target_user_id.len() > 200 {
+        return Err(AppError::bad_request("user_id must be 1-200 characters"));
+    }
+    let owner_id: Option<String> = sqlx::query_scalar("SELECT owner_id FROM providers WHERE id=?")
+        .bind(&id)
+        .fetch_one(&state.db)
+        .await?;
+    if owner_id.as_deref() == Some(target_user_id) {
+        return Err(AppError::bad_request(
+            "provider owner already has implicit access",
+        ));
+    }
+    let result = sqlx::query(
+        "INSERT INTO provider_grants(provider_id,user_id,created_at) SELECT ?,id,? FROM users WHERE id=? ON CONFLICT(provider_id,user_id) DO NOTHING",
+    )
+    .bind(&id)
+    .bind(chrono::Utc::now().timestamp())
+    .bind(target_user_id)
+    .execute(&state.db)
+    .await?;
+    if result.rows_affected() == 0 {
+        let user_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id=?)")
+            .bind(target_user_id)
+            .fetch_one(&state.db)
+            .await?;
+        if !user_exists {
+            return Err(AppError::not_found("user_id not found"));
+        }
+        return Err(AppError::bad_request("provider grant already exists"));
+    }
+    state.balancer.reload_providers(&state.db).await?;
+    let audit_target = format!("{id}:{target_user_id}");
+    write_admin_audit(
+        &state,
+        &user.id,
+        "provider.grant.create",
+        Some(&audit_target),
+        &peer.ip().to_string(),
+    )
+    .await?;
+    Ok(Json(json!({"ok":true,"user_id":target_user_id})))
+}
+
+pub async fn delete_provider_grant(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path((id, user_id)): Path<(String, String)>,
+) -> Result<Json<Value>, AppError> {
+    let user = browser_identity(&state, &headers).await?;
+    require_provider_manager(&state, &user, &id).await?;
+    let deleted = sqlx::query("DELETE FROM provider_grants WHERE provider_id=? AND user_id=?")
+        .bind(&id)
+        .bind(&user_id)
+        .execute(&state.db)
+        .await?;
+    if deleted.rows_affected() == 0 {
+        return Err(AppError::not_found("provider grant not found"));
+    }
+    state.balancer.reload_providers(&state.db).await?;
+    let audit_target = format!("{id}:{user_id}");
+    write_admin_audit(
+        &state,
+        &user.id,
+        "provider.grant.delete",
+        Some(&audit_target),
+        &peer.ip().to_string(),
+    )
+    .await?;
+    Ok(Json(json!({"ok":true})))
+}
+
 pub async fn oauth_start(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
-    require_admin(&user)?;
     let result: Result<Json<Value>, AppError> = async {
         Ok(Json(serde_json::to_value(
             oauth::start(&state, &user.id).await?,
@@ -662,11 +819,11 @@ pub async fn oauth_complete(
     Json(input): Json<OAuthComplete>,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
-    require_admin(&user)?;
     let result: Result<Json<Value>, AppError> = async {
         let token = oauth::exchange(&state, &input.state, &input.code, &user.id).await?;
         insert_provider(
             &state,
+            &user.id,
             &input.name,
             &token.access_token,
             &token.refresh_token,
@@ -944,14 +1101,22 @@ pub async fn dashboard(
     .bind(chrono::Utc::now().timestamp() - 86400)
     .fetch_one(&state.db)
     .await?;
-    let providers: i64 = if is_admin(&user) {
+    let provider_access: i64 = sqlx::query_scalar("SELECT provider_access FROM users WHERE id=?")
+        .bind(&user.id)
+        .fetch_one(&state.db)
+        .await?;
+    let providers: i64 = if is_admin(&user) || provider_access != 0 {
         sqlx::query_scalar(
             "SELECT COUNT(*) FROM providers WHERE manual_disabled=0 AND status='active'",
         )
         .fetch_one(&state.db)
         .await?
     } else {
-        0
+        sqlx::query_scalar("SELECT COUNT(*) FROM providers p WHERE p.manual_disabled=0 AND p.status='active' AND (p.owner_id=? OR EXISTS(SELECT 1 FROM provider_grants g WHERE g.provider_id=p.id AND g.user_id=?))")
+            .bind(&user.id)
+            .bind(&user.id)
+            .fetch_one(&state.db)
+            .await?
     };
     Ok(Json(
         json!({"active_consumers":keys,"calls_24h":calls,"errors_24h":errors,"available_providers":providers}),
@@ -1301,6 +1466,13 @@ mod tests {
             format!("Bearer {token}").parse().unwrap(),
         );
         let state = crate::test_state("http://token.invalid").await;
+        let now = chrono::Utc::now().timestamp();
+        sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES('legacy-provider','legacy','legacy','access','refresh',?,?)")
+            .bind(now)
+            .bind(now)
+            .execute(&state.db)
+            .await
+            .unwrap();
         let response = setup(
             State(state.clone()),
             headers.clone(),
@@ -1317,6 +1489,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(role, "root");
+        let owner_id: String =
+            sqlx::query_scalar("SELECT owner_id FROM providers WHERE id='legacy-provider'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(owner_id, "root-user");
         assert!(state.config.load().setup_complete);
         let second = setup(
             State(state),
@@ -1524,8 +1702,13 @@ mod tests {
     #[tokio::test]
     async fn provider_tokens_are_stored_and_replaced_as_plaintext() {
         let state = crate::test_state("http://token.invalid").await;
+        sqlx::query("INSERT INTO users(id,role,created_at) VALUES('owner','user',?)")
+            .bind(chrono::Utc::now().timestamp())
+            .execute(&state.db)
+            .await
+            .unwrap();
         let access = provider_access_token("account-old");
-        let _ = insert_provider(&state, "provider", &access, "refresh-old", None)
+        let _ = insert_provider(&state, "owner", "provider", &access, "refresh-old", None)
             .await
             .unwrap();
         let id: String = sqlx::query_scalar("SELECT id FROM providers")
@@ -1643,6 +1826,7 @@ mod tests {
             ("root-user", "root"),
             ("admin-user", "admin"),
             ("tenant-user", "user"),
+            ("grantee-user", "user"),
         ] {
             sqlx::query("INSERT INTO users(id,role,created_at) VALUES(?,?,?)")
                 .bind(id)
@@ -1856,9 +2040,72 @@ mod tests {
             assert_eq!(historical_provider, None);
         }
 
-        sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES('tenant-provider','tenant','tenant','access','refresh',?,?)")
+        sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,created_at,updated_at,owner_id) VALUES('tenant-provider','tenant','tenant','access','refresh',?,?, 'tenant-user')")
             .bind(now).bind(now).execute(&state.db).await.unwrap();
         let tenant_token = setup_token(&signing, &issuer, "tenant-user");
+        let created = provider_request(
+            &state,
+            Method::POST,
+            "/api/providers",
+            &tenant_token,
+            Some(json!({
+                "name":"tenant-created",
+                "access_key":provider_access_token("tenant-created"),
+                "refresh_key":"refresh"
+            })),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+        let created: Value =
+            serde_json::from_slice(&created.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let created_id = created["id"].as_str().unwrap();
+        let created_owner: String = sqlx::query_scalar("SELECT owner_id FROM providers WHERE id=?")
+            .bind(created_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(created_owner, "tenant-user");
+        let delete_created = provider_request(
+            &state,
+            Method::DELETE,
+            &format!("/api/providers/{created_id}"),
+            &tenant_token,
+            None,
+        )
+        .await;
+        assert_eq!(delete_created.status(), StatusCode::OK);
+        let create_grant = provider_request(
+            &state,
+            Method::POST,
+            "/api/providers/tenant-provider/grants",
+            &tenant_token,
+            Some(json!({"user_id":"grantee-user"})),
+        )
+        .await;
+        assert_eq!(create_grant.status(), StatusCode::OK);
+        let grants = provider_request(
+            &state,
+            Method::GET,
+            "/api/providers/tenant-provider/grants",
+            &tenant_token,
+            None,
+        )
+        .await;
+        assert_eq!(grants.status(), StatusCode::OK);
+        let grants: Value =
+            serde_json::from_slice(&grants.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(grants[0]["user_id"], "grantee-user");
+        let delete_grant = provider_request(
+            &state,
+            Method::DELETE,
+            "/api/providers/tenant-provider/grants/grantee-user",
+            &tenant_token,
+            None,
+        )
+        .await;
+        assert_eq!(delete_grant.status(), StatusCode::OK);
         sqlx::query("INSERT INTO consumers(id,user_id,name,prefix,secret_hash,created_at) VALUES('tenant-audit-key','tenant-user','tenant audit','sk-tenant-audit','tenant-audit-hash',?)")
             .bind(now).execute(&state.db).await.unwrap();
         sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,method,path,status,latency_ms,created_at) VALUES('tenant-audit-call','tenant-audit-request','tenant-audit-key','tenant-user','POST','/v1/responses',200,1,?)")
@@ -1895,8 +2142,33 @@ mod tests {
             (Method::DELETE, "/api/providers/tenant-provider", None),
         ] {
             let response = provider_request(&state, method, path, &tenant_token, body).await;
-            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(response.status(), StatusCode::OK);
         }
+
+        sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,created_at,updated_at,owner_id) VALUES('foreign-provider','foreign','foreign','access','refresh',?,?, 'root-user')")
+            .bind(now).bind(now).execute(&state.db).await.unwrap();
+        let foreign_provider = provider_request(
+            &state,
+            Method::GET,
+            "/api/providers/foreign-provider",
+            &tenant_token,
+            None,
+        )
+        .await;
+        assert_eq!(foreign_provider.status(), StatusCode::NOT_FOUND);
+        let tenant_providers =
+            provider_request(&state, Method::GET, "/api/providers", &tenant_token, None).await;
+        assert_eq!(tenant_providers.status(), StatusCode::OK);
+        let tenant_providers: Value = serde_json::from_slice(
+            &tenant_providers
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(tenant_providers, json!([]));
 
         sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES('denied-provider','denied','denied','denied','refresh',?,?)")
             .bind(now).bind(now).execute(&state.db).await.unwrap();
@@ -1912,11 +2184,14 @@ mod tests {
         assert_eq!(denied.status(), StatusCode::BAD_GATEWAY);
 
         for (action, expected) in [
-            ("provider.tokens.read", 2_i64),
-            ("provider.tokens.update", 2),
-            ("provider.test", 2),
-            ("provider.delete", 2),
+            ("provider.tokens.read", 3_i64),
+            ("provider.tokens.update", 3),
+            ("provider.test", 3),
+            ("provider.delete", 4),
+            ("provider.create", 1),
             ("provider.test.failed", 1),
+            ("provider.grant.create", 1),
+            ("provider.grant.delete", 1),
         ] {
             let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_audit WHERE action=?")
                 .bind(action)

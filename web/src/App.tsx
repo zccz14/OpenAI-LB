@@ -320,7 +320,7 @@ const copy = {
     pageDashboard: "查看上游提供商容量与当前租户的 24 小时运行摘要。",
     pageProviders: "注册、刷新、停用并观察 CodeX OAuth 上游提供商。",
     pageConsumers: "按 AI App 隔离下游消费者，分别跟踪调用量并独立吊销凭据。",
-    pageUsage: "按 Consumer 核算请求、Token、错误和延迟。",
+    pageUsage: "按消费者核算请求、Token、错误和延迟。",
     pageAudit: "逐次追踪请求、上游提供商、结果与用量；诊断内容按配置期限保留。",
     pageRequestDetail: "查看调用上下文、消息结构与同一亲和链的相邻请求。",
     pageUsers: "由 root 管理本地授权角色；用户身份仍由 Auth Mini 提供。",
@@ -328,7 +328,7 @@ const copy = {
     operationalStatus: "运行状态",
     operationalDescription: "当前租户与上游提供商池的可行动摘要",
     availableProviders: "可用上游提供商",
-    activeConsumers: "有效 Consumer",
+    activeConsumers: "有效消费者",
     calls24h: "24 小时调用",
     errors24h: "24 小时错误",
     providerPool: "OAuth 上游提供商池",
@@ -383,12 +383,12 @@ const copy = {
     credits: "Credits",
     rawUsage: "Usage 原始字段",
     usageUnavailable: "Usage API 未返回可识别的额度字段，请查看原始字段。",
-    consumersTitle: "租户 Consumer",
+    consumersTitle: "租户消费者",
     consumersDescription:
-      "每个 AI App 建议使用一个独立 Consumer；这样用量、错误和吊销都能按 App 隔离。Consumer 凭据只在创建后显示一次。",
+      "每个 AI App 建议使用一个独立消费者；这样用量、错误和吊销都能按 App 隔离。消费者凭据只在创建后显示一次。",
     create: "创建",
-    noConsumers: "尚无 Consumer",
-    noConsumersDescription: "为每个 AI App 创建一个独立 Consumer，再开始调用代理。",
+    noConsumers: "尚无消费者",
+    noConsumersDescription: "为每个 AI App 创建一个独立消费者，再开始调用代理。",
     prefix: "前缀",
     createdAt: "创建时间",
     lastUsed: "最近使用",
@@ -397,19 +397,19 @@ const copy = {
     revoke: "吊销",
     editConsumer: "编辑",
     saveConsumer: "保存",
-    consumerUpdated: "Consumer 已更新",
-    revokeTitle: "吊销 Consumer？",
-    revokeDescription: "此操作不可撤销；使用该 Consumer 的所有调用将立即失败。",
+    consumerUpdated: "消费者已更新",
+    revokeTitle: "吊销消费者？",
+    revokeDescription: "此操作不可撤销；使用该消费者的所有调用将立即失败。",
     cancel: "取消",
     confirmRevoke: "确认吊销",
     consumerAppHelp:
-      "请为每个 AI App 单独创建一个 Consumer，并用 App 名称命名，便于隔离用量、排障和吊销。",
-    saveConsumerTitle: "立即保存 Consumer",
+      "请为每个 AI App 单独创建一个消费者，并用 App 名称命名，便于隔离用量、排障和吊销。",
+    saveConsumerTitle: "立即保存消费者",
     saveConsumerDescription:
       "关闭后无法再次查看。不要将它写入浏览器代码、日志或聊天记录。",
     savedConsumer: "我已安全保存",
     copied: "已复制",
-    consumerRevoked: "Consumer 已吊销",
+    consumerRevoked: "消费者已吊销",
     usageTitle: "用量透视",
     usageDescription:
       "按用户、脱敏 API Token、模型和日期交叉汇总请求 Token；调整行、列和聚合数据以定位用量。",
@@ -421,10 +421,10 @@ const copy = {
     last24Hours: "最近 24 小时",
     last7Days: "最近 7 天",
     allUsers: "全部用户",
-    allConsumers: "全部 Consumer",
+    allConsumers: "全部消费者",
     allModels: "全部模型",
     model: "模型",
-    consumerLabel: "Consumer",
+    consumerLabel: "消费者",
     date: "日期",
     rows: "行",
     columns: "列",
@@ -482,7 +482,7 @@ const copy = {
     inflight: "处理中",
     accessKey: "Access key",
     refreshKey: "Refresh key",
-    consumer: "Consumer",
+    consumer: "消费者",
     input: "输入",
     output: "输出",
     userId: "用户 ID",
@@ -2256,7 +2256,9 @@ function Consumers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{t.create} Consumer</DialogTitle>
+            <DialogTitle>
+              {t.create} {t.consumer}
+            </DialogTitle>
             <DialogDescription>{t.consumerAppHelp}</DialogDescription>
           </DialogHeader>
           <form onSubmit={create}>
@@ -2285,7 +2287,9 @@ function Consumers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{t.editConsumer} Consumer</DialogTitle>
+            <DialogTitle>
+              {t.editConsumer} {t.consumer}
+            </DialogTitle>
           </DialogHeader>
           <form onSubmit={update}>
             <FieldGroup>

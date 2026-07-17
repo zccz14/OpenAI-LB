@@ -103,6 +103,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/oauth/complete", post(api::oauth_complete))
         .route("/api/usage", get(api::usage))
         .route("/api/audit", get(api::audit))
+        .route("/api/audit/{id}", get(api::audit_detail))
         .route("/api/admin-audit", get(api::list_admin_audit))
         .route("/api/dashboard", get(api::dashboard))
         .route(

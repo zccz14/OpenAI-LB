@@ -1404,6 +1404,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn usage_rows_split_dates_at_utc_midnight() {
+        let state = crate::test_state("http://token.invalid").await;
+        let midnight_utc = 1_704_067_200_i64;
+        sqlx::query("INSERT INTO users(id,role,created_at) VALUES('tenant','user',?)")
+            .bind(midnight_utc)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO api_keys(id,user_id,name,prefix,secret_hash,created_at) VALUES('key','tenant','key','sk-utc','hash-utc',?)")
+            .bind(midnight_utc)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        for (id, created_at) in [("before", midnight_utc - 1), ("after", midnight_utc)] {
+            sqlx::query("INSERT INTO api_calls(id,request_id,api_key_id,user_id,method,path,status,latency_ms,created_at) VALUES(?,?, 'key','tenant','POST','/v1/responses',200,1,?)")
+                .bind(id)
+                .bind(id)
+                .bind(created_at)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+        let user = crate::auth::UserIdentity {
+            id: "tenant".to_owned(),
+            email: None,
+            name: None,
+            role: "user".to_owned(),
+        };
+        let rows = usage_rows(&state, &user, midnight_utc - 60).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["date"], "2023-12-31");
+        assert_eq!(rows[1]["date"], "2024-01-01");
+    }
+
+    #[tokio::test]
     async fn sensitive_admin_action_is_audited() {
         let state = crate::test_state("http://token.invalid").await;
         sqlx::query("INSERT INTO users(id,role,created_at) VALUES('admin','admin',?)")

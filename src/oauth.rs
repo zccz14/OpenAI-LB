@@ -5,10 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::{
-    AppError, AppState,
-    crypto::{decrypt, encrypt},
-};
+use crate::{AppError, AppState, OAuthFlow};
 
 #[derive(Debug, Serialize)]
 pub struct OAuthStart {
@@ -56,16 +53,17 @@ pub async fn start(state: &AppState, user_id: &str) -> Result<OAuthStart, AppErr
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let raw_state = URL_SAFE_NO_PAD.encode(random_bytes::<24>());
     let state_hash = hex::encode(Sha256::digest(raw_state.as_bytes()));
-    let expires_at = chrono::Utc::now().timestamp() + 600;
-    sqlx::query(
-        "INSERT INTO oauth_flows(state_hash,verifier_enc,created_by,expires_at) VALUES(?,?,?,?)",
-    )
-    .bind(state_hash)
-    .bind(encrypt(&config.encryption_key, &verifier)?)
-    .bind(user_id)
-    .bind(expires_at)
-    .execute(&state.db)
-    .await?;
+    let now = chrono::Utc::now().timestamp();
+    let expires_at = now + 600;
+    state.oauth_flows.retain(|_, flow| flow.expires_at > now);
+    state.oauth_flows.insert(
+        state_hash,
+        OAuthFlow {
+            verifier,
+            created_by: user_id.to_owned(),
+            expires_at,
+        },
+    );
     let mut url = Url::parse(&config.oauth_authorize_url)?;
     url.query_pairs_mut()
         .append_pair("response_type", "code")
@@ -92,20 +90,20 @@ pub async fn exchange(
 ) -> Result<TokenResponse, AppError> {
     let config = state.config.load();
     let state_hash = hex::encode(Sha256::digest(raw_state.as_bytes()));
-    let row: Option<(String,)> = sqlx::query_as("DELETE FROM oauth_flows WHERE state_hash=? AND created_by=? AND expires_at>? RETURNING verifier_enc")
-        .bind(state_hash).bind(user_id).bind(chrono::Utc::now().timestamp()).fetch_optional(&state.db).await?;
-    let verifier = decrypt(
-        &config.encryption_key,
-        &row.ok_or_else(|| AppError::bad_request("invalid or expired OAuth state"))?
-            .0,
-    )?;
+    let now = chrono::Utc::now().timestamp();
+    let (_, flow) = state
+        .oauth_flows
+        .remove_if(&state_hash, |_, flow| {
+            flow.created_by == user_id && flow.expires_at > now
+        })
+        .ok_or_else(|| AppError::bad_request("invalid or expired OAuth state"))?;
     token_request(
         state,
         &[
             ("grant_type", "authorization_code"),
             ("client_id", &config.oauth_client_id),
             ("code", code),
-            ("code_verifier", &verifier),
+            ("code_verifier", &flow.verifier),
             ("redirect_uri", &config.oauth_redirect_uri),
         ],
     )
@@ -228,8 +226,17 @@ mod tests {
             .execute(&state.db)
             .await
             .unwrap();
+        let flow_table: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='oauth_flows'",
+        )
+        .fetch_optional(&state.db)
+        .await
+        .unwrap();
+        assert!(flow_table.is_none());
         let flow = start(&state, "admin").await.unwrap();
+        assert_eq!(state.oauth_flows.len(), 1);
         assert!(exchange(&state, &flow.state, "code", "admin").await.is_ok());
+        assert!(state.oauth_flows.is_empty());
         assert!(
             exchange(&state, &flow.state, "code", "admin")
                 .await

@@ -307,7 +307,7 @@ pub(crate) async fn test_state_with_upstream(
         image_body_limit: 1024 * 1024,
         audio_body_limit: 1024 * 1024,
         affinity_ttl_seconds: 3600,
-        request_archive_retention_days: 7,
+        request_archive_retention_days: 1,
     };
     AppState::new(config, pool).await.unwrap()
 }

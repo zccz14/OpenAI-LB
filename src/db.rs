@@ -185,6 +185,13 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(tokens, ("access".to_owned(), "refresh".to_owned()));
+        let archive_retention: String = sqlx::query_scalar(
+            "SELECT value FROM app_meta WHERE key='request_archive_retention_days'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(archive_retention, "1");
         sqlx::query("INSERT INTO users(id,role,created_at) VALUES('root','root',2)")
             .execute(&pool)
             .await

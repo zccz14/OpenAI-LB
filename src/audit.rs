@@ -23,6 +23,7 @@ pub struct AuditEvent {
     pub request_id: String,
     pub consumer_id: String,
     pub user_id: String,
+    pub request_archive: bool,
     pub provider_id: Option<String>,
     pub affinity_hash: Option<String>,
     pub affinity_source: Option<String>,
@@ -131,17 +132,19 @@ async fn insert(
         .bind(event.created_at)
         .execute(&mut **transaction)
         .await?;
-    sqlx::query("INSERT INTO request_archives(api_call_id,request_headers_json,request_body,request_body_truncated,response_headers_json,response_body,response_body_truncated,created_at) VALUES(?,?,?,?,?,?,?,?)")
-        .bind(&event.id)
-        .bind(&event.request_headers_json)
-        .bind(&event.request_body)
-        .bind(event.request_body_truncated)
-        .bind(&event.response_headers_json)
-        .bind(&event.response_body)
-        .bind(event.response_body_truncated)
-        .bind(event.created_at)
-        .execute(&mut **transaction)
-        .await?;
+    if event.request_archive {
+        sqlx::query("INSERT INTO request_archives(api_call_id,request_headers_json,request_body,request_body_truncated,response_headers_json,response_body,response_body_truncated,created_at) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(&event.id)
+            .bind(&event.request_headers_json)
+            .bind(&event.request_body)
+            .bind(event.request_body_truncated)
+            .bind(&event.response_headers_json)
+            .bind(&event.response_body)
+            .bind(event.response_body_truncated)
+            .bind(event.created_at)
+            .execute(&mut **transaction)
+            .await?;
+    }
     Ok(())
 }
 

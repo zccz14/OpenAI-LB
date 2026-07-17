@@ -85,6 +85,7 @@ impl AuditTracker {
                 request_id: request_id.to_owned(),
                 consumer_id: identity.consumer_id.clone(),
                 user_id: identity.user_id.clone(),
+                request_archive: identity.request_archive,
                 provider_id: None,
                 affinity_hash: None,
                 affinity_source: None,
@@ -125,6 +126,9 @@ impl AuditTracker {
 
     fn set_request(&mut self, headers: &HeaderMap, body: &[u8], truncated: bool) {
         if let Some(event) = &mut self.event {
+            if !event.request_archive {
+                return;
+            }
             event.request_headers_json = archive_headers(headers);
             let (body, limit_truncated) = body_preview(body);
             event.request_body = body;
@@ -134,12 +138,18 @@ impl AuditTracker {
 
     fn set_response_headers(&mut self, headers: &HeaderMap) {
         if let Some(event) = &mut self.event {
+            if !event.request_archive {
+                return;
+            }
             event.response_headers_json = Some(archive_headers(headers));
         }
     }
 
     fn set_response_body(&mut self, body: &[u8], truncated: bool) {
         if let Some(event) = &mut self.event {
+            if !event.request_archive {
+                return;
+            }
             let (body, limit_truncated) = body_preview(body);
             event.response_body = Some(body);
             event.response_body_truncated = truncated || limit_truncated;
@@ -1047,7 +1057,13 @@ impl StreamCompletion {
 
     fn capture_sse(&mut self, pending: &mut Vec<u8>, bytes: &[u8]) {
         update_sse_usage(pending, bytes, &mut self.usage);
-        self.response_preview.capture(bytes);
+        if self
+            .event
+            .as_ref()
+            .is_some_and(|event| event.request_archive)
+        {
+            self.response_preview.capture(bytes);
+        }
     }
 
     fn finish(&mut self, failed: bool) {
@@ -1368,7 +1384,7 @@ mod tests {
         .execute(&state.db)
         .await
         .unwrap();
-        sqlx::query("INSERT INTO consumers(id,user_id,name,prefix,secret_hash,created_at) VALUES('key-1','user-1','test','sk-test',?,?)")
+        sqlx::query("INSERT INTO consumers(id,user_id,name,prefix,secret_hash,request_archive,created_at) VALUES('key-1','user-1','test','sk-test',?,1,?)")
             .bind(crate::crypto::consumer_secret_hash("sk-test-secret")).bind(now).execute(&state.db).await.unwrap();
         if provider {
             sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,status,created_at,updated_at) VALUES('provider-1','one','account-1',?,?,'active',?,?)")
@@ -1503,6 +1519,7 @@ mod tests {
         let identity = ApiIdentity {
             consumer_id: "key-1".to_owned(),
             user_id: "user-1".to_owned(),
+            request_archive: false,
         };
         let mut audit = AuditTracker::begin(
             &state,
@@ -1542,6 +1559,11 @@ mod tests {
                 "previous_response_id".to_owned(),
             )
         );
+        let archives: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_archives")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(archives, 0);
     }
 
     #[tokio::test]
@@ -1551,6 +1573,7 @@ mod tests {
         let identity = ApiIdentity {
             consumer_id: "key-1".to_owned(),
             user_id: "user-1".to_owned(),
+            request_archive: true,
         };
         let mut audit = AuditTracker::begin(
             &state,
@@ -1620,6 +1643,7 @@ mod tests {
         let identity = ApiIdentity {
             consumer_id: "key-1".to_owned(),
             user_id: "user-1".to_owned(),
+            request_archive: true,
         };
         let mut audit = AuditTracker::begin(
             &state,
@@ -2094,6 +2118,7 @@ mod tests {
         let identity = ApiIdentity {
             consumer_id: "key-1".to_owned(),
             user_id: "user-1".to_owned(),
+            request_archive: true,
         };
         let mut audit = AuditTracker::begin(
             &state,

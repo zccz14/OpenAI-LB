@@ -143,6 +143,8 @@ pub async fn me(
 #[derive(Deserialize)]
 pub struct CreateConsumer {
     name: String,
+    #[serde(default)]
+    request_archive: bool,
 }
 
 pub async fn list_consumers(
@@ -150,11 +152,12 @@ pub async fn list_consumers(
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
-    let rows = sqlx::query("SELECT id,name,prefix,created_at,last_used_at,revoked_at FROM consumers WHERE user_id=? ORDER BY created_at DESC")
+    let rows = sqlx::query("SELECT id,name,prefix,created_at,last_used_at,revoked_at,request_archive FROM consumers WHERE user_id=? ORDER BY created_at DESC")
         .bind(&user.id).fetch_all(&state.db).await?;
     Ok(Json(Value::Array(rows.into_iter().map(|row| json!({
         "id": row.get::<String,_>(0), "name": row.get::<String,_>(1), "prefix": row.get::<String,_>(2),
-        "created_at": row.get::<i64,_>(3), "last_used_at": row.get::<Option<i64>,_>(4), "revoked_at": row.get::<Option<i64>,_>(5)
+        "created_at": row.get::<i64,_>(3), "last_used_at": row.get::<Option<i64>,_>(4), "revoked_at": row.get::<Option<i64>,_>(5),
+        "request_archive": row.get::<i64,_>(6) != 0
     })).collect())))
 }
 
@@ -174,18 +177,47 @@ pub async fn create_consumer(
     let prefix = secret.chars().take(11).collect::<String>();
     let id = Uuid::new_v4().to_string();
     sqlx::query(
-        "INSERT INTO consumers(id,user_id,name,prefix,secret_hash,created_at) VALUES(?,?,?,?,?,?)",
+        "INSERT INTO consumers(id,user_id,name,prefix,secret_hash,request_archive,created_at) VALUES(?,?,?,?,?,?,?)",
     )
     .bind(&id)
     .bind(&user.id)
     .bind(name)
     .bind(&prefix)
     .bind(consumer_secret_hash(&secret))
+    .bind(input.request_archive)
     .bind(chrono::Utc::now().timestamp())
     .execute(&state.db)
     .await?;
     Ok(Json(
-        json!({"id":id,"name":name,"prefix":prefix,"secret":secret}),
+        json!({"id":id,"name":name,"prefix":prefix,"secret":secret,"request_archive":input.request_archive}),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateConsumer {
+    request_archive: bool,
+}
+
+pub async fn update_consumer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<UpdateConsumer>,
+) -> Result<Json<Value>, AppError> {
+    let user = browser_identity(&state, &headers).await?;
+    let result = sqlx::query(
+        "UPDATE consumers SET request_archive=? WHERE id=? AND user_id=? AND revoked_at IS NULL",
+    )
+    .bind(input.request_archive)
+    .bind(id)
+    .bind(user.id)
+    .execute(&state.db)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::not_found("consumer not found"));
+    }
+    Ok(Json(
+        json!({"ok":true,"request_archive":input.request_archive}),
     ))
 }
 

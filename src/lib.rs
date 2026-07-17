@@ -15,7 +15,7 @@ use axum::{
     Router,
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{delete, get, patch, post},
+    routing::{get, patch, post},
 };
 use dashmap::DashMap;
 use rust_embed::RustEmbed;
@@ -88,7 +88,10 @@ pub fn router(state: AppState) -> Router {
             "/api/consumers",
             get(api::list_consumers).post(api::create_consumer),
         )
-        .route("/api/consumers/{id}", delete(api::revoke_consumer))
+        .route(
+            "/api/consumers/{id}",
+            patch(api::update_consumer).delete(api::revoke_consumer),
+        )
         .route(
             "/api/providers",
             get(api::list_providers).post(api::create_provider),

@@ -20,7 +20,7 @@ use crate::{
     AppError, AppState,
     audit::AuditEvent,
     auth::{ApiIdentity, api_identity},
-    balancer::{Lease, track_response},
+    balancer::{Lease, affinity_hash, track_response},
     oauth,
 };
 
@@ -86,6 +86,8 @@ impl AuditTracker {
                 api_key_id: identity.key_id.clone(),
                 user_id: identity.user_id.clone(),
                 channel_id: None,
+                affinity_hash: None,
+                affinity_source: None,
                 method: method.as_str().to_owned(),
                 path: path.to_owned(),
                 model: None,
@@ -111,6 +113,13 @@ impl AuditTracker {
     fn set_channel(&mut self, channel_id: &str) {
         if let Some(event) = &mut self.event {
             event.channel_id = Some(channel_id.to_owned());
+        }
+    }
+
+    fn set_affinity(&mut self, key: Option<&str>, source: Option<&str>) {
+        if let Some(event) = &mut self.event {
+            event.affinity_hash = key.map(affinity_hash);
+            event.affinity_source = source.map(str::to_owned);
         }
     }
 
@@ -419,8 +428,14 @@ async fn dispatch(
         .and_then(|value| value.get("stream"))
         .and_then(Value::as_bool)
         .unwrap_or_default();
-    let affinity =
-        affinity_key(headers, parsed.as_ref()).map(|key| format!("{}:{key}", identity.key_id));
+    let affinity_key = affinity_key(headers, parsed.as_ref());
+    let affinity = affinity_key
+        .as_ref()
+        .map(|key| format!("{}:{}", identity.key_id, key.value));
+    audit.set_affinity(
+        affinity.as_deref(),
+        affinity_key.as_ref().map(|key| key.source),
+    );
     let mut payload = transform_request(path, parsed, &state)?;
     let first = select_ready_channel(&state, affinity.as_deref()).await?;
     audit.set_channel(&first.channel.id);
@@ -503,7 +518,14 @@ async fn dispatch_audio(
     body: Body,
     audit: &mut AuditTracker,
 ) -> Result<Response, AppError> {
-    let affinity = affinity_key(headers, None).map(|key| format!("{}:{key}", identity.key_id));
+    let affinity_key = affinity_key(headers, None);
+    let affinity = affinity_key
+        .as_ref()
+        .map(|key| format!("{}:{}", identity.key_id, key.value));
+    audit.set_affinity(
+        affinity.as_deref(),
+        affinity_key.as_ref().map(|key| key.source),
+    );
     let lease = select_ready_channel(&state, affinity.as_deref()).await?;
     audit.set_channel(&lease.channel.id);
     let preview = Arc::new(Mutex::new(StreamingPreview::default()));
@@ -704,7 +726,12 @@ fn validate_enum(
     Ok(())
 }
 
-fn affinity_key(headers: &HeaderMap, body: Option<&Value>) -> Option<String> {
+struct AffinityKey {
+    source: &'static str,
+    value: String,
+}
+
+fn affinity_key(headers: &HeaderMap, body: Option<&Value>) -> Option<AffinityKey> {
     [
         "x-lb-affinity-key",
         "session_id",
@@ -720,7 +747,10 @@ fn affinity_key(headers: &HeaderMap, body: Option<&Value>) -> Option<String> {
             .and_then(|value| value.to_str().ok())
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(str::to_owned)
+            .map(|value| AffinityKey {
+                source: name,
+                value: value.to_owned(),
+            })
     })
     .or_else(|| {
         body.and_then(|value| {
@@ -732,7 +762,10 @@ fn affinity_key(headers: &HeaderMap, body: Option<&Value>) -> Option<String> {
                         .and_then(Value::as_str)
                         .map(str::trim)
                         .filter(|value| !value.is_empty())
-                        .map(str::to_owned)
+                        .map(|value| AffinityKey {
+                            source: name,
+                            value: value.to_owned(),
+                        })
                 })
         })
     })
@@ -1389,7 +1422,9 @@ mod tests {
         headers.insert("x-session-id", HeaderValue::from_static("session"));
         headers.insert("x-lb-affinity-key", HeaderValue::from_static("explicit"));
         assert_eq!(
-            affinity_key(&headers, Some(&json!({"previous_response_id":"body"}))).as_deref(),
+            affinity_key(&headers, Some(&json!({"previous_response_id":"body"})))
+                .map(|key| key.value)
+                .as_deref(),
             Some("explicit")
         );
     }
@@ -1476,6 +1511,10 @@ mod tests {
         )
         .await
         .unwrap();
+        audit.set_affinity(
+            Some("key-1:previous-response"),
+            Some("previous_response_id"),
+        );
         audit.finish(
             StatusCode::OK,
             None,
@@ -1487,9 +1526,19 @@ mod tests {
             None,
         );
         wait_for_audits(&state, 1).await;
-        let row: (i64, i64, i64, i64) = sqlx::query_as("SELECT input_tokens,output_tokens,cached_tokens,COUNT(*) FROM api_calls WHERE request_id='request-1'")
+        let row: (i64, i64, i64, i64, String, String) = sqlx::query_as("SELECT input_tokens,output_tokens,cached_tokens,COUNT(*),affinity_hash,affinity_source FROM api_calls WHERE request_id='request-1'")
             .fetch_one(&state.db).await.unwrap();
-        assert_eq!(row, (12, 4, 3, 1));
+        assert_eq!(
+            row,
+            (
+                12,
+                4,
+                3,
+                1,
+                affinity_hash("key-1:previous-response"),
+                "previous_response_id".to_owned(),
+            )
+        );
     }
 
     #[tokio::test]

@@ -695,13 +695,13 @@ pub async fn audit_detail(
     let user = browser_identity(&state, &headers).await?;
     let (sql, scope) = if is_admin(&user) {
         (
-            "SELECT a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated FROM api_calls c LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=?",
+            "SELECT c.id,c.request_id,c.user_id,k.prefix,c.channel_id,ch.name,c.method,c.path,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated FROM api_calls c JOIN api_keys k ON k.id=c.api_key_id LEFT JOIN channels ch ON ch.id=c.channel_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=?",
             None,
         )
     } else {
         (
-            "SELECT a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated FROM api_calls c LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=? AND c.user_id=?",
-            Some(user.id),
+            "SELECT c.id,c.request_id,c.user_id,k.prefix,c.channel_id,ch.name,c.method,c.path,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated FROM api_calls c JOIN api_keys k ON k.id=c.api_key_id LEFT JOIN channels ch ON ch.id=c.channel_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=? AND c.user_id=?",
+            Some(user.id.clone()),
         )
     };
     let mut query = sqlx::query(sql).bind(&id);
@@ -712,14 +712,54 @@ pub async fn audit_detail(
         .fetch_optional(&state.db)
         .await?
         .ok_or_else(|| AppError::not_found("audit event not found"))?;
+    let affinity_hash = row.get::<Option<String>, _>(16);
+    let navigation_rows = if let Some(affinity_hash) = &affinity_hash {
+        let (sql, scope) = if is_admin(&user) {
+            (
+                "SELECT id,request_id,created_at FROM api_calls WHERE affinity_hash=? ORDER BY created_at,id",
+                None,
+            )
+        } else {
+            (
+                "SELECT id,request_id,created_at FROM api_calls WHERE affinity_hash=? AND user_id=? ORDER BY created_at,id",
+                Some(user.id.clone()),
+            )
+        };
+        let mut query = sqlx::query(sql).bind(affinity_hash);
+        if let Some(scope) = scope {
+            query = query.bind(scope);
+        }
+        query.fetch_all(&state.db).await?
+    } else {
+        Vec::new()
+    };
+    let position = navigation_rows
+        .iter()
+        .position(|item| item.get::<String, _>(0) == id);
+    let navigation = |item: Option<&sqlx::sqlite::SqliteRow>| {
+        item.map(|item| {
+            json!({
+                "id":item.get::<String,_>(0),
+                "request_id":item.get::<String,_>(1),
+                "created_at":item.get::<i64,_>(2)
+            })
+        })
+    };
+    let previous = position
+        .and_then(|index| index.checked_sub(1))
+        .and_then(|index| navigation_rows.get(index));
+    let next = position.and_then(|index| navigation_rows.get(index + 1));
     Ok(Json(json!({
-        "archive_available":row.get::<Option<String>,_>(0).is_some(),
-        "request_headers":row.get::<Option<String>,_>(1),
-        "request_body":row.get::<Option<Vec<u8>>,_>(2).map(|body| String::from_utf8_lossy(&body).into_owned()),
-        "request_body_truncated":row.get::<Option<i64>,_>(3).unwrap_or_default() != 0,
-        "response_headers":row.get::<Option<String>,_>(4),
-        "response_body":row.get::<Option<Vec<u8>>,_>(5).map(|body| String::from_utf8_lossy(&body).into_owned()),
-        "response_body_truncated":row.get::<Option<i64>,_>(6).unwrap_or_default() != 0
+        "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"user_id":row.get::<String,_>(2),"key_prefix":row.get::<String,_>(3),
+        "channel_id":row.get::<Option<String>,_>(4),"channel_name":row.get::<Option<String>,_>(5),"method":row.get::<String,_>(6),"path":row.get::<String,_>(7),
+        "model":row.get::<Option<String>,_>(8),"status":row.get::<i64,_>(9),"latency_ms":row.get::<i64,_>(10),"input_tokens":row.get::<i64,_>(11),
+        "output_tokens":row.get::<i64,_>(12),"cached_tokens":row.get::<i64,_>(13),"error":row.get::<Option<String>,_>(14),"client_ip":row.get::<Option<String>,_>(15),
+        "affinity_hash":affinity_hash,"affinity_source":row.get::<Option<String>,_>(17),"created_at":row.get::<i64,_>(18),
+        "archive_available":row.get::<Option<String>,_>(19).is_some(),"request_headers":row.get::<Option<String>,_>(20),
+        "request_body":row.get::<Option<Vec<u8>>,_>(21).map(|body| String::from_utf8_lossy(&body).into_owned()),"request_body_truncated":row.get::<Option<i64>,_>(22).unwrap_or_default() != 0,
+        "response_headers":row.get::<Option<String>,_>(23),"response_body":row.get::<Option<Vec<u8>>,_>(24).map(|body| String::from_utf8_lossy(&body).into_owned()),
+        "response_body_truncated":row.get::<Option<i64>,_>(25).unwrap_or_default() != 0,
+        "previous":navigation(previous),"next":navigation(next)
     })))
 }
 
@@ -1437,6 +1477,23 @@ mod tests {
                 .execute(&state.db)
                 .await
                 .unwrap();
+            let affinity_hash =
+                crate::balancer::affinity_hash(&format!("history-key:response-{user_id}"));
+            sqlx::query("UPDATE api_calls SET affinity_hash=?,affinity_source='previous_response_id' WHERE id=?")
+                .bind(&affinity_hash)
+                .bind(&call_id)
+                .execute(&state.db)
+                .await
+                .unwrap();
+            let previous_id = format!("previous-{user_id}");
+            sqlx::query("INSERT INTO api_calls(id,request_id,api_key_id,user_id,affinity_hash,affinity_source,method,path,status,latency_ms,created_at) VALUES(?,?, 'history-key','root-user',?,'previous_response_id','POST','/v1/responses',200,1,?)")
+                .bind(&previous_id)
+                .bind(format!("previous-request-{user_id}"))
+                .bind(&affinity_hash)
+                .bind(now - 1)
+                .execute(&state.db)
+                .await
+                .unwrap();
             let audit =
                 channel_request(&state, Method::GET, "/api/audit", &browser_token, None).await;
             assert_eq!(audit.status(), StatusCode::OK);
@@ -1467,6 +1524,7 @@ mod tests {
             assert_eq!(detail["archive_available"], true);
             assert_eq!(detail["request_body"], json!(r#"{"input":"audit detail"}"#));
             assert_eq!(detail["response_body"], json!(r#"{"output":"diagnostic"}"#));
+            assert_eq!(detail["previous"]["id"], previous_id);
             let test = channel_request(
                 &state,
                 Method::POST,

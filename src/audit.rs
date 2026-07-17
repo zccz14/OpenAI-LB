@@ -24,6 +24,8 @@ pub struct AuditEvent {
     pub api_key_id: String,
     pub user_id: String,
     pub channel_id: Option<String>,
+    pub affinity_hash: Option<String>,
+    pub affinity_source: Option<String>,
     pub method: String,
     pub path: String,
     pub model: Option<String>,
@@ -108,12 +110,14 @@ async fn insert(
     transaction: &mut Transaction<'_, Sqlite>,
     event: &AuditEvent,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO api_calls(id,request_id,api_key_id,user_id,channel_id,method,path,model,status,latency_ms,input_tokens,output_tokens,cached_tokens,error,client_ip,created_at) VALUES(?,?,?,?,(SELECT id FROM channels WHERE id=?),?,?,?,?,?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO api_calls(id,request_id,api_key_id,user_id,channel_id,affinity_hash,affinity_source,method,path,model,status,latency_ms,input_tokens,output_tokens,cached_tokens,error,client_ip,created_at) VALUES(?,?,?,?,(SELECT id FROM channels WHERE id=?),?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(&event.id)
         .bind(&event.request_id)
         .bind(&event.api_key_id)
         .bind(&event.user_id)
         .bind(&event.channel_id)
+        .bind(&event.affinity_hash)
+        .bind(&event.affinity_source)
         .bind(&event.method)
         .bind(&event.path)
         .bind(&event.model)

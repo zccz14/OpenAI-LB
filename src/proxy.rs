@@ -83,9 +83,9 @@ impl AuditTracker {
             event: Some(AuditEvent {
                 id: Uuid::new_v4().to_string(),
                 request_id: request_id.to_owned(),
-                api_key_id: identity.key_id.clone(),
+                consumer_id: identity.consumer_id.clone(),
                 user_id: identity.user_id.clone(),
-                channel_id: None,
+                provider_id: None,
                 affinity_hash: None,
                 affinity_source: None,
                 method: method.as_str().to_owned(),
@@ -110,9 +110,9 @@ impl AuditTracker {
         })
     }
 
-    fn set_channel(&mut self, channel_id: &str) {
+    fn set_provider(&mut self, provider_id: &str) {
         if let Some(event) = &mut self.event {
-            event.channel_id = Some(channel_id.to_owned());
+            event.provider_id = Some(provider_id.to_owned());
         }
     }
 
@@ -431,15 +431,15 @@ async fn dispatch(
     let affinity_key = affinity_key(headers, parsed.as_ref());
     let affinity = affinity_key
         .as_ref()
-        .map(|key| format!("{}:{}", identity.key_id, key.value));
+        .map(|key| format!("{}:{}", identity.consumer_id, key.value));
     audit.set_affinity(
         affinity.as_deref(),
         affinity_key.as_ref().map(|key| key.source),
     );
     let mut payload = transform_request(path, parsed, &state)?;
-    let first = select_ready_channel(&state, affinity.as_deref()).await?;
-    audit.set_channel(&first.channel.id);
-    let first_id = first.channel.id.clone();
+    let first = select_ready_provider(&state, affinity.as_deref()).await?;
+    audit.set_provider(&first.provider.id);
+    let first_id = first.provider.id.clone();
     let response = send_upstream(
         &state,
         &first,
@@ -473,7 +473,7 @@ async fn dispatch(
                 }
                 drop(response);
                 drop(first);
-                audit.set_channel(&second.channel.id);
+                audit.set_provider(&second.provider.id);
                 payload =
                     transform_request(path, serde_json::from_slice::<Value>(body).ok(), &state)?;
                 let second_response =
@@ -481,7 +481,7 @@ async fn dispatch(
                         .await?;
                 track_response(
                     &state,
-                    &second.channel.id,
+                    &second.provider.id,
                     second_response.status(),
                     second_response.headers(),
                 )
@@ -521,13 +521,13 @@ async fn dispatch_audio(
     let affinity_key = affinity_key(headers, None);
     let affinity = affinity_key
         .as_ref()
-        .map(|key| format!("{}:{}", identity.key_id, key.value));
+        .map(|key| format!("{}:{}", identity.consumer_id, key.value));
     audit.set_affinity(
         affinity.as_deref(),
         affinity_key.as_ref().map(|key| key.source),
     );
-    let lease = select_ready_channel(&state, affinity.as_deref()).await?;
-    audit.set_channel(&lease.channel.id);
+    let lease = select_ready_provider(&state, affinity.as_deref()).await?;
+    audit.set_provider(&lease.provider.id);
     let preview = Arc::new(Mutex::new(StreamingPreview::default()));
     let capture = preview.clone();
     let stream = body.into_data_stream().map(move |item| {
@@ -556,7 +556,7 @@ async fn dispatch_audio(
     let upstream = upstream?;
     track_response(
         &state,
-        &lease.channel.id,
+        &lease.provider.id,
         upstream.status(),
         upstream.headers(),
     )
@@ -574,12 +574,15 @@ async fn dispatch_audio(
     .await
 }
 
-async fn select_ready_channel(state: &AppState, affinity: Option<&str>) -> Result<Lease, AppError> {
+async fn select_ready_provider(
+    state: &AppState,
+    affinity: Option<&str>,
+) -> Result<Lease, AppError> {
     let mut first = state.balancer.select(state, affinity, None).await?;
     if refresh_if_needed(state, &mut first).await.is_ok() {
         return Ok(first);
     }
-    let failed_id = first.channel.id.clone();
+    let failed_id = first.provider.id.clone();
     drop(first);
     let mut second = state
         .balancer
@@ -773,7 +776,7 @@ fn affinity_key(headers: &HeaderMap, body: Option<&Value>) -> Option<AffinityKey
 
 async fn refresh_if_needed(state: &AppState, lease: &mut Lease) -> Result<(), AppError> {
     if lease
-        .channel
+        .provider
         .expires_at
         .is_none_or(|expires| expires > chrono::Utc::now().timestamp() + 60)
     {
@@ -781,51 +784,51 @@ async fn refresh_if_needed(state: &AppState, lease: &mut Lease) -> Result<(), Ap
     }
     let lock = state
         .refresh_locks
-        .entry(lease.channel.id.clone())
+        .entry(lease.provider.id.clone())
         .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
         .clone();
     let _guard = lock.lock().await;
     let current: (String, String, Option<i64>, String) = sqlx::query_as(
-        "SELECT access_token,refresh_token,expires_at,account_id FROM channels WHERE id=?",
+        "SELECT access_token,refresh_token,expires_at,account_id FROM providers WHERE id=?",
     )
-    .bind(&lease.channel.id)
+    .bind(&lease.provider.id)
     .fetch_one(&state.db)
     .await?;
     let now = chrono::Utc::now().timestamp();
     if current.2.is_some_and(|expires| expires > now + 60) {
         lease.access_token = current.0;
         lease.refresh_token = current.1;
-        lease.channel.expires_at = current.2;
-        lease.channel.account_id = current.3;
+        lease.provider.expires_at = current.2;
+        lease.provider.account_id = current.3;
         return Ok(());
     }
     let refresh_token = current.1.clone();
     let token = match oauth::refresh(state, &refresh_token).await {
         Ok(token) => token,
         Err(error) => {
-            sqlx::query("UPDATE channels SET status='auth_error',last_error='credential refresh failed',updated_at=? WHERE id=? AND refresh_token=?")
-                .bind(now).bind(&lease.channel.id).bind(&current.1).execute(&state.db).await?;
-            state.balancer.reload_channels(&state.db).await?;
+            sqlx::query("UPDATE providers SET status='auth_error',last_error='credential refresh failed',updated_at=? WHERE id=? AND refresh_token=?")
+                .bind(now).bind(&lease.provider.id).bind(&current.1).execute(&state.db).await?;
+            state.balancer.reload_providers(&state.db).await?;
             return Err(error);
         }
     };
     let account_id = oauth::account_id_from_jwt(&token.access_token)
-        .unwrap_or_else(|_| lease.channel.account_id.clone());
+        .unwrap_or_else(|_| lease.provider.account_id.clone());
     let expires_at = now + token.expires_in;
-    let updated = sqlx::query("UPDATE channels SET access_token=?,refresh_token=?,account_id=?,expires_at=?,status='active',last_error=NULL,updated_at=? WHERE id=? AND refresh_token=?")
+    let updated = sqlx::query("UPDATE providers SET access_token=?,refresh_token=?,account_id=?,expires_at=?,status='active',last_error=NULL,updated_at=? WHERE id=? AND refresh_token=?")
         .bind(&token.access_token)
         .bind(&token.refresh_token)
-        .bind(&account_id).bind(expires_at).bind(now).bind(&lease.channel.id).bind(&current.1).execute(&state.db).await?;
+        .bind(&account_id).bind(expires_at).bind(now).bind(&lease.provider.id).bind(&current.1).execute(&state.db).await?;
     if updated.rows_affected() == 0 {
         return Err(AppError::unavailable(
-            "channel credential changed during refresh",
+            "provider credential changed during refresh",
         ));
     }
     lease.access_token = token.access_token;
     lease.refresh_token = token.refresh_token;
-    lease.channel.account_id = account_id;
-    lease.channel.expires_at = Some(expires_at);
-    state.balancer.reload_channels(&state.db).await?;
+    lease.provider.account_id = account_id;
+    lease.provider.expires_at = Some(expires_at);
+    state.balancer.reload_providers(&state.db).await?;
     Ok(())
 }
 
@@ -855,7 +858,7 @@ async fn send_upstream(
             header::AUTHORIZATION,
             format!("Bearer {}", lease.access_token),
         )
-        .header("chatgpt-account-id", &lease.channel.account_id)
+        .header("chatgpt-account-id", &lease.provider.account_id)
         .header("x-request-id", request_id);
     if path != "/v1/audio/transcriptions" {
         request = request
@@ -1356,23 +1359,23 @@ mod tests {
         (format!("http://{address}"), interrupt)
     }
 
-    async fn seed_proxy(state: &AppState, channel: bool) {
+    async fn seed_proxy(state: &AppState, provider: bool) {
         let now = chrono::Utc::now().timestamp();
         sqlx::query(
-            "INSERT INTO users(id,role,channel_access,created_at) VALUES('user-1','user',1,?)",
+            "INSERT INTO users(id,role,provider_access,created_at) VALUES('user-1','user',1,?)",
         )
         .bind(now)
         .execute(&state.db)
         .await
         .unwrap();
-        sqlx::query("INSERT INTO api_keys(id,user_id,name,prefix,secret_hash,created_at) VALUES('key-1','user-1','test','sk-test',?,?)")
-            .bind(crate::crypto::api_key_hash("sk-test-secret")).bind(now).execute(&state.db).await.unwrap();
-        if channel {
-            sqlx::query("INSERT INTO channels(id,name,account_id,access_token,refresh_token,status,created_at,updated_at) VALUES('channel-1','one','account-1',?,?,'active',?,?)")
+        sqlx::query("INSERT INTO consumers(id,user_id,name,prefix,secret_hash,created_at) VALUES('key-1','user-1','test','sk-test',?,?)")
+            .bind(crate::crypto::consumer_secret_hash("sk-test-secret")).bind(now).execute(&state.db).await.unwrap();
+        if provider {
+            sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,status,created_at,updated_at) VALUES('provider-1','one','account-1',?,?,'active',?,?)")
                 .bind("access-token")
                 .bind("refresh-token")
                 .bind(now).bind(now).execute(&state.db).await.unwrap();
-            state.balancer.reload_channels(&state.db).await.unwrap();
+            state.balancer.reload_providers(&state.db).await.unwrap();
         }
     }
 
@@ -1495,10 +1498,10 @@ mod tests {
             .execute(&state.db)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO api_keys(id,user_id,name,prefix,secret_hash,created_at) VALUES('key-1','user-1','test','sk-test','hash',?)")
+        sqlx::query("INSERT INTO consumers(id,user_id,name,prefix,secret_hash,created_at) VALUES('key-1','user-1','test','sk-test','hash',?)")
             .bind(now).execute(&state.db).await.unwrap();
         let identity = ApiIdentity {
-            key_id: "key-1".to_owned(),
+            consumer_id: "key-1".to_owned(),
             user_id: "user-1".to_owned(),
         };
         let mut audit = AuditTracker::begin(
@@ -1546,7 +1549,7 @@ mod tests {
         let state = crate::test_state("http://token.invalid").await;
         seed_proxy(&state, false).await;
         let identity = ApiIdentity {
-            key_id: "key-1".to_owned(),
+            consumer_id: "key-1".to_owned(),
             user_id: "user-1".to_owned(),
         };
         let mut audit = AuditTracker::begin(
@@ -1611,25 +1614,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audit_survives_channel_deletion_during_an_inflight_call() {
+    async fn audit_survives_provider_deletion_during_an_inflight_call() {
         let state = crate::test_state("http://token.invalid").await;
         seed_proxy(&state, false).await;
         let identity = ApiIdentity {
-            key_id: "key-1".to_owned(),
+            consumer_id: "key-1".to_owned(),
             user_id: "user-1".to_owned(),
         };
         let mut audit = AuditTracker::begin(
             &state,
             &identity,
-            "deleted-channel-request",
+            "deleted-provider-request",
             &Method::POST,
             "/v1/responses",
             "127.0.0.1",
         )
         .await
         .unwrap();
-        audit.set_channel("channel-1");
-        sqlx::query("DELETE FROM channels WHERE id='channel-1'")
+        audit.set_provider("provider-1");
+        sqlx::query("DELETE FROM providers WHERE id='provider-1'")
             .execute(&state.db)
             .await
             .unwrap();
@@ -1637,7 +1640,7 @@ mod tests {
 
         wait_for_audits(&state, 1).await;
         let row: (i64, Option<String>) = sqlx::query_as(
-            "SELECT status,channel_id FROM api_calls WHERE request_id='deleted-channel-request'",
+            "SELECT status,provider_id FROM api_calls WHERE request_id='deleted-provider-request'",
         )
         .fetch_one(&state.db)
         .await
@@ -1953,7 +1956,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_channel_error_is_forwarded_and_failed_calls_are_audited() {
+    async fn single_provider_error_is_forwarded_and_failed_calls_are_audited() {
         for expected in [
             StatusCode::UNAUTHORIZED,
             StatusCode::FORBIDDEN,
@@ -2017,7 +2020,7 @@ mod tests {
         assert!(
             std::str::from_utf8(&archived_response)
                 .unwrap()
-                .contains("no available CodeX channel")
+                .contains("no available CodeX provider")
         );
     }
 
@@ -2062,11 +2065,11 @@ mod tests {
         });
         let state = crate::test_state(&format!("http://{address}/token")).await;
         let now = chrono::Utc::now().timestamp();
-        sqlx::query("INSERT INTO channels(id,name,account_id,access_token,refresh_token,expires_at,status,created_at,updated_at) VALUES('channel-1','one','account-1',?,?,?,'active',?,?)")
+        sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,expires_at,status,created_at,updated_at) VALUES('provider-1','one','account-1',?,?,?,'active',?,?)")
             .bind("access-old")
             .bind("refresh-old")
             .bind(now - 1).bind(now).bind(now).execute(&state.db).await.unwrap();
-        state.balancer.reload_channels(&state.db).await.unwrap();
+        state.balancer.reload_providers(&state.db).await.unwrap();
         let first = state.balancer.select(&state, None, None).await.unwrap();
         let second = state.balancer.select(&state, None, None).await.unwrap();
         let state_one = state.clone();
@@ -2089,7 +2092,7 @@ mod tests {
         let state = crate::test_state("http://token.invalid").await;
         seed_proxy(&state, false).await;
         let identity = ApiIdentity {
-            key_id: "key-1".to_owned(),
+            consumer_id: "key-1".to_owned(),
             user_id: "user-1".to_owned(),
         };
         let mut audit = AuditTracker::begin(

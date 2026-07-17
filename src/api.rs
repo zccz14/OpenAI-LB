@@ -15,8 +15,8 @@ use uuid::Uuid;
 use crate::{
     AppError, AppState,
     auth::{bearer, browser_identity, is_admin, require_admin, require_root},
-    balancer::Channel,
-    crypto::api_key_hash,
+    balancer::Provider,
+    crypto::consumer_secret_hash,
     oauth,
 };
 
@@ -141,16 +141,16 @@ pub async fn me(
 }
 
 #[derive(Deserialize)]
-pub struct CreateKey {
+pub struct CreateConsumer {
     name: String,
 }
 
-pub async fn list_keys(
+pub async fn list_consumers(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
-    let rows = sqlx::query("SELECT id,name,prefix,created_at,last_used_at,revoked_at FROM api_keys WHERE user_id=? ORDER BY created_at DESC")
+    let rows = sqlx::query("SELECT id,name,prefix,created_at,last_used_at,revoked_at FROM consumers WHERE user_id=? ORDER BY created_at DESC")
         .bind(&user.id).fetch_all(&state.db).await?;
     Ok(Json(Value::Array(rows.into_iter().map(|row| json!({
         "id": row.get::<String,_>(0), "name": row.get::<String,_>(1), "prefix": row.get::<String,_>(2),
@@ -158,10 +158,10 @@ pub async fn list_keys(
     })).collect())))
 }
 
-pub async fn create_key(
+pub async fn create_consumer(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(input): Json<CreateKey>,
+    Json(input): Json<CreateConsumer>,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
     let name = input.name.trim();
@@ -174,13 +174,13 @@ pub async fn create_key(
     let prefix = secret.chars().take(11).collect::<String>();
     let id = Uuid::new_v4().to_string();
     sqlx::query(
-        "INSERT INTO api_keys(id,user_id,name,prefix,secret_hash,created_at) VALUES(?,?,?,?,?,?)",
+        "INSERT INTO consumers(id,user_id,name,prefix,secret_hash,created_at) VALUES(?,?,?,?,?,?)",
     )
     .bind(&id)
     .bind(&user.id)
     .bind(name)
     .bind(&prefix)
-    .bind(api_key_hash(&secret))
+    .bind(consumer_secret_hash(&secret))
     .bind(chrono::Utc::now().timestamp())
     .execute(&state.db)
     .await?;
@@ -189,14 +189,14 @@ pub async fn create_key(
     ))
 }
 
-pub async fn revoke_key(
+pub async fn revoke_consumer(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
     let result = sqlx::query(
-        "UPDATE api_keys SET revoked_at=? WHERE id=? AND user_id=? AND revoked_at IS NULL",
+        "UPDATE consumers SET revoked_at=? WHERE id=? AND user_id=? AND revoked_at IS NULL",
     )
     .bind(chrono::Utc::now().timestamp())
     .bind(id)
@@ -204,33 +204,34 @@ pub async fn revoke_key(
     .execute(&state.db)
     .await?;
     if result.rows_affected() == 0 {
-        return Err(AppError::not_found("API key not found"));
+        return Err(AppError::not_found("consumer not found"));
     }
     Ok(Json(json!({"ok":true})))
 }
 
 #[derive(Deserialize)]
-pub struct CreateChannel {
+pub struct CreateProvider {
     name: String,
     access_key: String,
     refresh_key: String,
 }
 
-pub async fn list_channels(
+pub async fn list_providers(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
     require_admin(&user)?;
-    let channels = sqlx::query_as::<_, Channel>("SELECT * FROM channels ORDER BY created_at DESC")
-        .fetch_all(&state.db)
-        .await?;
+    let providers =
+        sqlx::query_as::<_, Provider>("SELECT * FROM providers ORDER BY created_at DESC")
+            .fetch_all(&state.db)
+            .await?;
     Ok(Json(Value::Array(
-        channels
+        providers
             .into_iter()
-            .map(|channel| {
-                let inflight = state.balancer.inflight(&channel.id);
-                let mut value = serde_json::to_value(channel).expect("channel serializes");
+            .map(|provider| {
+                let inflight = state.balancer.inflight(&provider.id);
+                let mut value = serde_json::to_value(provider).expect("provider serializes");
                 value["inflight"] = json!(inflight);
                 value
             })
@@ -238,15 +239,15 @@ pub async fn list_channels(
     )))
 }
 
-pub async fn create_channel(
+pub async fn create_provider(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(input): Json<CreateChannel>,
+    Json(input): Json<CreateProvider>,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
     require_admin(&user)?;
-    let result = insert_channel(
+    let result = insert_provider(
         &state,
         &input.name,
         &input.access_key,
@@ -255,9 +256,9 @@ pub async fn create_channel(
     )
     .await;
     let action = if result.is_ok() {
-        "channel.create"
+        "provider.create"
     } else {
-        "channel.create.failed"
+        "provider.create.failed"
     };
     write_admin_audit(
         &state,
@@ -274,7 +275,7 @@ pub async fn create_channel(
     result
 }
 
-async fn insert_channel(
+async fn insert_provider(
     state: &AppState,
     name: &str,
     access: &str,
@@ -290,34 +291,34 @@ async fn insert_channel(
     let id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp();
     let expires_at = expires_at.or_else(|| oauth::expires_at_from_jwt(access));
-    sqlx::query("INSERT INTO channels(id,name,account_id,access_token,refresh_token,expires_at,status,created_at,updated_at) VALUES(?,?,?,?,?,?,'active',?,?)")
+    sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,expires_at,status,created_at,updated_at) VALUES(?,?,?,?,?,?,'active',?,?)")
         .bind(&id).bind(name.trim()).bind(&account_id).bind(access.trim())
         .bind(refresh.trim()).bind(expires_at).bind(now).bind(now).execute(&state.db).await?;
-    state.balancer.reload_channels(&state.db).await?;
+    state.balancer.reload_providers(&state.db).await?;
     Ok(Json(
         json!({"id":id,"name":name.trim(),"account_id":account_id,"status":"active"}),
     ))
 }
 
 #[derive(Deserialize)]
-pub struct ChannelUpdate {
+pub struct ProviderUpdate {
     name: Option<String>,
     enabled: Option<bool>,
     refresh: Option<bool>,
 }
 
-pub async fn update_channel(
+pub async fn update_provider(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Json(input): Json<ChannelUpdate>,
+    Json(input): Json<ProviderUpdate>,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
     require_admin(&user)?;
     let operation: Result<Json<Value>, AppError> = async {
         if let Some(name) = input.name.filter(|name| !name.trim().is_empty()) {
-            sqlx::query("UPDATE channels SET name=?,updated_at=? WHERE id=?")
+            sqlx::query("UPDATE providers SET name=?,updated_at=? WHERE id=?")
                 .bind(name.trim())
                 .bind(chrono::Utc::now().timestamp())
                 .bind(&id)
@@ -326,55 +327,55 @@ pub async fn update_channel(
         }
         if let Some(enabled) = input.enabled {
             let (disabled, status) = if enabled { (0, "active") } else { (1, "disabled") };
-            sqlx::query("UPDATE channels SET manual_disabled=?,status=?,cooldown_until=NULL,updated_at=? WHERE id=?")
+            sqlx::query("UPDATE providers SET manual_disabled=?,status=?,cooldown_until=NULL,updated_at=? WHERE id=?")
                 .bind(disabled).bind(status).bind(chrono::Utc::now().timestamp()).bind(&id).execute(&state.db).await?;
         }
         if input.refresh.unwrap_or(false) {
-            refresh_channel(&state, &id).await?;
+            refresh_provider(&state, &id).await?;
         }
-        state.balancer.reload_channels(&state.db).await?;
+        state.balancer.reload_providers(&state.db).await?;
         Ok(Json(json!({"ok":true})))
     }.await;
     let action = if operation.is_ok() {
-        "channel.update"
+        "provider.update"
     } else {
-        "channel.update.failed"
+        "provider.update.failed"
     };
     write_admin_audit(&state, &user.id, action, Some(&id), &peer.ip().to_string()).await?;
     operation
 }
 
-async fn refresh_channel(state: &AppState, id: &str) -> Result<(), AppError> {
+async fn refresh_provider(state: &AppState, id: &str) -> Result<(), AppError> {
     let lock = state
         .refresh_locks
         .entry(id.to_owned())
         .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
         .clone();
     let _guard = lock.lock().await;
-    let row = sqlx::query("SELECT refresh_token,account_id FROM channels WHERE id=?")
+    let row = sqlx::query("SELECT refresh_token,account_id FROM providers WHERE id=?")
         .bind(id)
         .fetch_optional(&state.db)
         .await?
-        .ok_or_else(|| AppError::not_found("channel not found"))?;
+        .ok_or_else(|| AppError::not_found("provider not found"))?;
     let refresh: String = row.get(0);
     let token = oauth::refresh(state, &refresh).await?;
     let account_id =
         oauth::account_id_from_jwt(&token.access_token).unwrap_or_else(|_| row.get::<String, _>(1));
     let now = chrono::Utc::now().timestamp();
-    let updated = sqlx::query("UPDATE channels SET access_token=?,refresh_token=?,account_id=?,expires_at=?,status=CASE WHEN manual_disabled=1 THEN 'disabled' ELSE 'active' END,cooldown_until=NULL,last_error=NULL,updated_at=? WHERE id=? AND refresh_token=?")
+    let updated = sqlx::query("UPDATE providers SET access_token=?,refresh_token=?,account_id=?,expires_at=?,status=CASE WHEN manual_disabled=1 THEN 'disabled' ELSE 'active' END,cooldown_until=NULL,last_error=NULL,updated_at=? WHERE id=? AND refresh_token=?")
         .bind(&token.access_token)
         .bind(&token.refresh_token)
         .bind(account_id).bind(now + token.expires_in).bind(now).bind(id).bind(refresh).execute(&state.db).await?;
     if updated.rows_affected() == 0 {
         return Err(AppError::unavailable(
-            "channel credential changed during refresh",
+            "provider credential changed during refresh",
         ));
     }
-    state.balancer.reload_channels(&state.db).await?;
+    state.balancer.reload_providers(&state.db).await?;
     Ok(())
 }
 
-pub async fn read_channel_tokens(
+pub async fn read_provider_tokens(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
@@ -384,11 +385,11 @@ pub async fn read_channel_tokens(
     require_admin(&user)?;
     let result: Result<(HeaderMap, Json<Value>), AppError> = async {
         let row: (String, String) =
-            sqlx::query_as("SELECT access_token,refresh_token FROM channels WHERE id=?")
+            sqlx::query_as("SELECT access_token,refresh_token FROM providers WHERE id=?")
                 .bind(&id)
                 .fetch_optional(&state.db)
                 .await?
-                .ok_or_else(|| AppError::not_found("channel not found"))?;
+                .ok_or_else(|| AppError::not_found("provider not found"))?;
         let mut response_headers = HeaderMap::new();
         response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
         Ok((
@@ -398,31 +399,31 @@ pub async fn read_channel_tokens(
     }
     .await;
     let action = if result.is_ok() {
-        "channel.tokens.read"
+        "provider.tokens.read"
     } else {
-        "channel.tokens.read.failed"
+        "provider.tokens.read.failed"
     };
     write_admin_audit(&state, &user.id, action, Some(&id), &peer.ip().to_string()).await?;
     result
 }
 
 #[derive(Deserialize)]
-pub struct ReplaceChannelTokens {
+pub struct ReplaceProviderTokens {
     name: String,
     access_key: String,
     refresh_key: String,
 }
 
-pub async fn replace_channel_tokens(
+pub async fn replace_provider_tokens(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Json(input): Json<ReplaceChannelTokens>,
+    Json(input): Json<ReplaceProviderTokens>,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
     require_admin(&user)?;
-    let result = replace_channel_token_values(
+    let result = replace_provider_token_values(
         &state,
         &id,
         input.name.trim(),
@@ -431,15 +432,15 @@ pub async fn replace_channel_tokens(
     )
     .await;
     let action = if result.is_ok() {
-        "channel.tokens.update"
+        "provider.tokens.update"
     } else {
-        "channel.tokens.update.failed"
+        "provider.tokens.update.failed"
     };
     write_admin_audit(&state, &user.id, action, Some(&id), &peer.ip().to_string()).await?;
     result
 }
 
-async fn replace_channel_token_values(
+async fn replace_provider_token_values(
     state: &AppState,
     id: &str,
     name: &str,
@@ -453,37 +454,37 @@ async fn replace_channel_token_values(
     }
     let account_id = oauth::account_id_from_jwt(access_token)?;
     let expires_at = oauth::expires_at_from_jwt(access_token);
-    let updated = sqlx::query("UPDATE channels SET name=?,access_token=?,refresh_token=?,account_id=?,expires_at=?,status=CASE WHEN manual_disabled=1 THEN 'disabled' ELSE 'active' END,cooldown_until=NULL,last_error=NULL,updated_at=? WHERE id=?")
+    let updated = sqlx::query("UPDATE providers SET name=?,access_token=?,refresh_token=?,account_id=?,expires_at=?,status=CASE WHEN manual_disabled=1 THEN 'disabled' ELSE 'active' END,cooldown_until=NULL,last_error=NULL,updated_at=? WHERE id=?")
         .bind(name).bind(access_token).bind(refresh_token).bind(&account_id).bind(expires_at)
         .bind(chrono::Utc::now().timestamp()).bind(id).execute(&state.db).await?;
     if updated.rows_affected() == 0 {
-        return Err(AppError::not_found("channel not found"));
+        return Err(AppError::not_found("provider not found"));
     }
-    state.balancer.reload_channels(&state.db).await?;
+    state.balancer.reload_providers(&state.db).await?;
     Ok(Json(json!({"ok":true,"name":name,"account_id":account_id})))
 }
 
-pub async fn list_channel_usage(
+pub async fn list_provider_usage(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
     require_admin(&user)?;
-    let ids = sqlx::query_scalar::<_, String>("SELECT id FROM channels ORDER BY created_at DESC")
+    let ids = sqlx::query_scalar::<_, String>("SELECT id FROM providers ORDER BY created_at DESC")
         .fetch_all(&state.db)
         .await?;
-    let mut channels = serde_json::Map::new();
+    let mut providers = serde_json::Map::new();
     for id in ids {
-        let value = match channel_usage_value(&state, &id).await {
+        let value = match provider_usage_value(&state, &id).await {
             Ok(usage) => json!({"usage": usage}),
             Err(error) => json!({"error": error.message()}),
         };
-        channels.insert(id, value);
+        providers.insert(id, value);
     }
-    Ok(Json(json!({"channels": channels})))
+    Ok(Json(json!({"providers": providers})))
 }
 
-pub async fn test_channel(
+pub async fn test_provider(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
@@ -491,29 +492,29 @@ pub async fn test_channel(
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
     require_admin(&user)?;
-    let result = channel_usage(&state, &id).await;
+    let result = provider_usage(&state, &id).await;
     let action = if result.is_ok() {
-        "channel.test"
+        "provider.test"
     } else {
-        "channel.test.failed"
+        "provider.test.failed"
     };
     write_admin_audit(&state, &user.id, action, Some(&id), &peer.ip().to_string()).await?;
     result
 }
 
-async fn channel_usage(state: &AppState, id: &str) -> Result<Json<Value>, AppError> {
+async fn provider_usage(state: &AppState, id: &str) -> Result<Json<Value>, AppError> {
     Ok(Json(
-        json!({"ok":true,"usage":channel_usage_value(state, id).await?}),
+        json!({"ok":true,"usage":provider_usage_value(state, id).await?}),
     ))
 }
 
-async fn channel_usage_value(state: &AppState, id: &str) -> Result<Value, AppError> {
+async fn provider_usage_value(state: &AppState, id: &str) -> Result<Value, AppError> {
     let row: (String, String) =
-        sqlx::query_as("SELECT access_token,account_id FROM channels WHERE id=?")
+        sqlx::query_as("SELECT access_token,account_id FROM providers WHERE id=?")
             .bind(id)
             .fetch_optional(&state.db)
             .await?
-            .ok_or_else(|| AppError::not_found("channel not found"))?;
+            .ok_or_else(|| AppError::not_found("provider not found"))?;
     let mut usage_url = url::Url::parse(&state.config.load().upstream_base)?;
     usage_url.set_path("/backend-api/wham/usage");
     usage_url.set_query(None);
@@ -524,21 +525,21 @@ async fn channel_usage_value(state: &AppState, id: &str) -> Result<Value, AppErr
         .header("chatgpt-account-id", row.1)
         .send()
         .await
-        .map_err(|_| AppError::upstream(502, "channel Usage API request failed"))?;
+        .map_err(|_| AppError::upstream(502, "provider Usage API request failed"))?;
     if !response.status().is_success() {
         return Err(AppError::upstream(
             502,
-            format!("channel Usage API returned {}", response.status()),
+            format!("provider Usage API returned {}", response.status()),
         ));
     }
     let usage = response
         .json::<Value>()
         .await
-        .map_err(|_| AppError::upstream(502, "channel Usage API returned invalid JSON"))?;
+        .map_err(|_| AppError::upstream(502, "provider Usage API returned invalid JSON"))?;
     Ok(usage)
 }
 
-pub async fn delete_channel(
+pub async fn delete_provider(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
@@ -547,22 +548,22 @@ pub async fn delete_channel(
     let user = browser_identity(&state, &headers).await?;
     require_admin(&user)?;
     let result: Result<Json<Value>, AppError> = async {
-        let deleted = sqlx::query("DELETE FROM channels WHERE id=?")
+        let deleted = sqlx::query("DELETE FROM providers WHERE id=?")
             .bind(&id)
             .execute(&state.db)
             .await?;
         if deleted.rows_affected() == 0 {
-            return Err(AppError::not_found("channel not found"));
+            return Err(AppError::not_found("provider not found"));
         }
-        state.balancer.forget_channel(&id);
-        state.balancer.reload_channels(&state.db).await?;
+        state.balancer.forget_provider(&id);
+        state.balancer.reload_providers(&state.db).await?;
         Ok(Json(json!({"ok":true})))
     }
     .await;
     let action = if result.is_ok() {
-        "channel.delete"
+        "provider.delete"
     } else {
-        "channel.delete.failed"
+        "provider.delete.failed"
     };
     write_admin_audit(&state, &user.id, action, Some(&id), &peer.ip().to_string()).await?;
     result
@@ -607,7 +608,7 @@ pub async fn oauth_complete(
     require_admin(&user)?;
     let result: Result<Json<Value>, AppError> = async {
         let token = oauth::exchange(&state, &input.state, &input.code, &user.id).await?;
-        insert_channel(
+        insert_provider(
             &state,
             &input.name,
             &token.access_token,
@@ -692,7 +693,7 @@ async fn usage_rows(
     user: &crate::auth::UserIdentity,
     since: i64,
 ) -> Result<Vec<Value>, AppError> {
-    let sql = "SELECT c.user_id,u.email,u.display_name,k.id,k.name,k.prefix,COALESCE(NULLIF(c.model,''),'unknown'),date(c.created_at,'unixepoch'),COUNT(c.id),COALESCE(SUM(c.input_tokens),0),COALESCE(SUM(c.cached_tokens),0),COALESCE(SUM(c.output_tokens),0) FROM api_calls c JOIN users u ON u.id=c.user_id JOIN api_keys k ON k.id=c.api_key_id WHERE c.created_at>=?";
+    let sql = "SELECT c.user_id,u.email,u.display_name,k.id,k.name,k.prefix,COALESCE(NULLIF(c.model,''),'unknown'),date(c.created_at,'unixepoch'),COUNT(c.id),COALESCE(SUM(c.input_tokens),0),COALESCE(SUM(c.cached_tokens),0),COALESCE(SUM(c.output_tokens),0) FROM api_calls c JOIN users u ON u.id=c.user_id JOIN consumers k ON k.id=c.consumer_id WHERE c.created_at>=?";
     let group = " GROUP BY c.user_id,u.email,u.display_name,k.id,k.name,k.prefix,COALESCE(NULLIF(c.model,''),'unknown'),date(c.created_at,'unixepoch') ORDER BY date(c.created_at,'unixepoch') ASC";
     let rows = if is_admin(user) {
         sqlx::query(&format!("{sql}{group}"))
@@ -713,9 +714,9 @@ async fn usage_rows(
                 "user_id": row.get::<String, _>(0),
                 "user_email": row.get::<Option<String>, _>(1),
                 "user_name": row.get::<Option<String>, _>(2),
-                "key_id": row.get::<String, _>(3),
-                "key_name": row.get::<String, _>(4),
-                "key_prefix": row.get::<String, _>(5),
+                "consumer_id": row.get::<String, _>(3),
+                "consumer_name": row.get::<String, _>(4),
+                "consumer_prefix": row.get::<String, _>(5),
                 "model": row.get::<String, _>(6),
                 "date": row.get::<String, _>(7),
                 "requests": row.get::<i64, _>(8),
@@ -737,12 +738,12 @@ pub async fn audit(
     let offset = page.offset.unwrap_or(0).max(0);
     let (sql, scope) = if is_admin(&user) {
         (
-            "SELECT c.id,c.request_id,c.user_id,k.name,c.channel_id,ch.name,c.path,c.method,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at FROM api_calls c JOIN api_keys k ON k.id=c.api_key_id LEFT JOIN channels ch ON ch.id=c.channel_id ORDER BY c.created_at DESC LIMIT ? OFFSET ?",
+            "SELECT c.id,c.request_id,c.user_id,k.name,c.provider_id,ch.name,c.path,c.method,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id ORDER BY c.created_at DESC LIMIT ? OFFSET ?",
             None,
         )
     } else {
         (
-            "SELECT c.id,c.request_id,c.user_id,k.name,c.channel_id,ch.name,c.path,c.method,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at FROM api_calls c JOIN api_keys k ON k.id=c.api_key_id LEFT JOIN channels ch ON ch.id=c.channel_id WHERE c.user_id=? ORDER BY c.created_at DESC LIMIT ? OFFSET ?",
+            "SELECT c.id,c.request_id,c.user_id,k.name,c.provider_id,ch.name,c.path,c.method,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id WHERE c.user_id=? ORDER BY c.created_at DESC LIMIT ? OFFSET ?",
             Some(user.id),
         )
     };
@@ -752,7 +753,7 @@ pub async fn audit(
     }
     let rows = query.bind(limit).bind(offset).fetch_all(&state.db).await?;
     Ok(Json(Value::Array(rows.into_iter().map(|row| json!({
-        "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"user_id":row.get::<String,_>(2),"key_name":row.get::<String,_>(3),"channel_id":row.get::<Option<String>,_>(4),"channel_name":row.get::<Option<String>,_>(5),
+        "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"user_id":row.get::<String,_>(2),"consumer_name":row.get::<String,_>(3),"provider_id":row.get::<Option<String>,_>(4),"provider_name":row.get::<Option<String>,_>(5),
         "path":row.get::<String,_>(6),"method":row.get::<String,_>(7),"model":row.get::<Option<String>,_>(8),"status":row.get::<i64,_>(9),"latency_ms":row.get::<i64,_>(10),
         "input_tokens":row.get::<i64,_>(11),"output_tokens":row.get::<i64,_>(12),"cached_tokens":row.get::<i64,_>(13),"error":row.get::<Option<String>,_>(14),"client_ip":row.get::<Option<String>,_>(15),"created_at":row.get::<i64,_>(16)
     })).collect())))
@@ -766,12 +767,12 @@ pub async fn audit_detail(
     let user = browser_identity(&state, &headers).await?;
     let (sql, scope) = if is_admin(&user) {
         (
-            "SELECT c.id,c.request_id,c.user_id,k.name,c.channel_id,ch.name,c.method,c.path,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated FROM api_calls c JOIN api_keys k ON k.id=c.api_key_id LEFT JOIN channels ch ON ch.id=c.channel_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=?",
+            "SELECT c.id,c.request_id,c.user_id,k.name,c.provider_id,ch.name,c.method,c.path,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=?",
             None,
         )
     } else {
         (
-            "SELECT c.id,c.request_id,c.user_id,k.name,c.channel_id,ch.name,c.method,c.path,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated FROM api_calls c JOIN api_keys k ON k.id=c.api_key_id LEFT JOIN channels ch ON ch.id=c.channel_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=? AND c.user_id=?",
+            "SELECT c.id,c.request_id,c.user_id,k.name,c.provider_id,ch.name,c.method,c.path,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=? AND c.user_id=?",
             Some(user.id.clone()),
         )
     };
@@ -821,8 +822,8 @@ pub async fn audit_detail(
         .and_then(|index| navigation_rows.get(index));
     let next = position.and_then(|index| navigation_rows.get(index + 1));
     Ok(Json(json!({
-        "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"user_id":row.get::<String,_>(2),"key_name":row.get::<String,_>(3),
-        "channel_id":row.get::<Option<String>,_>(4),"channel_name":row.get::<Option<String>,_>(5),"method":row.get::<String,_>(6),"path":row.get::<String,_>(7),
+        "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"user_id":row.get::<String,_>(2),"consumer_name":row.get::<String,_>(3),
+        "provider_id":row.get::<Option<String>,_>(4),"provider_name":row.get::<Option<String>,_>(5),"method":row.get::<String,_>(6),"path":row.get::<String,_>(7),
         "model":row.get::<Option<String>,_>(8),"status":row.get::<i64,_>(9),"latency_ms":row.get::<i64,_>(10),"input_tokens":row.get::<i64,_>(11),
         "output_tokens":row.get::<i64,_>(12),"cached_tokens":row.get::<i64,_>(13),"error":row.get::<Option<String>,_>(14),"client_ip":row.get::<Option<String>,_>(15),
         "affinity_hash":affinity_hash,"affinity_source":row.get::<Option<String>,_>(17),"created_at":row.get::<i64,_>(18),
@@ -868,7 +869,7 @@ pub async fn dashboard(
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
     let keys: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE user_id=? AND revoked_at IS NULL")
+        sqlx::query_scalar("SELECT COUNT(*) FROM consumers WHERE user_id=? AND revoked_at IS NULL")
             .bind(&user.id)
             .fetch_one(&state.db)
             .await?;
@@ -885,9 +886,9 @@ pub async fn dashboard(
     .bind(chrono::Utc::now().timestamp() - 86400)
     .fetch_one(&state.db)
     .await?;
-    let channels: i64 = if is_admin(&user) {
+    let providers: i64 = if is_admin(&user) {
         sqlx::query_scalar(
-            "SELECT COUNT(*) FROM channels WHERE manual_disabled=0 AND status='active'",
+            "SELECT COUNT(*) FROM providers WHERE manual_disabled=0 AND status='active'",
         )
         .fetch_one(&state.db)
         .await?
@@ -895,7 +896,7 @@ pub async fn dashboard(
         0
     };
     Ok(Json(
-        json!({"active_keys":keys,"calls_24h":calls,"errors_24h":errors,"available_channels":channels}),
+        json!({"active_consumers":keys,"calls_24h":calls,"errors_24h":errors,"available_providers":providers}),
     ))
 }
 
@@ -1044,7 +1045,7 @@ pub async fn list_users(
     let root = browser_identity(&state, &headers).await?;
     require_admin(&root)?;
     let rows = sqlx::query(
-        "SELECT id,email,display_name,role,channel_access,created_at FROM users ORDER BY created_at,id",
+        "SELECT id,email,display_name,role,provider_access,created_at FROM users ORDER BY created_at,id",
     )
     .fetch_all(&state.db)
     .await?;
@@ -1056,7 +1057,7 @@ pub async fn list_users(
                     "email":row.get::<Option<String>,_>(1),
                     "display_name":row.get::<Option<String>,_>(2),
                     "role":row.get::<String,_>(3),
-                    "channel_access":row.get::<i64,_>(4) != 0,
+                    "provider_access":row.get::<i64,_>(4) != 0,
                     "created_at":row.get::<i64,_>(5)
                 })
             })
@@ -1069,7 +1070,7 @@ pub struct UpdateUser {
     #[serde(default)]
     role: Option<String>,
     #[serde(default)]
-    channel_access: Option<bool>,
+    provider_access: Option<bool>,
 }
 
 pub async fn update_user(
@@ -1081,8 +1082,8 @@ pub async fn update_user(
 ) -> Result<Json<Value>, AppError> {
     let admin = browser_identity(&state, &headers).await?;
     require_admin(&admin)?;
-    if input.role.is_none() && input.channel_access.is_none() {
-        return Err(AppError::bad_request("role or channel_access is required"));
+    if input.role.is_none() && input.provider_access.is_none() {
+        return Err(AppError::bad_request("role or provider_access is required"));
     }
     if let Some(role) = input.role {
         require_root(&admin)?;
@@ -1108,21 +1109,21 @@ pub async fn update_user(
         )
         .await?;
     }
-    if let Some(channel_access) = input.channel_access {
-        let result = sqlx::query("UPDATE users SET channel_access=? WHERE id=? AND role='user'")
-            .bind(channel_access)
+    if let Some(provider_access) = input.provider_access {
+        let result = sqlx::query("UPDATE users SET provider_access=? WHERE id=? AND role='user'")
+            .bind(provider_access)
             .bind(&id)
             .execute(&state.db)
             .await?;
         if result.rows_affected() == 0 {
             return Err(AppError::bad_request(
-                "channel access only applies to tenant users",
+                "provider access only applies to tenant users",
             ));
         }
         write_admin_audit(
             &state,
             &admin.id,
-            "user.channel_access.update",
+            "user.provider_access.update",
             Some(&id),
             &peer.ip().to_string(),
         )
@@ -1186,7 +1187,7 @@ mod tests {
         )
     }
 
-    fn channel_access_token(account_id: &str) -> String {
+    fn provider_access_token(account_id: &str) -> String {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
         let payload = URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(&json!({
@@ -1198,7 +1199,7 @@ mod tests {
         format!("{header}.{payload}.signature")
     }
 
-    async fn channel_request(
+    async fn provider_request(
         state: &AppState,
         method: Method,
         path: &str,
@@ -1283,10 +1284,10 @@ mod tests {
                 .execute(&state.db)
                 .await
                 .unwrap();
-            sqlx::query("INSERT INTO api_keys(id,user_id,name,prefix,secret_hash,created_at) VALUES(?,?,?,? ,?,?)")
+            sqlx::query("INSERT INTO consumers(id,user_id,name,prefix,secret_hash,created_at) VALUES(?,?,?,? ,?,?)")
                 .bind(format!("key-{user}")).bind(user).bind(user).bind(user)
                 .bind(format!("hash-{user}")).bind(now).execute(&state.db).await.unwrap();
-            sqlx::query("INSERT INTO api_calls(id,request_id,api_key_id,user_id,method,path,status,latency_ms,created_at) VALUES(?,?,?,?, 'POST','/v1/responses',200,1,?)")
+            sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,method,path,status,latency_ms,created_at) VALUES(?,?,?,?, 'POST','/v1/responses',200,1,?)")
                 .bind(format!("call-{user}")).bind("shared-client-request-id").bind(format!("key-{user}"))
                 .bind(user).bind(now).execute(&state.db).await.unwrap();
         }
@@ -1327,7 +1328,7 @@ mod tests {
             .unwrap();
         }
         for (id, user_id) in [("key-a", "tenant-a"), ("key-b", "tenant-b")] {
-            sqlx::query("INSERT INTO api_keys(id,user_id,name,prefix,secret_hash,created_at) VALUES(?,?,?,? ,?,?)")
+            sqlx::query("INSERT INTO consumers(id,user_id,name,prefix,secret_hash,created_at) VALUES(?,?,?,? ,?,?)")
                 .bind(id)
                 .bind(user_id)
                 .bind(id)
@@ -1338,7 +1339,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        for (id, key_id, user_id, model, input, cached, output, created_at) in [
+        for (id, consumer_id, user_id, model, input, cached, output, created_at) in [
             ("a-1", "key-a", "tenant-a", "gpt-5", 10, 3, 4, now - 60),
             ("a-2", "key-a", "tenant-a", "gpt-5", 6, 2, 8, now - 120),
             ("b-1", "key-b", "tenant-b", "gpt-4.1", 5, 1, 2, now - 60),
@@ -1353,10 +1354,10 @@ mod tests {
                 now - 8 * 24 * 60 * 60,
             ),
         ] {
-            sqlx::query("INSERT INTO api_calls(id,request_id,api_key_id,user_id,method,path,model,status,latency_ms,input_tokens,cached_tokens,output_tokens,created_at) VALUES(?,?,?,?,'POST','/v1/responses',?,200,1,?,?,?,?)")
+            sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,method,path,model,status,latency_ms,input_tokens,cached_tokens,output_tokens,created_at) VALUES(?,?,?,?,'POST','/v1/responses',?,200,1,?,?,?,?)")
                 .bind(id)
                 .bind(id)
-                .bind(key_id)
+                .bind(consumer_id)
                 .bind(user_id)
                 .bind(model)
                 .bind(input)
@@ -1412,13 +1413,13 @@ mod tests {
             .execute(&state.db)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO api_keys(id,user_id,name,prefix,secret_hash,created_at) VALUES('key','tenant','key','sk-utc','hash-utc',?)")
+        sqlx::query("INSERT INTO consumers(id,user_id,name,prefix,secret_hash,created_at) VALUES('key','tenant','key','sk-utc','hash-utc',?)")
             .bind(midnight_utc)
             .execute(&state.db)
             .await
             .unwrap();
         for (id, created_at) in [("before", midnight_utc - 1), ("after", midnight_utc)] {
-            sqlx::query("INSERT INTO api_calls(id,request_id,api_key_id,user_id,method,path,status,latency_ms,created_at) VALUES(?,?, 'key','tenant','POST','/v1/responses',200,1,?)")
+            sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,method,path,status,latency_ms,created_at) VALUES(?,?, 'key','tenant','POST','/v1/responses',200,1,?)")
                 .bind(id)
                 .bind(id)
                 .bind(created_at)
@@ -1449,8 +1450,8 @@ mod tests {
         write_admin_audit(
             &state,
             "admin",
-            "channel.create",
-            Some("channel-1"),
+            "provider.create",
+            Some("provider-1"),
             "127.0.0.1",
         )
         .await
@@ -1459,40 +1460,40 @@ mod tests {
             .fetch_one(&state.db)
             .await
             .unwrap();
-        assert_eq!(row, ("channel.create".to_owned(), "127.0.0.1".to_owned()));
+        assert_eq!(row, ("provider.create".to_owned(), "127.0.0.1".to_owned()));
     }
 
     #[tokio::test]
-    async fn channel_tokens_are_stored_and_replaced_as_plaintext() {
+    async fn provider_tokens_are_stored_and_replaced_as_plaintext() {
         let state = crate::test_state("http://token.invalid").await;
-        let access = channel_access_token("account-old");
-        let _ = insert_channel(&state, "channel", &access, "refresh-old", None)
+        let access = provider_access_token("account-old");
+        let _ = insert_provider(&state, "provider", &access, "refresh-old", None)
             .await
             .unwrap();
-        let id: String = sqlx::query_scalar("SELECT id FROM channels")
+        let id: String = sqlx::query_scalar("SELECT id FROM providers")
             .fetch_one(&state.db)
             .await
             .unwrap();
         let stored: (String, String) =
-            sqlx::query_as("SELECT access_token,refresh_token FROM channels WHERE id=?")
+            sqlx::query_as("SELECT access_token,refresh_token FROM providers WHERE id=?")
                 .bind(&id)
                 .fetch_one(&state.db)
                 .await
                 .unwrap();
         assert_eq!(stored, (access, "refresh-old".to_owned()));
 
-        let replacement = channel_access_token("account-new");
-        let _ = replace_channel_token_values(
+        let replacement = provider_access_token("account-new");
+        let _ = replace_provider_token_values(
             &state,
             &id,
-            "channel renamed",
+            "provider renamed",
             &replacement,
             "refresh-new",
         )
         .await
         .unwrap();
         let updated: (String, String, String, String) = sqlx::query_as(
-            "SELECT name,access_token,refresh_token,account_id FROM channels WHERE id=?",
+            "SELECT name,access_token,refresh_token,account_id FROM providers WHERE id=?",
         )
         .bind(&id)
         .fetch_one(&state.db)
@@ -1501,7 +1502,7 @@ mod tests {
         assert_eq!(
             updated,
             (
-                "channel renamed".to_owned(),
+                "provider renamed".to_owned(),
                 replacement,
                 "refresh-new".to_owned(),
                 "account-new".to_owned()
@@ -1510,7 +1511,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn channel_test_calls_usage_with_server_side_credentials() {
+    async fn provider_test_calls_usage_with_server_side_credentials() {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         let usage = Router::new().route(
             "/backend-api/wham/usage",
@@ -1534,10 +1535,10 @@ mod tests {
         )
         .await;
         let now = chrono::Utc::now().timestamp();
-        sqlx::query("INSERT INTO channels(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES('channel','Channel','account','access','refresh',?,?)")
+        sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES('provider','Provider','account','access','refresh',?,?)")
             .bind(now).bind(now).execute(&state.db).await.unwrap();
 
-        let result = channel_usage(&state, "channel").await.unwrap();
+        let result = provider_usage(&state, "provider").await.unwrap();
         assert_eq!(result.0["usage"]["plan_type"], "team");
         assert_eq!(
             result.0["usage"]["rate_limit"]["primary_window"]["used_percent"],
@@ -1549,7 +1550,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn channel_routes_enforce_roles_audit_actions_and_preserve_call_history() {
+    async fn provider_routes_enforce_roles_audit_actions_and_preserve_call_history() {
         let signing = SigningKey::from_bytes(&[31_u8; 32]);
         let x = URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes());
         let external = Router::new()
@@ -1593,11 +1594,11 @@ mod tests {
                 .await
                 .unwrap();
         }
-        sqlx::query("INSERT INTO api_keys(id,user_id,name,prefix,secret_hash,created_at) VALUES('history-key','root-user','history','sk-history','hash-history',?)")
+        sqlx::query("INSERT INTO consumers(id,user_id,name,prefix,secret_hash,created_at) VALUES('history-key','root-user','history','sk-history','hash-history',?)")
             .bind(now).execute(&state.db).await.unwrap();
 
         let admin_browser_token = setup_token(&signing, &issuer, "admin-user");
-        let users = channel_request(
+        let users = provider_request(
             &state,
             Method::GET,
             "/api/users",
@@ -1614,40 +1615,40 @@ mod tests {
                 .unwrap()
                 .iter()
                 .find(|user| user["id"] == "tenant-user")
-                .and_then(|user| user["channel_access"].as_bool()),
+                .and_then(|user| user["provider_access"].as_bool()),
             Some(false)
         );
-        let grant = channel_request(
+        let grant = provider_request(
             &state,
             Method::PATCH,
             "/api/users/tenant-user",
             &admin_browser_token,
-            Some(json!({"channel_access":true})),
+            Some(json!({"provider_access":true})),
         )
         .await;
         assert_eq!(grant.status(), StatusCode::OK);
         let granted: i64 =
-            sqlx::query_scalar("SELECT channel_access FROM users WHERE id='tenant-user'")
+            sqlx::query_scalar("SELECT provider_access FROM users WHERE id='tenant-user'")
                 .fetch_one(&state.db)
                 .await
                 .unwrap();
         assert_eq!(granted, 1);
 
         for user_id in ["root-user", "admin-user"] {
-            let channel_id = format!("channel-{user_id}");
+            let provider_id = format!("provider-{user_id}");
             let call_id = format!("call-{user_id}");
-            let access = channel_access_token(&format!("account-{user_id}"));
-            sqlx::query("INSERT INTO channels(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
-                .bind(&channel_id).bind(user_id).bind(format!("account-{user_id}"))
+            let access = provider_access_token(&format!("account-{user_id}"));
+            sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
+                .bind(&provider_id).bind(user_id).bind(format!("account-{user_id}"))
                 .bind(access).bind("refresh").bind(now).bind(now).execute(&state.db).await.unwrap();
-            sqlx::query("INSERT INTO api_calls(id,request_id,api_key_id,user_id,channel_id,method,path,status,latency_ms,created_at) VALUES(?,?,'history-key','root-user',?,'POST','/v1/responses',200,1,?)")
-                .bind(&call_id).bind(&call_id).bind(&channel_id).bind(now).execute(&state.db).await.unwrap();
+            sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,provider_id,method,path,status,latency_ms,created_at) VALUES(?,?,'history-key','root-user',?,'POST','/v1/responses',200,1,?)")
+                .bind(&call_id).bind(&call_id).bind(&provider_id).bind(now).execute(&state.db).await.unwrap();
             let browser_token = setup_token(&signing, &issuer, user_id);
 
-            let read = channel_request(
+            let read = provider_request(
                 &state,
                 Method::GET,
-                &format!("/api/channels/{channel_id}"),
+                &format!("/api/providers/{provider_id}"),
                 &browser_token,
                 None,
             )
@@ -1657,11 +1658,11 @@ mod tests {
             let read_body = read.into_body().collect().await.unwrap().to_bytes();
             assert!(std::str::from_utf8(&read_body).unwrap().contains("refresh"));
 
-            let replacement = channel_access_token(&format!("replacement-{user_id}"));
-            let update = channel_request(
+            let replacement = provider_access_token(&format!("replacement-{user_id}"));
+            let update = provider_request(
                 &state,
                 Method::PUT,
-                &format!("/api/channels/{channel_id}"),
+                &format!("/api/providers/{provider_id}"),
                 &browser_token,
                 Some(
                     json!({"name":"renamed","access_key":replacement,"refresh_key":"refresh-new"}),
@@ -1690,7 +1691,7 @@ mod tests {
                 .await
                 .unwrap();
             let previous_id = format!("previous-{user_id}");
-            sqlx::query("INSERT INTO api_calls(id,request_id,api_key_id,user_id,affinity_hash,affinity_source,method,path,status,latency_ms,created_at) VALUES(?,?, 'history-key','root-user',?,'previous_response_id','POST','/v1/responses',200,1,?)")
+            sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,affinity_hash,affinity_source,method,path,status,latency_ms,created_at) VALUES(?,?, 'history-key','root-user',?,'previous_response_id','POST','/v1/responses',200,1,?)")
                 .bind(&previous_id)
                 .bind(format!("previous-request-{user_id}"))
                 .bind(&affinity_hash)
@@ -1699,7 +1700,7 @@ mod tests {
                 .await
                 .unwrap();
             let audit =
-                channel_request(&state, Method::GET, "/api/audit", &browser_token, None).await;
+                provider_request(&state, Method::GET, "/api/audit", &browser_token, None).await;
             assert_eq!(audit.status(), StatusCode::OK);
             let audits: Value =
                 serde_json::from_slice(&audit.into_body().collect().await.unwrap().to_bytes())
@@ -1710,7 +1711,7 @@ mod tests {
                     .unwrap()
                     .iter()
                     .find(|audit| audit["id"] == call_id)
-                    .and_then(|audit| audit["channel_name"].as_str()),
+                    .and_then(|audit| audit["provider_name"].as_str()),
                 Some("renamed")
             );
             assert_eq!(
@@ -1719,10 +1720,10 @@ mod tests {
                     .unwrap()
                     .iter()
                     .find(|audit| audit["id"] == call_id)
-                    .and_then(|audit| audit["key_name"].as_str()),
+                    .and_then(|audit| audit["consumer_name"].as_str()),
                 Some("history")
             );
-            let detail = channel_request(
+            let detail = provider_request(
                 &state,
                 Method::GET,
                 &format!("/api/audit/{call_id}"),
@@ -1737,21 +1738,21 @@ mod tests {
             assert_eq!(detail["archive_available"], true);
             assert_eq!(detail["request_body"], json!(r#"{"input":"audit detail"}"#));
             assert_eq!(detail["response_body"], json!(r#"{"output":"diagnostic"}"#));
-            assert_eq!(detail["key_name"], "history");
+            assert_eq!(detail["consumer_name"], "history");
             assert_eq!(detail["previous"]["id"], previous_id);
-            let test = channel_request(
+            let test = provider_request(
                 &state,
                 Method::POST,
-                &format!("/api/channels/{channel_id}/test"),
+                &format!("/api/providers/{provider_id}/test"),
                 &browser_token,
                 None,
             )
             .await;
             assert_eq!(test.status(), StatusCode::OK);
-            let usage_list = channel_request(
+            let usage_list = provider_request(
                 &state,
                 Method::GET,
-                "/api/channels/usage",
+                "/api/providers/usage",
                 &browser_token,
                 None,
             )
@@ -1760,39 +1761,39 @@ mod tests {
             let usage_body = usage_list.into_body().collect().await.unwrap().to_bytes();
             let usage_value: Value = serde_json::from_slice(&usage_body).unwrap();
             assert_eq!(
-                usage_value.pointer(&format!("/channels/{channel_id}/usage/plan_type")),
+                usage_value.pointer(&format!("/providers/{provider_id}/usage/plan_type")),
                 Some(&json!("team"))
             );
             assert_eq!(
-                usage_value.pointer(&format!("/channels/{channel_id}/usage/email")),
+                usage_value.pointer(&format!("/providers/{provider_id}/usage/email")),
                 Some(&json!("ops@example.com"))
             );
-            let delete = channel_request(
+            let delete = provider_request(
                 &state,
                 Method::DELETE,
-                &format!("/api/channels/{channel_id}"),
+                &format!("/api/providers/{provider_id}"),
                 &browser_token,
                 None,
             )
             .await;
             assert_eq!(delete.status(), StatusCode::OK);
-            let historical_channel: Option<String> =
-                sqlx::query_scalar("SELECT channel_id FROM api_calls WHERE id=?")
+            let historical_provider: Option<String> =
+                sqlx::query_scalar("SELECT provider_id FROM api_calls WHERE id=?")
                     .bind(call_id)
                     .fetch_one(&state.db)
                     .await
                     .unwrap();
-            assert_eq!(historical_channel, None);
+            assert_eq!(historical_provider, None);
         }
 
-        sqlx::query("INSERT INTO channels(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES('tenant-channel','tenant','tenant','access','refresh',?,?)")
+        sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES('tenant-provider','tenant','tenant','access','refresh',?,?)")
             .bind(now).bind(now).execute(&state.db).await.unwrap();
         let tenant_token = setup_token(&signing, &issuer, "tenant-user");
-        sqlx::query("INSERT INTO api_keys(id,user_id,name,prefix,secret_hash,created_at) VALUES('tenant-audit-key','tenant-user','tenant audit','sk-tenant-audit','tenant-audit-hash',?)")
+        sqlx::query("INSERT INTO consumers(id,user_id,name,prefix,secret_hash,created_at) VALUES('tenant-audit-key','tenant-user','tenant audit','sk-tenant-audit','tenant-audit-hash',?)")
             .bind(now).execute(&state.db).await.unwrap();
-        sqlx::query("INSERT INTO api_calls(id,request_id,api_key_id,user_id,method,path,status,latency_ms,created_at) VALUES('tenant-audit-call','tenant-audit-request','tenant-audit-key','tenant-user','POST','/v1/responses',200,1,?)")
+        sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,method,path,status,latency_ms,created_at) VALUES('tenant-audit-call','tenant-audit-request','tenant-audit-key','tenant-user','POST','/v1/responses',200,1,?)")
             .bind(now).execute(&state.db).await.unwrap();
-        let tenant_detail = channel_request(
+        let tenant_detail = provider_request(
             &state,
             Method::GET,
             "/api/audit/tenant-audit-call",
@@ -1801,7 +1802,7 @@ mod tests {
         )
         .await;
         assert_eq!(tenant_detail.status(), StatusCode::OK);
-        let foreign_detail = channel_request(
+        let foreign_detail = provider_request(
             &state,
             Method::GET,
             "/api/audit/call-root-user",
@@ -1811,29 +1812,29 @@ mod tests {
         .await;
         assert_eq!(foreign_detail.status(), StatusCode::NOT_FOUND);
         for (method, path, body) in [
-            (Method::GET, "/api/channels/usage", None),
-            (Method::GET, "/api/channels/tenant-channel", None),
+            (Method::GET, "/api/providers/usage", None),
+            (Method::GET, "/api/providers/tenant-provider", None),
             (
                 Method::PUT,
-                "/api/channels/tenant-channel",
+                "/api/providers/tenant-provider",
                 Some(
-                    json!({"name":"tenant","access_key":channel_access_token("tenant"),"refresh_key":"refresh"}),
+                    json!({"name":"tenant","access_key":provider_access_token("tenant"),"refresh_key":"refresh"}),
                 ),
             ),
-            (Method::POST, "/api/channels/tenant-channel/test", None),
-            (Method::DELETE, "/api/channels/tenant-channel", None),
+            (Method::POST, "/api/providers/tenant-provider/test", None),
+            (Method::DELETE, "/api/providers/tenant-provider", None),
         ] {
-            let response = channel_request(&state, method, path, &tenant_token, body).await;
+            let response = provider_request(&state, method, path, &tenant_token, body).await;
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
         }
 
-        sqlx::query("INSERT INTO channels(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES('denied-channel','denied','denied','denied','refresh',?,?)")
+        sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES('denied-provider','denied','denied','denied','refresh',?,?)")
             .bind(now).bind(now).execute(&state.db).await.unwrap();
         let admin_token = setup_token(&signing, &issuer, "admin-user");
-        let denied = channel_request(
+        let denied = provider_request(
             &state,
             Method::POST,
-            "/api/channels/denied-channel/test",
+            "/api/providers/denied-provider/test",
             &admin_token,
             None,
         )
@@ -1841,11 +1842,11 @@ mod tests {
         assert_eq!(denied.status(), StatusCode::BAD_GATEWAY);
 
         for (action, expected) in [
-            ("channel.tokens.read", 2_i64),
-            ("channel.tokens.update", 2),
-            ("channel.test", 2),
-            ("channel.delete", 2),
-            ("channel.test.failed", 1),
+            ("provider.tokens.read", 2_i64),
+            ("provider.tokens.update", 2),
+            ("provider.test", 2),
+            ("provider.delete", 2),
+            ("provider.test.failed", 1),
         ] {
             let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_audit WHERE action=?")
                 .bind(action)
@@ -1857,7 +1858,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn channel_usage_maps_invalid_json_to_bad_gateway() {
+    async fn provider_usage_maps_invalid_json_to_bad_gateway() {
         let invalid = Router::new().route(
             "/backend-api/wham/usage",
             get(|| async { (StatusCode::OK, "not-json") }),
@@ -1871,15 +1872,15 @@ mod tests {
         )
         .await;
         let now = chrono::Utc::now().timestamp();
-        sqlx::query("INSERT INTO channels(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES('invalid','invalid','account','access','refresh',?,?)")
+        sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES('invalid','invalid','account','access','refresh',?,?)")
             .bind(now).bind(now).execute(&state.db).await.unwrap();
-        let error = channel_usage(&state, "invalid").await.unwrap_err();
+        let error = provider_usage(&state, "invalid").await.unwrap_err();
         assert_eq!(error.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(error.message(), "channel Usage API returned invalid JSON");
+        assert_eq!(error.message(), "provider Usage API returned invalid JSON");
     }
 
     #[tokio::test]
-    async fn channel_usage_maps_network_failure_to_bad_gateway() {
+    async fn provider_usage_maps_network_failure_to_bad_gateway() {
         let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = unavailable.local_addr().unwrap();
         drop(unavailable);
@@ -1889,10 +1890,10 @@ mod tests {
         )
         .await;
         let now = chrono::Utc::now().timestamp();
-        sqlx::query("INSERT INTO channels(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES('offline','offline','account','access','refresh',?,?)")
+        sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES('offline','offline','account','access','refresh',?,?)")
             .bind(now).bind(now).execute(&state.db).await.unwrap();
-        let error = channel_usage(&state, "offline").await.unwrap_err();
+        let error = provider_usage(&state, "offline").await.unwrap_err();
         assert_eq!(error.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(error.message(), "channel Usage API request failed");
+        assert_eq!(error.message(), "provider Usage API request failed");
     }
 }

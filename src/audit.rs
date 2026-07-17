@@ -21,9 +21,9 @@ pub(crate) fn write_retries() -> usize {
 pub struct AuditEvent {
     pub id: String,
     pub request_id: String,
-    pub api_key_id: String,
+    pub consumer_id: String,
     pub user_id: String,
-    pub channel_id: Option<String>,
+    pub provider_id: Option<String>,
     pub affinity_hash: Option<String>,
     pub affinity_source: Option<String>,
     pub method: String,
@@ -93,13 +93,13 @@ async fn persist(pool: &SqlitePool, batch: &[AuditEvent]) -> Result<(), sqlx::Er
     let mut touched_keys = std::collections::HashSet::new();
     for event in batch {
         insert(&mut transaction, event).await?;
-        touched_keys.insert(event.api_key_id.as_str());
+        touched_keys.insert(event.consumer_id.as_str());
     }
     let used_at = chrono::Utc::now().timestamp();
-    for key_id in touched_keys {
-        sqlx::query("UPDATE api_keys SET last_used_at=? WHERE id=?")
+    for consumer_id in touched_keys {
+        sqlx::query("UPDATE consumers SET last_used_at=? WHERE id=?")
             .bind(used_at)
-            .bind(key_id)
+            .bind(consumer_id)
             .execute(&mut *transaction)
             .await?;
     }
@@ -110,12 +110,12 @@ async fn insert(
     transaction: &mut Transaction<'_, Sqlite>,
     event: &AuditEvent,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO api_calls(id,request_id,api_key_id,user_id,channel_id,affinity_hash,affinity_source,method,path,model,status,latency_ms,input_tokens,output_tokens,cached_tokens,error,client_ip,created_at) VALUES(?,?,?,?,(SELECT id FROM channels WHERE id=?),?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,provider_id,affinity_hash,affinity_source,method,path,model,status,latency_ms,input_tokens,output_tokens,cached_tokens,error,client_ip,created_at) VALUES(?,?,?,?,(SELECT id FROM providers WHERE id=?),?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(&event.id)
         .bind(&event.request_id)
-        .bind(&event.api_key_id)
+        .bind(&event.consumer_id)
         .bind(&event.user_id)
-        .bind(&event.channel_id)
+        .bind(&event.provider_id)
         .bind(&event.affinity_hash)
         .bind(&event.affinity_source)
         .bind(&event.method)
@@ -187,12 +187,12 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO api_keys(id,user_id,name,prefix,secret_hash,created_at) VALUES('key','user','key','sk-test','hash',0)")
+        sqlx::query("INSERT INTO consumers(id,user_id,name,prefix,secret_hash,created_at) VALUES('key','user','key','sk-test','hash',0)")
             .execute(&pool)
             .await
             .unwrap();
         for (id, created_at) in [("expired", 0_i64), ("retained", 200_000_i64)] {
-            sqlx::query("INSERT INTO api_calls(id,request_id,api_key_id,user_id,method,path,status,latency_ms,created_at) VALUES(?,?, 'key','user','POST','/v1/responses',200,1,?)")
+            sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,method,path,status,latency_ms,created_at) VALUES(?,?, 'key','user','POST','/v1/responses',200,1,?)")
                 .bind(id)
                 .bind(id)
                 .bind(created_at)

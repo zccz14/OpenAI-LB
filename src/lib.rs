@@ -84,21 +84,24 @@ pub fn router(state: AppState) -> Router {
         .route("/api/config", get(api::public_config))
         .route("/api/setup", get(api::setup_status).post(api::setup))
         .route("/api/me", get(api::me))
-        .route("/api/keys", get(api::list_keys).post(api::create_key))
-        .route("/api/keys/{id}", delete(api::revoke_key))
         .route(
-            "/api/channels",
-            get(api::list_channels).post(api::create_channel),
+            "/api/consumers",
+            get(api::list_consumers).post(api::create_consumer),
         )
-        .route("/api/channels/usage", get(api::list_channel_usage))
+        .route("/api/consumers/{id}", delete(api::revoke_consumer))
         .route(
-            "/api/channels/{id}",
-            get(api::read_channel_tokens)
-                .put(api::replace_channel_tokens)
-                .patch(api::update_channel)
-                .delete(api::delete_channel),
+            "/api/providers",
+            get(api::list_providers).post(api::create_provider),
         )
-        .route("/api/channels/{id}/test", post(api::test_channel))
+        .route("/api/providers/usage", get(api::list_provider_usage))
+        .route(
+            "/api/providers/{id}",
+            get(api::read_provider_tokens)
+                .put(api::replace_provider_tokens)
+                .patch(api::update_provider)
+                .delete(api::delete_provider),
+        )
+        .route("/api/providers/{id}/test", post(api::test_provider))
         .route("/api/oauth/start", post(api::oauth_start))
         .route("/api/oauth/complete", post(api::oauth_complete))
         .route("/api/usage", get(api::usage))

@@ -161,8 +161,8 @@ mod tests {
         assert_eq!(role, "admin");
         for table in [
             "users",
-            "api_keys",
-            "channels",
+            "consumers",
+            "providers",
             "affinities",
             "api_calls",
             "admin_audit",
@@ -180,7 +180,7 @@ mod tests {
                 .unwrap();
         assert_eq!(foreign_key_violations, 0);
         let tokens: (String, String) =
-            sqlx::query_as("SELECT access_token,refresh_token FROM channels WHERE id='channel'")
+            sqlx::query_as("SELECT access_token,refresh_token FROM providers WHERE id='channel'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();

@@ -143,8 +143,8 @@ import {
 type Locale = "zh" | "en"
 type Page =
   | "dashboard"
-  | "channels"
-  | "keys"
+  | "providers"
+  | "consumers"
   | "usage"
   | "audit"
   | "request-detail"
@@ -158,11 +158,11 @@ type ManagedUser = {
   email?: string
   display_name?: string
   role: Role
-  channel_access: boolean
+  provider_access: boolean
   created_at: number
 }
 type PublicConfig = { setup_required: boolean; auth_issuer?: string }
-type Key = {
+type Consumer = {
   id: string
   name: string
   prefix: string
@@ -170,7 +170,7 @@ type Key = {
   last_used_at?: number
   revoked_at?: number
 }
-type Channel = {
+type Provider = {
   id: string
   name: string
   account_id: string
@@ -182,13 +182,13 @@ type Channel = {
   inflight: number
   updated_at: number
 }
-type ChannelTokens = { access_key: string; refresh_key: string }
+type ProviderTokens = { access_key: string; refresh_key: string }
 type UsageWindow = {
   used_percent?: number
   reset_at?: number
   reset_after_seconds?: number
 }
-type ChannelUsage = {
+type ProviderUsage = {
   email?: string
   account_email?: string
   account?: { email?: string }
@@ -197,18 +197,18 @@ type ChannelUsage = {
   credits?: { balance?: number | string | null; unlimited?: boolean }
   [key: string]: unknown
 }
-type ChannelUsageEntry = { usage?: ChannelUsage; error?: string }
-type ChannelUsageResponse = { channels: Record<string, ChannelUsageEntry> }
-type ChannelTokenDialogState = {
-  channel: Channel
+type ProviderUsageEntry = { usage?: ProviderUsage; error?: string }
+type ProviderUsageResponse = { providers: Record<string, ProviderUsageEntry> }
+type ProviderTokenDialogState = {
+  provider: Provider
   loading: boolean
-  tokens?: ChannelTokens
+  tokens?: ProviderTokens
   error?: string
 }
-type ChannelTestState = {
-  channel: Channel
+type ProviderTestState = {
+  provider: Provider
   status: "loading" | "success" | "error"
-  usage?: ChannelUsage
+  usage?: ProviderUsage
   error?: string
 }
 type UsagePeriod = "24h" | "7d"
@@ -216,9 +216,9 @@ type UsageRow = {
   user_id: string
   user_email?: string
   user_name?: string
-  key_id: string
-  key_name: string
-  key_prefix: string
+  consumer_id: string
+  consumer_name: string
+  consumer_prefix: string
   model: string
   date: string
   requests: number
@@ -241,9 +241,9 @@ type Audit = {
   id: string
   request_id: string
   user_id: string
-  key_name: string
-  channel_id?: string
-  channel_name?: string
+  consumer_name: string
+  provider_id?: string
+  provider_name?: string
   path: string
   model?: string
   status: number
@@ -297,8 +297,8 @@ type SettingsData = {
 const copy = {
   zh: {
     dashboard: "总览",
-    channels: "渠道",
-    keys: "API 密钥",
+    providers: "上游提供商",
+    consumers: "下游消费者",
     usage: "用量",
     audit: "审计",
     users: "用户",
@@ -316,26 +316,26 @@ const copy = {
       "邮箱验证码、Passkey 和 ED25519 登录均在 Auth Mini 页面完成；成功后会自动返回 OpenAI-LB。",
     continueAuthMini: "前往 Auth Mini 登录",
     loading: "正在加载 OpenAI-LB…",
-    pageDashboard: "查看渠道容量与当前租户的 24 小时运行摘要。",
-    pageChannels: "注册、刷新、停用并观察 CodeX OAuth 渠道。",
-    pageKeys: "创建和吊销租户调用凭据；密钥仅显示一次。",
-    pageUsage: "按 API Key 核算请求、Token、错误和延迟。",
-    pageAudit: "逐次追踪请求、渠道、结果与用量；诊断内容按配置期限保留。",
+    pageDashboard: "查看上游提供商容量与当前租户的 24 小时运行摘要。",
+    pageProviders: "注册、刷新、停用并观察 CodeX OAuth 上游提供商。",
+    pageConsumers: "按 AI App 隔离下游消费者，分别跟踪调用量并独立吊销凭据。",
+    pageUsage: "按 Consumer 核算请求、Token、错误和延迟。",
+    pageAudit: "逐次追踪请求、上游提供商、结果与用量；诊断内容按配置期限保留。",
     pageRequestDetail: "查看调用上下文、消息结构与同一亲和链的相邻请求。",
     pageUsers: "由 root 管理本地授权角色；用户身份仍由 Auth Mini 提供。",
     pageSettings: "确认身份边界、上游与部署限制。",
     operationalStatus: "运行状态",
-    operationalDescription: "当前租户与渠道池的可行动摘要",
-    availableChannels: "可用渠道",
-    activeKeys: "有效 API Key",
+    operationalDescription: "当前租户与上游提供商池的可行动摘要",
+    availableProviders: "可用上游提供商",
+    activeConsumers: "有效 Consumer",
     calls24h: "24 小时调用",
     errors24h: "24 小时错误",
-    channelPool: "OAuth 渠道池",
-    channelDescription:
+    providerPool: "OAuth 上游提供商池",
+    providerDescription:
       "Token 以明文保存在 SQLite；管理员读取与变更会进入操作审计。",
-    addChannel: "添加渠道",
-    noChannels: "尚无渠道",
-    noChannelsDescription:
+    addProvider: "添加上游提供商",
+    noProviders: "尚无上游提供商",
+    noProvidersDescription:
       "添加 access_key 与 refresh_key，或开始 PKCE OAuth。",
     name: "名称",
     account: "账户",
@@ -343,11 +343,11 @@ const copy = {
     recoveryReason: "恢复 / 原因",
     actions: "操作",
     refresh: "刷新",
-    channelUpdated: "渠道已更新",
-    channelAdded: "渠道已添加",
-    oauthChannelAdded: "OAuth 渠道已添加",
-    addChannelTitle: "添加 CodeX OAuth 渠道",
-    addChannelDescription:
+    providerUpdated: "上游提供商已更新",
+    providerAdded: "上游提供商已添加",
+    oauthProviderAdded: "OAuth 上游提供商已添加",
+    addProviderTitle: "添加 CodeX OAuth 上游提供商",
+    addProviderDescription:
       "直接导入凭据，或用 PKCE 授权后粘贴回调中的 code。Token 将以明文保存在 SQLite，并可由管理员再次读取和编辑。",
     accessClaimHelp: "必须是包含 CodeX account_id claim 的 JWT。",
     oauthCode: "OAuth code",
@@ -355,25 +355,25 @@ const copy = {
     startOauth: "开始 OAuth",
     completeOauth: "完成 OAuth",
     importCredentials: "导入凭据",
-    editChannel: "编辑",
-    tokenTitle: "编辑渠道",
+    editProvider: "编辑",
+    tokenTitle: "编辑上游提供商",
     tokenDescription:
-      "编辑渠道名称和 SQLite 明文存储的 Token。保存时三项会原子更新。",
+      "编辑上游提供商名称和 SQLite 明文存储的 Token。保存时三项会原子更新。",
     loadingTokens: "正在读取 Token…",
     saveTokens: "保存",
-    tokensSaved: "渠道已保存",
-    deleteChannel: "删除",
-    deleteChannelTitle: "删除 OAuth 渠道？",
-    deleteChannelDescription:
-      "此操作会永久删除该渠道及 Token；依赖该渠道的亲和记录也会一并删除。",
-    confirmDeleteChannel: "确认删除",
-    channelDeleted: "渠道已删除",
-    testChannel: "测试",
-    testingChannel: "正在获取渠道 Usage…",
-    testTitle: "渠道 Usage 测试",
+    tokensSaved: "上游提供商已保存",
+    deleteProvider: "删除",
+    deleteProviderTitle: "删除 OAuth 上游提供商？",
+    deleteProviderDescription:
+      "此操作会永久删除该上游提供商及 Token；依赖该上游提供商的亲和记录也会一并删除。",
+    confirmDeleteProvider: "确认删除",
+    providerDeleted: "上游提供商已删除",
+    testProvider: "测试",
+    testingProvider: "正在获取上游提供商 Usage…",
+    testTitle: "上游提供商 Usage 测试",
     testDescription:
-      "服务端使用该渠道 OAuth Token 调用 Usage API，Token 不会随测试结果返回浏览器。",
-    testSucceeded: "渠道测试成功",
+      "服务端使用该上游提供商 OAuth Token 调用 Usage API，Token 不会随测试结果返回浏览器。",
+    testSucceeded: "上游提供商测试成功",
     usageEmail: "邮箱",
     usagePlan: "套餐",
     quotaRemaining: "剩余额度",
@@ -382,28 +382,30 @@ const copy = {
     credits: "Credits",
     rawUsage: "Usage 原始字段",
     usageUnavailable: "Usage API 未返回可识别的额度字段，请查看原始字段。",
-    tenantKeys: "租户 API Key",
-    keysDescription: "Key 只在创建后显示一次，服务器仅保存 SHA-256 哈希。",
+    consumersTitle: "租户 Consumer",
+    consumersDescription:
+      "每个 AI App 建议使用一个独立 Consumer；这样用量、错误和吊销都能按 App 隔离。Consumer 凭据只在创建后显示一次。",
     create: "创建",
-    noKeys: "尚无 API Key",
-    noKeysDescription: "创建第一个 Key 后即可调用代理。",
+    noConsumers: "尚无 Consumer",
+    noConsumersDescription: "为每个 AI App 创建一个独立 Consumer，再开始调用代理。",
     prefix: "前缀",
     createdAt: "创建时间",
     lastUsed: "最近使用",
     revoked: "已吊销",
     active: "有效",
     revoke: "吊销",
-    revokeTitle: "吊销 API Key？",
-    revokeDescription: "此操作不可撤销；使用该 Key 的所有调用将立即失败。",
+    revokeTitle: "吊销 Consumer？",
+    revokeDescription: "此操作不可撤销；使用该 Consumer 的所有调用将立即失败。",
     cancel: "取消",
     confirmRevoke: "确认吊销",
-    keyNameHelp: "为环境或应用使用可辨识名称，便于按 Key 统计和吊销。",
-    saveKeyTitle: "立即保存 API Key",
-    saveKeyDescription:
+    consumerAppHelp:
+      "请为每个 AI App 单独创建一个 Consumer，并用 App 名称命名，便于隔离用量、排障和吊销。",
+    saveConsumerTitle: "立即保存 Consumer",
+    saveConsumerDescription:
       "关闭后无法再次查看。不要将它写入浏览器代码、日志或聊天记录。",
-    savedKey: "我已安全保存",
+    savedConsumer: "我已安全保存",
     copied: "已复制",
-    keyRevoked: "API Key 已吊销",
+    consumerRevoked: "Consumer 已吊销",
     usageTitle: "用量透视",
     usageDescription:
       "按用户、脱敏 API Token、模型和日期交叉汇总请求 Token；调整行、列和聚合数据以定位用量。",
@@ -415,10 +417,10 @@ const copy = {
     last24Hours: "最近 24 小时",
     last7Days: "最近 7 天",
     allUsers: "全部用户",
-    allApiKeys: "全部 API Token",
+    allConsumers: "全部 Consumer",
     allModels: "全部模型",
     model: "模型",
-    apiToken: "API Token",
+    consumerLabel: "Consumer",
     date: "日期",
     rows: "行",
     columns: "列",
@@ -441,7 +443,7 @@ const copy = {
     noAuditDescription: "每次代理调用结束后都会写入基础审计记录。",
     time: "时间",
     requestId: "请求 ID",
-    channel: "渠道",
+    provider: "上游提供商",
     endpointModel: "接口 / 模型",
     latency: "延迟",
     cachedInput: "缓存输入",
@@ -476,7 +478,7 @@ const copy = {
     inflight: "处理中",
     accessKey: "Access key",
     refreshKey: "Refresh key",
-    apiKey: "API Key",
+    consumer: "Consumer",
     input: "输入",
     output: "输出",
     userId: "用户 ID",
@@ -496,7 +498,7 @@ const copy = {
     loginUnknown: "认证失败，请重试。",
     adminAuditTitle: "管理员操作审计",
     adminAuditDescription:
-      "记录渠道与 OAuth 管理操作、失败尝试、来源 IP 和目标。",
+      "记录上游提供商与 OAuth 管理操作、失败尝试、来源 IP 和目标。",
     administrator: "管理员",
     action: "操作",
     target: "目标",
@@ -522,15 +524,15 @@ const copy = {
     setupAuthenticated: "身份已验证",
     setupSecurity:
       "Setup 完成后初始化入口会立即关闭；后续登录用户默认为 user。",
-    usersTitle: "用户与渠道权限",
+    usersTitle: "用户与上游提供商权限",
     usersDescription:
-      "新租户用户默认不能使用渠道；管理员可单独授权。管理员和 root 始终允许使用渠道。",
+      "新租户用户默认不能使用上游提供商；管理员可单独授权。管理员和 root 始终允许使用上游提供商。",
     noUsers: "暂无用户",
     noUsersDescription: "用户首次通过 Auth Mini 登录后会自动出现在这里。",
     displayName: "显示名称",
     roleUpdated: "用户角色已更新",
-    channelAccess: "渠道访问",
-    channelAccessUpdated: "渠道访问权限已更新",
+    providerAccess: "上游提供商访问",
+    providerAccessUpdated: "上游提供商访问权限已更新",
     alwaysAllowed: "管理员始终允许",
     runtimeSettings: "运行配置",
     runtimeSettingsDescription:
@@ -548,8 +550,8 @@ const copy = {
   },
   en: {
     dashboard: "Overview",
-    channels: "Channels",
-    keys: "API keys",
+    providers: "Providers",
+    consumers: "Consumers",
     usage: "Usage",
     audit: "Audit",
     users: "Users",
@@ -568,14 +570,15 @@ const copy = {
     continueAuthMini: "Continue to Auth Mini",
     loading: "Loading OpenAI-LB…",
     pageDashboard:
-      "Review channel capacity and the tenant's 24-hour operating summary.",
-    pageChannels:
-      "Register, refresh, disable, and observe CodeX OAuth channels.",
-    pageKeys: "Create and revoke tenant credentials; secrets are shown once.",
+      "Review provider capacity and the tenant's 24-hour operating summary.",
+    pageProviders:
+      "Register, refresh, disable, and observe CodeX OAuth providers.",
+    pageConsumers:
+      "Give each AI app its own downstream Consumer so usage, errors, and revocation stay isolated.",
     pageUsage:
-      "Attribute requests, tokens, errors, and latency to each API key.",
+      "Attribute requests, tokens, errors, and latency to each Consumer.",
     pageAudit:
-      "Trace each request, channel, result, and usage; diagnostic content follows the configured retention.",
+      "Trace each request, provider, result, and usage; diagnostic content follows the configured retention.",
     pageRequestDetail:
       "Review call context, message structure, and adjacent requests in the same affinity chain.",
     pageUsers:
@@ -583,17 +586,17 @@ const copy = {
     pageSettings:
       "Confirm identity boundaries, upstream, and deployment limits.",
     operationalStatus: "Operational status",
-    operationalDescription: "Actionable tenant and channel-pool summary",
-    availableChannels: "Available channels",
-    activeKeys: "Active API keys",
+    operationalDescription: "Actionable tenant and provider-pool summary",
+    availableProviders: "Available providers",
+    activeConsumers: "Active Consumers",
     calls24h: "Calls in 24h",
     errors24h: "Errors in 24h",
-    channelPool: "OAuth channel pool",
-    channelDescription:
+    providerPool: "OAuth provider pool",
+    providerDescription:
       "Tokens are stored as plaintext in SQLite; administrator reads and changes are audited.",
-    addChannel: "Add channel",
-    noChannels: "No channels",
-    noChannelsDescription:
+    addProvider: "Add provider",
+    noProviders: "No providers",
+    noProvidersDescription:
       "Add access_key and refresh_key, or start PKCE OAuth.",
     name: "Name",
     account: "Account",
@@ -601,11 +604,11 @@ const copy = {
     recoveryReason: "Recovery / reason",
     actions: "Actions",
     refresh: "Refresh",
-    channelUpdated: "Channel updated",
-    channelAdded: "Channel added",
-    oauthChannelAdded: "OAuth channel added",
-    addChannelTitle: "Add CodeX OAuth channel",
-    addChannelDescription:
+    providerUpdated: "Provider updated",
+    providerAdded: "Provider added",
+    oauthProviderAdded: "OAuth provider added",
+    addProviderTitle: "Add CodeX OAuth provider",
+    addProviderDescription:
       "Import credentials directly, or authorize with PKCE and paste the callback code. Tokens are stored as plaintext in SQLite and can be read and edited by administrators.",
     accessClaimHelp: "Must be a JWT containing the CodeX account_id claim.",
     oauthCode: "OAuth code",
@@ -614,25 +617,25 @@ const copy = {
     startOauth: "Start OAuth",
     completeOauth: "Complete OAuth",
     importCredentials: "Import credentials",
-    editChannel: "Edit",
-    tokenTitle: "Edit channel",
+    editProvider: "Edit",
+    tokenTitle: "Edit provider",
     tokenDescription:
-      "Edit the channel name and plaintext SQLite Tokens. Saving updates all three atomically.",
+      "Edit the provider name and plaintext SQLite Tokens. Saving updates all three atomically.",
     loadingTokens: "Loading Tokens…",
     saveTokens: "Save",
-    tokensSaved: "Channel saved",
-    deleteChannel: "Delete",
-    deleteChannelTitle: "Delete OAuth channel?",
-    deleteChannelDescription:
-      "This permanently deletes the channel and its Tokens. Affinity records that depend on it are deleted too.",
-    confirmDeleteChannel: "Delete channel",
-    channelDeleted: "Channel deleted",
-    testChannel: "Test",
-    testingChannel: "Fetching channel Usage…",
-    testTitle: "Channel Usage test",
+    tokensSaved: "Provider saved",
+    deleteProvider: "Delete",
+    deleteProviderTitle: "Delete OAuth provider?",
+    deleteProviderDescription:
+      "This permanently deletes the provider and its Tokens. Affinity records that depend on it are deleted too.",
+    confirmDeleteProvider: "Delete provider",
+    providerDeleted: "Provider deleted",
+    testProvider: "Test",
+    testingProvider: "Fetching provider Usage…",
+    testTitle: "Provider Usage test",
     testDescription:
-      "The server calls the Usage API with this channel's OAuth Token. The Token is not returned with the test result.",
-    testSucceeded: "Channel test succeeded",
+      "The server calls the Usage API with this provider's OAuth Token. The Token is not returned with the test result.",
+    testSucceeded: "Provider test succeeded",
     usageEmail: "Email",
     usagePlan: "Plan",
     quotaRemaining: "Quota remaining",
@@ -642,31 +645,32 @@ const copy = {
     rawUsage: "Raw Usage fields",
     usageUnavailable:
       "The Usage API returned no recognized quota fields. Review the raw fields below.",
-    tenantKeys: "Tenant API keys",
-    keysDescription:
-      "Keys are shown once; the server stores only SHA-256 hashes.",
+    consumersTitle: "Tenant Consumers",
+    consumersDescription:
+      "Create one downstream Consumer per AI app so usage, errors, and revocation remain isolated. Secrets are shown once.",
     create: "Create",
-    noKeys: "No API keys",
-    noKeysDescription: "Create the first key to call the proxy.",
+    noConsumers: "No Consumers",
+    noConsumersDescription:
+      "Create a separate Consumer for each AI app before calling the proxy.",
     prefix: "Prefix",
     createdAt: "Created",
     lastUsed: "Last used",
     revoked: "Revoked",
     active: "Active",
     revoke: "Revoke",
-    revokeTitle: "Revoke API key?",
+    revokeTitle: "Revoke Consumer?",
     revokeDescription:
-      "This cannot be undone. Every caller using this key will fail immediately.",
+      "This cannot be undone. Every caller using this Consumer will fail immediately.",
     cancel: "Cancel",
-    confirmRevoke: "Revoke key",
-    keyNameHelp:
-      "Use a recognizable environment or application name for attribution and revocation.",
-    saveKeyTitle: "Save this API key now",
-    saveKeyDescription:
+    confirmRevoke: "Revoke Consumer",
+    consumerAppHelp:
+      "Create one Consumer per AI app and name it after the app so usage, troubleshooting, and revocation stay isolated.",
+    saveConsumerTitle: "Save this Consumer now",
+    saveConsumerDescription:
       "It cannot be viewed again after closing. Do not put it in browser code, logs, or chat.",
-    savedKey: "I stored it safely",
+    savedConsumer: "I stored it safely",
     copied: "Copied",
-    keyRevoked: "API key revoked",
+    consumerRevoked: "Consumer revoked",
     usageTitle: "Usage pivot",
     usageDescription:
       "Cross-tabulate request Tokens by user, masked API token, model, and date. Adjust rows, columns, and aggregate data to isolate usage.",
@@ -679,10 +683,10 @@ const copy = {
     last24Hours: "Last 24 hours",
     last7Days: "Last 7 days",
     allUsers: "All users",
-    allApiKeys: "All API tokens",
+    allConsumers: "All Consumers",
     allModels: "All models",
     model: "Model",
-    apiToken: "API token",
+    consumerLabel: "Consumer",
     date: "Date",
     rows: "Rows",
     columns: "Columns",
@@ -706,7 +710,7 @@ const copy = {
       "A basic audit record is written when each proxy call terminates.",
     time: "Time",
     requestId: "Request ID",
-    channel: "Channel",
+    provider: "Provider",
     endpointModel: "Endpoint / model",
     latency: "Latency",
     cachedInput: "Cached input",
@@ -744,7 +748,7 @@ const copy = {
     inflight: "Inflight",
     accessKey: "Access key",
     refreshKey: "Refresh key",
-    apiKey: "API key",
+    consumer: "Consumer",
     input: "Input",
     output: "Output",
     userId: "User ID",
@@ -764,7 +768,7 @@ const copy = {
     loginUnknown: "Authentication failed. Try again.",
     adminAuditTitle: "Administrator action audit",
     adminAuditDescription:
-      "Channel and OAuth operations, failed attempts, source IP, and target.",
+      "Provider and OAuth operations, failed attempts, source IP, and target.",
     administrator: "Administrator",
     action: "Action",
     target: "Target",
@@ -791,16 +795,16 @@ const copy = {
     setupAuthenticated: "Identity verified",
     setupSecurity:
       "The setup endpoint closes immediately after completion. Later first-time users receive the user role.",
-    usersTitle: "Users and channel access",
+    usersTitle: "Users and provider access",
     usersDescription:
-      "New tenant users cannot use channels until an administrator grants access. Administrators and root always have access.",
+      "New tenant users cannot use providers until an administrator grants access. Administrators and root always have access.",
     noUsers: "No users",
     noUsersDescription:
       "Users appear here after their first Auth Mini sign-in.",
     displayName: "Display name",
     roleUpdated: "User role updated",
-    channelAccess: "Channel access",
-    channelAccessUpdated: "Channel access updated",
+    providerAccess: "Provider access",
+    providerAccessUpdated: "Provider access updated",
     alwaysAllowed: "Administrators always allowed",
     runtimeSettings: "Runtime settings",
     runtimeSettingsDescription:
@@ -1208,9 +1212,9 @@ function Console({
       [
         ["dashboard", CircleGaugeIcon],
         ...(user?.role === "root" || user?.role === "admin"
-          ? [["channels", BoxesIcon]]
+          ? [["providers", BoxesIcon]]
           : []),
-        ["keys", KeyRoundIcon],
+        ["consumers", KeyRoundIcon],
         ["usage", ActivityIcon],
         ["audit", ScrollTextIcon],
         ...(user?.role === "root" || user?.role === "admin"
@@ -1299,12 +1303,12 @@ function Console({
                 element={<Dashboard sdk={sdk} locale={locale} />}
               />
               <Route
-                path="/channels"
-                element={<Channels sdk={sdk} locale={locale} />}
+                path="/providers"
+                element={<Providers sdk={sdk} locale={locale} />}
               />
               <Route
-                path="/keys"
-                element={<Keys sdk={sdk} locale={locale} />}
+                path="/consumers"
+                element={<Consumers sdk={sdk} locale={locale} />}
               />
               <Route
                 path="/usage"
@@ -1370,8 +1374,8 @@ function Dashboard({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
   if (loading) return <LoadingTable />
   if (error) return <ErrorState message={error} />
   const rows = [
-    [t.availableChannels, data?.available_channels],
-    [t.activeKeys, data?.active_keys],
+    [t.availableProviders, data?.available_providers],
+    [t.activeConsumers, data?.active_consumers],
     [t.calls24h, data?.calls_24h],
     [t.errors24h, data?.errors_24h],
   ]
@@ -1400,7 +1404,7 @@ function Dashboard({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
   )
 }
 
-function Channels({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
+function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
   const t = copy[locale]
   const queryClient = useQueryClient()
   const [open, setOpen] = useState(false)
@@ -1409,15 +1413,15 @@ function Channels({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
     authorize_url: string
   } | null>(null)
   const [tokenDialog, setTokenDialog] =
-    useState<ChannelTokenDialogState | null>(null)
-  const [testState, setTestState] = useState<ChannelTestState | null>(null)
-  const [deleteTarget, setDeleteTarget] = useState<Channel | null>(null)
+    useState<ProviderTokenDialogState | null>(null)
+  const [testState, setTestState] = useState<ProviderTestState | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<Provider | null>(null)
   const [deletePending, setDeletePending] = useState(false)
   const tokenRequest = useRef<AbortController | null>(null)
   const testRequest = useRef<AbortController | null>(null)
-  const { data, error, loading } = useApiQuery<Channel[]>(sdk, "/api/channels")
+  const { data, error, loading } = useApiQuery<Provider[]>(sdk, "/api/providers")
   const { data: usageData, error: usageError } =
-    useApiQuery<ChannelUsageResponse>(sdk, "/api/channels/usage")
+    useApiQuery<ProviderUsageResponse>(sdk, "/api/providers/usage")
   useEffect(
     () => () => {
       tokenRequest.current?.abort()
@@ -1425,59 +1429,59 @@ function Channels({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
     },
     []
   )
-  function refreshChannels() {
-    void queryClient.invalidateQueries({ queryKey: ["/api/channels"] })
+  function refreshProviders() {
+    void queryClient.invalidateQueries({ queryKey: ["/api/providers"] })
   }
   async function mutate(id: string, body: object) {
     try {
-      await api(sdk, `/api/channels/${id}`, {
+      await api(sdk, `/api/providers/${id}`, {
         method: "PATCH",
         body: JSON.stringify(body),
       })
-      refreshChannels()
-      toast.success(t.channelUpdated)
+      refreshProviders()
+      toast.success(t.providerUpdated)
     } catch (cause) {
       toast.error(message(cause, t))
     }
   }
-  async function openTokens(channel: Channel) {
+  async function openTokens(provider: Provider) {
     tokenRequest.current?.abort()
     const request = new AbortController()
     tokenRequest.current = request
-    setTokenDialog({ channel, loading: true })
+    setTokenDialog({ provider, loading: true })
     try {
-      const tokens = await api<ChannelTokens>(
+      const tokens = await api<ProviderTokens>(
         sdk,
-        `/api/channels/${channel.id}`,
+        `/api/providers/${provider.id}`,
         { signal: request.signal }
       )
       if (tokenRequest.current === request)
-        setTokenDialog({ channel, loading: false, tokens })
+        setTokenDialog({ provider, loading: false, tokens })
     } catch (cause) {
       if (!isAbortError(cause) && tokenRequest.current === request)
-        setTokenDialog({ channel, loading: false, error: message(cause, t) })
+        setTokenDialog({ provider, loading: false, error: message(cause, t) })
     } finally {
       if (tokenRequest.current === request) tokenRequest.current = null
     }
   }
-  async function test(channel: Channel) {
+  async function test(provider: Provider) {
     testRequest.current?.abort()
     const request = new AbortController()
     testRequest.current = request
-    setTestState({ channel, status: "loading" })
+    setTestState({ provider, status: "loading" })
     try {
-      const result = await api<{ usage: ChannelUsage }>(
+      const result = await api<{ usage: ProviderUsage }>(
         sdk,
-        `/api/channels/${channel.id}/test`,
+        `/api/providers/${provider.id}/test`,
         { method: "POST", signal: request.signal }
       )
       if (testRequest.current === request) {
-        setTestState({ channel, status: "success", usage: result.usage })
+        setTestState({ provider, status: "success", usage: result.usage })
         toast.success(t.testSucceeded)
       }
     } catch (cause) {
       if (!isAbortError(cause) && testRequest.current === request)
-        setTestState({ channel, status: "error", error: message(cause, t) })
+        setTestState({ provider, status: "error", error: message(cause, t) })
     } finally {
       if (testRequest.current === request) testRequest.current = null
     }
@@ -1486,10 +1490,10 @@ function Channels({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
     if (!deleteTarget || deletePending) return
     setDeletePending(true)
     try {
-      await api(sdk, `/api/channels/${deleteTarget.id}`, { method: "DELETE" })
+      await api(sdk, `/api/providers/${deleteTarget.id}`, { method: "DELETE" })
       setDeleteTarget(null)
-      refreshChannels()
-      toast.success(t.channelDeleted)
+      refreshProviders()
+      toast.success(t.providerDeleted)
     } catch (cause) {
       toast.error(message(cause, t))
     } finally {
@@ -1513,22 +1517,22 @@ function Channels({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
       <Card>
         <CardHeader className="flex-row items-start justify-between">
           <div>
-            <CardTitle>{t.channelPool}</CardTitle>
-            <CardDescription>{t.channelDescription}</CardDescription>
+            <CardTitle>{t.providerPool}</CardTitle>
+            <CardDescription>{t.providerDescription}</CardDescription>
           </div>
           <Button onClick={() => setOpen(true)}>
             <PlusIcon data-icon="inline-start" />
-            {t.addChannel}
+            {t.addProvider}
           </Button>
         </CardHeader>
         <CardContent>
           {!data?.length ? (
             <EmptyState
               icon={<BoxesIcon />}
-              title={t.noChannels}
-              description={t.noChannelsDescription}
+              title={t.noProviders}
+              description={t.noProvidersDescription}
               action={
-                <Button onClick={() => setOpen(true)}>{t.addChannel}</Button>
+                <Button onClick={() => setOpen(true)}>{t.addProvider}</Button>
               }
             />
           ) : (
@@ -1549,19 +1553,19 @@ function Channels({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {data.map((channel) => {
-                    const entry = usageData?.channels[channel.id]
+                  {data.map((provider) => {
+                    const entry = usageData?.providers[provider.id]
                     const usage = entry?.usage
                     const quota =
                       usage?.rate_limit?.primary_window ??
                       usage?.rate_limit?.secondary_window
                     return (
-                      <TableRow key={channel.id}>
+                      <TableRow key={provider.id}>
                         <TableCell className="font-medium">
-                          {channel.name}
+                          {provider.name}
                         </TableCell>
                         <TableCell className="font-mono text-xs">
-                          {channel.account_id}
+                          {provider.account_id}
                         </TableCell>
                         <TableCell className="text-xs">
                           {usageEmail(usage) || "—"}
@@ -1570,7 +1574,7 @@ function Channels({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                         <TableCell>
                           <QuotaProgress
                             window={quota}
-                            label={`${t.quotaRemaining}: ${channel.name}`}
+                            label={`${t.quotaRemaining}: ${provider.name}`}
                             unavailable={entry?.error || usageError}
                           />
                         </TableCell>
@@ -1579,17 +1583,17 @@ function Channels({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                         </TableCell>
                         <TableCell>
                           <StatusBadge
-                            status={channel.status}
+                            status={provider.status}
                             locale={locale}
                           />
                         </TableCell>
                         <TableCell className="tabular-nums">
-                          {channel.inflight}
+                          {provider.inflight}
                         </TableCell>
                         <TableCell className="max-w-64 text-xs text-muted-foreground">
-                          {channel.last_error ||
-                            (channel.cooldown_until
-                              ? formatTime(channel.cooldown_until, locale)
+                          {provider.last_error ||
+                            (provider.cooldown_until
+                              ? formatTime(provider.cooldown_until, locale)
                               : "—")}
                         </TableCell>
                         <TableCell>
@@ -1598,58 +1602,58 @@ function Channels({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                               size="sm"
                               variant="outline"
                               disabled={
-                                tokenDialog?.channel.id === channel.id &&
+                                tokenDialog?.provider.id === provider.id &&
                                 tokenDialog.loading
                               }
-                              onClick={() => void openTokens(channel)}
+                              onClick={() => void openTokens(provider)}
                             >
-                              {tokenDialog?.channel.id === channel.id &&
+                              {tokenDialog?.provider.id === provider.id &&
                               tokenDialog.loading ? (
                                 <Spinner data-icon="inline-start" />
                               ) : (
                                 <KeyRoundIcon data-icon="inline-start" />
                               )}
-                              {t.editChannel}
+                              {t.editProvider}
                             </Button>
                             <Button
                               size="sm"
                               variant="outline"
                               disabled={
-                                testState?.channel.id === channel.id &&
+                                testState?.provider.id === provider.id &&
                                 testState.status === "loading"
                               }
-                              onClick={() => void test(channel)}
+                              onClick={() => void test(provider)}
                             >
-                              {testState?.channel.id === channel.id &&
+                              {testState?.provider.id === provider.id &&
                               testState.status === "loading" ? (
                                 <Spinner data-icon="inline-start" />
                               ) : (
                                 <ActivityIcon data-icon="inline-start" />
                               )}
-                              {t.testChannel}
+                              {t.testProvider}
                             </Button>
                             <Button
                               size="sm"
                               variant="outline"
                               onClick={() =>
-                                void mutate(channel.id, { refresh: true })
+                                void mutate(provider.id, { refresh: true })
                               }
                             >
                               <RefreshCwIcon data-icon="inline-start" />
                               {t.refresh}
                             </Button>
                             <Switch
-                              aria-label={`${t.status}: ${channel.name}`}
-                              checked={!channel.manual_disabled}
+                              aria-label={`${t.status}: ${provider.name}`}
+                              checked={!provider.manual_disabled}
                               onCheckedChange={(checked) =>
-                                void mutate(channel.id, { enabled: checked })
+                                void mutate(provider.id, { enabled: checked })
                               }
                             />
                             <Button
                               size="icon-sm"
                               variant="ghost"
-                              aria-label={`${t.deleteChannel}: ${channel.name}`}
-                              onClick={() => setDeleteTarget(channel)}
+                              aria-label={`${t.deleteProvider}: ${provider.name}`}
+                              onClick={() => setDeleteTarget(provider)}
                             >
                               <Trash2Icon />
                             </Button>
@@ -1664,7 +1668,7 @@ function Channels({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
           )}
         </CardContent>
       </Card>
-      <ChannelDialog
+      <ProviderDialog
         sdk={sdk}
         locale={locale}
         open={open}
@@ -1673,20 +1677,20 @@ function Channels({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
         setOauth={setOauth}
         onDone={() => {
           setOpen(false)
-          refreshChannels()
+          refreshProviders()
         }}
       />
-      <ChannelTokensDialog
+      <ProviderTokensDialog
         sdk={sdk}
         locale={locale}
         state={tokenDialog}
         onClose={closeTokens}
         onSaved={() => {
           closeTokens()
-          refreshChannels()
+          refreshProviders()
         }}
       />
-      <ChannelTestDialog
+      <ProviderTestDialog
         locale={locale}
         state={testState}
         onClose={closeTest}
@@ -1699,9 +1703,9 @@ function Channels({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>{t.deleteChannelTitle}</AlertDialogTitle>
+            <AlertDialogTitle>{t.deleteProviderTitle}</AlertDialogTitle>
             <AlertDialogDescription>
-              {t.deleteChannelDescription}
+              {t.deleteProviderDescription}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -1714,7 +1718,7 @@ function Channels({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
               onClick={() => void remove()}
             >
               {deletePending && <Spinner data-icon="inline-start" />}
-              {t.confirmDeleteChannel}
+              {t.confirmDeleteProvider}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -1723,7 +1727,7 @@ function Channels({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
   )
 }
 
-function ChannelTokensDialog({
+function ProviderTokensDialog({
   sdk,
   locale,
   state,
@@ -1732,7 +1736,7 @@ function ChannelTokensDialog({
 }: {
   sdk: AuthSdk
   locale: Locale
-  state: ChannelTokenDialogState | null
+  state: ProviderTokenDialogState | null
   onClose: () => void
   onSaved: () => void
 }) {
@@ -1746,7 +1750,7 @@ function ChannelTokensDialog({
     saveRequest.current?.abort()
     saveRequest.current = null
     setPending(false)
-    setName(state?.channel.name ?? "")
+    setName(state?.provider.name ?? "")
     setAccess(state?.tokens?.access_key ?? "")
     setRefresh(state?.tokens?.refresh_key ?? "")
   }, [state])
@@ -1757,7 +1761,7 @@ function ChannelTokensDialog({
     saveRequest.current = request
     setPending(true)
     try {
-      await api(sdk, `/api/channels/${state.channel.id}`, {
+      await api(sdk, `/api/providers/${state.provider.id}`, {
         method: "PUT",
         body: JSON.stringify({
           name,
@@ -1791,7 +1795,7 @@ function ChannelTokensDialog({
       <DialogContent>
         <DialogHeader>
           <DialogTitle>
-            {t.tokenTitle}: {state?.channel.name}
+            {t.tokenTitle}: {state?.provider.name}
           </DialogTitle>
           <DialogDescription>{t.tokenDescription}</DialogDescription>
         </DialogHeader>
@@ -1806,9 +1810,9 @@ function ChannelTokensDialog({
           <form onSubmit={save}>
             <FieldGroup>
               <Field>
-                <FieldLabel htmlFor="edit-channel-name">{t.name}</FieldLabel>
+                <FieldLabel htmlFor="edit-provider-name">{t.name}</FieldLabel>
                 <Input
-                  id="edit-channel-name"
+                  id="edit-provider-name"
                   value={name}
                   onChange={(event) => setName(event.target.value)}
                   required
@@ -1859,13 +1863,13 @@ function ChannelTokensDialog({
   )
 }
 
-function ChannelTestDialog({
+function ProviderTestDialog({
   locale,
   state,
   onClose,
 }: {
   locale: Locale
-  state: ChannelTestState | null
+  state: ProviderTestState | null
   onClose: () => void
 }) {
   const t = copy[locale]
@@ -1884,14 +1888,14 @@ function ChannelTestDialog({
       <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>
-            {t.testTitle}: {state?.channel.name}
+            {t.testTitle}: {state?.provider.name}
           </DialogTitle>
           <DialogDescription>{t.testDescription}</DialogDescription>
         </DialogHeader>
         {state?.status === "loading" ? (
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
             <Spinner />
-            {t.testingChannel}
+            {t.testingProvider}
           </div>
         ) : state?.status === "error" ? (
           <ErrorState message={state.error || t.unknownError} />
@@ -1937,7 +1941,7 @@ function ChannelTestDialog({
   )
 }
 
-function ChannelDialog({
+function ProviderDialog({
   sdk,
   locale,
   open,
@@ -1964,7 +1968,7 @@ function ChannelDialog({
     event.preventDefault()
     setPending(true)
     try {
-      await api(sdk, "/api/channels", {
+      await api(sdk, "/api/providers", {
         method: "POST",
         body: JSON.stringify({
           name,
@@ -1972,7 +1976,7 @@ function ChannelDialog({
           refresh_key: refresh,
         }),
       })
-      toast.success(t.channelAdded)
+      toast.success(t.providerAdded)
       onDone()
     } catch (cause) {
       toast.error(message(cause, t))
@@ -2004,7 +2008,7 @@ function ChannelDialog({
         method: "POST",
         body: JSON.stringify({ state: oauth.state, code, name }),
       })
-      toast.success(t.oauthChannelAdded)
+      toast.success(t.oauthProviderAdded)
       setOauth(null)
       onDone()
     } catch (cause) {
@@ -2017,15 +2021,15 @@ function ChannelDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>{t.addChannelTitle}</DialogTitle>
-          <DialogDescription>{t.addChannelDescription}</DialogDescription>
+          <DialogTitle>{t.addProviderTitle}</DialogTitle>
+          <DialogDescription>{t.addProviderDescription}</DialogDescription>
         </DialogHeader>
         <form onSubmit={direct}>
           <FieldGroup>
             <Field>
-              <FieldLabel htmlFor="channel-name">{t.name}</FieldLabel>
+              <FieldLabel htmlFor="provider-name">{t.name}</FieldLabel>
               <Input
-                id="channel-name"
+                id="provider-name"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 required
@@ -2099,27 +2103,27 @@ function ChannelDialog({
   )
 }
 
-function Keys({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
+function Consumers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
   const t = copy[locale]
   const queryClient = useQueryClient()
   const [name, setName] = useState("")
   const [open, setOpen] = useState(false)
   const [secret, setSecret] = useState("")
   const [revokeId, setRevokeId] = useState<string | null>(null)
-  const { data, error, loading } = useApiQuery<Key[]>(sdk, "/api/keys")
-  function refreshKeys() {
-    void queryClient.invalidateQueries({ queryKey: ["/api/keys"] })
+  const { data, error, loading } = useApiQuery<Consumer[]>(sdk, "/api/consumers")
+  function refreshConsumers() {
+    void queryClient.invalidateQueries({ queryKey: ["/api/consumers"] })
   }
   async function create(event: FormEvent) {
     event.preventDefault()
     try {
-      const value = await api<{ secret: string }>(sdk, "/api/keys", {
+      const value = await api<{ secret: string }>(sdk, "/api/consumers", {
         method: "POST",
         body: JSON.stringify({ name }),
       })
       setSecret(value.secret)
       setName("")
-      refreshKeys()
+      refreshConsumers()
     } catch (cause) {
       toast.error(message(cause, t))
     }
@@ -2127,10 +2131,10 @@ function Keys({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
   async function revoke() {
     if (!revokeId) return
     try {
-      await api(sdk, `/api/keys/${revokeId}`, { method: "DELETE" })
-      refreshKeys()
+      await api(sdk, `/api/consumers/${revokeId}`, { method: "DELETE" })
+      refreshConsumers()
       setRevokeId(null)
-      toast.success(t.keyRevoked)
+      toast.success(t.consumerRevoked)
     } catch (cause) {
       toast.error(message(cause, t))
     }
@@ -2142,8 +2146,8 @@ function Keys({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
       <Card>
         <CardHeader className="flex-row items-start justify-between">
           <div>
-            <CardTitle>{t.tenantKeys}</CardTitle>
-            <CardDescription>{t.keysDescription}</CardDescription>
+            <CardTitle>{t.consumersTitle}</CardTitle>
+            <CardDescription>{t.consumersDescription}</CardDescription>
           </div>
           <Button onClick={() => setOpen(true)}>
             <PlusIcon data-icon="inline-start" />
@@ -2154,8 +2158,8 @@ function Keys({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
           {!data?.length ? (
             <EmptyState
               icon={<KeyRoundIcon />}
-              title={t.noKeys}
-              description={t.noKeysDescription}
+              title={t.noConsumers}
+              description={t.noConsumersDescription}
               action={<Button onClick={() => setOpen(true)}>{t.create}</Button>}
             />
           ) : (
@@ -2172,31 +2176,31 @@ function Keys({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {data.map((key) => (
-                    <TableRow key={key.id}>
-                      <TableCell className="font-medium">{key.name}</TableCell>
+                  {data.map((consumer) => (
+                    <TableRow key={consumer.id}>
+                      <TableCell className="font-medium">{consumer.name}</TableCell>
                       <TableCell className="font-mono text-xs">
-                        {key.prefix}…
+                        {consumer.prefix}…
                       </TableCell>
                       <TableCell>
-                        {formatTime(key.created_at, locale)}
+                        {formatTime(consumer.created_at, locale)}
                       </TableCell>
                       <TableCell>
-                        {formatTime(key.last_used_at, locale)}
+                        {formatTime(consumer.last_used_at, locale)}
                       </TableCell>
                       <TableCell>
                         <Badge
-                          variant={key.revoked_at ? "destructive" : "secondary"}
+                          variant={consumer.revoked_at ? "destructive" : "secondary"}
                         >
-                          {key.revoked_at ? t.revoked : t.active}
+                          {consumer.revoked_at ? t.revoked : t.active}
                         </Badge>
                       </TableCell>
                       <TableCell className="text-right">
                         <Button
                           size="sm"
                           variant="ghost"
-                          disabled={Boolean(key.revoked_at)}
-                          onClick={() => setRevokeId(key.id)}
+                          disabled={Boolean(consumer.revoked_at)}
+                          onClick={() => setRevokeId(consumer.id)}
                         >
                           {t.revoke}
                         </Button>
@@ -2212,15 +2216,15 @@ function Keys({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{t.create} API Key</DialogTitle>
-            <DialogDescription>{t.keyNameHelp}</DialogDescription>
+            <DialogTitle>{t.create} Consumer</DialogTitle>
+            <DialogDescription>{t.consumerAppHelp}</DialogDescription>
           </DialogHeader>
           <form onSubmit={create}>
             <FieldGroup>
               <Field>
-                <FieldLabel htmlFor="key-name">{t.name}</FieldLabel>
+                <FieldLabel htmlFor="consumer-name">{t.name}</FieldLabel>
                 <Input
-                  id="key-name"
+                  id="consumer-name"
                   value={name}
                   onChange={(e) => setName(e.target.value)}
                   required
@@ -2241,8 +2245,8 @@ function Keys({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{t.saveKeyTitle}</DialogTitle>
-            <DialogDescription>{t.saveKeyDescription}</DialogDescription>
+            <DialogTitle>{t.saveConsumerTitle}</DialogTitle>
+            <DialogDescription>{t.saveConsumerDescription}</DialogDescription>
           </DialogHeader>
           <div className="flex items-center gap-2 rounded-lg border bg-muted p-3">
             <code className="min-w-0 flex-1 text-xs break-all">{secret}</code>
@@ -2260,7 +2264,7 @@ function Keys({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
             </Button>
           </div>
           <DialogFooter>
-            <Button onClick={() => setSecret("")}>{t.savedKey}</Button>
+            <Button onClick={() => setSecret("")}>{t.savedConsumer}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -2302,11 +2306,11 @@ function UsagePage({
   const t = copy[locale]
   const [period, setPeriod] = useState<UsagePeriod>("24h")
   const [userFilter, setUserFilter] = useState("all")
-  const [keyFilter, setKeyFilter] = useState("all")
+  const [consumerFilter, setConsumerFilter] = useState("all")
   const [modelFilter, setModelFilter] = useState("all")
   const [rowDimensions, setRowDimensions] = useState<PivotDimension[]>([
     "user",
-    "key",
+    "consumer",
     "model",
   ])
   const [columnDimensions, setColumnDimensions] = useState<PivotDimension[]>([
@@ -2324,15 +2328,15 @@ function UsagePage({
   )
   const rows = useMemo(() => data?.rows ?? [], [data])
   const fieldLabels = useMemo<Record<PivotDimension, string>>(
-    () => ({ user: t.userId, key: t.apiToken, model: t.model, date: t.date }),
+    () => ({ user: t.userId, consumer: t.consumerLabel, model: t.model, date: t.date }),
     [t],
   )
   const users = useMemo(
     () => uniqueUsageOptions(rows, (row) => row.user_id, usageUserLabel),
     [rows]
   )
-  const keys = useMemo(
-    () => uniqueUsageOptions(rows, (row) => row.key_id, usageKeyLabel),
+  const consumers = useMemo(
+    () => uniqueUsageOptions(rows, (row) => row.consumer_id, usageConsumerLabel),
     [rows]
   )
   const models = useMemo(
@@ -2349,10 +2353,10 @@ function UsagePage({
       rows.filter(
         (row) =>
           (userFilter === "all" || row.user_id === userFilter) &&
-          (keyFilter === "all" || row.key_id === keyFilter) &&
+          (consumerFilter === "all" || row.consumer_id === consumerFilter) &&
           (modelFilter === "all" || row.model === modelFilter)
       ),
-    [rows, userFilter, keyFilter, modelFilter]
+    [rows, userFilter, consumerFilter, modelFilter]
   )
   const pivot = useMemo(
     () =>
@@ -2425,7 +2429,7 @@ function UsagePage({
   }
   const clearFilters = () => {
     setUserFilter("all")
-    setKeyFilter("all")
+    setConsumerFilter("all")
     setModelFilter("all")
   }
   if (loading) return <LoadingTable />
@@ -2459,11 +2463,11 @@ function UsagePage({
             />
           )}
           <UsageSelect
-            ariaLabel={t.apiToken}
-            value={keyFilter}
-            onValueChange={setKeyFilter}
-            allLabel={t.allApiKeys}
-            options={keys}
+            ariaLabel={t.consumerLabel}
+            value={consumerFilter}
+            onValueChange={setConsumerFilter}
+            allLabel={t.allConsumers}
+            options={consumers}
           />
           <UsageSelect
             ariaLabel={t.model}
@@ -2743,11 +2747,11 @@ function UsageDimensionCell({
         <code>{row.user_id}</code>
       </div>
     )
-  if (dimension === "key")
+  if (dimension === "consumer")
     return (
       <div className="flex flex-col">
-        <span className="font-medium">{row.key_name}</span>
-        <code>{row.key_prefix}…</code>
+        <span className="font-medium">{row.consumer_name}</span>
+        <code>{row.consumer_prefix}…</code>
       </div>
     )
   return <code>{usageDimensionLabel(row, dimension)}</code>
@@ -2795,9 +2799,9 @@ function AuditPage({
                   <TableRow>
                     <TableHead>{t.time}</TableHead>
                     <TableHead>{t.endpointModel}</TableHead>
-                    <TableHead>{t.apiKey}</TableHead>
+                    <TableHead>{t.consumer}</TableHead>
                     <TableHead>{t.userId}</TableHead>
-                    <TableHead>{t.channel}</TableHead>
+                    <TableHead>{t.provider}</TableHead>
                     <TableHead>{t.status}</TableHead>
                     <TableHead>{t.usage}</TableHead>
                     <TableHead className="text-right">{t.actions}</TableHead>
@@ -2822,13 +2826,13 @@ function AuditPage({
                         </div>
                       </TableCell>
                       <TableCell className="font-medium">
-                        {row.key_name}
+                        {row.consumer_name}
                       </TableCell>
                       <TableCell>
                         <code>{row.user_id}</code>
                       </TableCell>
-                      <TableCell title={row.channel_id}>
-                        {row.channel_name || "—"}
+                      <TableCell title={row.provider_id}>
+                        {row.provider_name || "—"}
                       </TableCell>
                       <TableCell>
                         <div className="flex max-w-48 flex-col gap-1">
@@ -2948,9 +2952,9 @@ function RequestDetailPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
           <Definition
             rows={[
               [t.requestId, data.request_id],
-              [t.apiKey, data.key_name],
+              [t.consumer, data.consumer_name],
               [t.userId, data.user_id],
-              [t.channel, data.channel_name || data.channel_id || "—"],
+              [t.provider, data.provider_name || data.provider_id || "—"],
               [t.endpointModel, data.model || "—"],
               [t.status, data.status],
               [t.affinitySource, data.affinity_source || "—"],
@@ -3201,14 +3205,14 @@ function UsersPage({
       toast.error(message(cause, t))
     }
   }
-  async function updateChannelAccess(id: string, channel_access: boolean) {
+  async function updateProviderAccess(id: string, provider_access: boolean) {
     try {
       await api(sdk, `/api/users/${id}`, {
         method: "PATCH",
-        body: JSON.stringify({ channel_access }),
+        body: JSON.stringify({ provider_access }),
       })
       refreshUsers()
-      toast.success(t.channelAccessUpdated)
+      toast.success(t.providerAccessUpdated)
     } catch (cause) {
       toast.error(message(cause, t))
     }
@@ -3238,7 +3242,7 @@ function UsersPage({
                   <TableHead>{t.userId}</TableHead>
                   <TableHead>{t.createdAt}</TableHead>
                   <TableHead>{t.role}</TableHead>
-                  <TableHead>{t.channelAccess}</TableHead>
+                  <TableHead>{t.providerAccess}</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -3281,16 +3285,16 @@ function UsersPage({
                     <TableCell>
                       {item.role === "user" ? (
                         <Switch
-                          aria-label={`${t.channelAccess}: ${item.email || item.id}`}
-                          checked={item.channel_access}
+                          aria-label={`${t.providerAccess}: ${item.email || item.id}`}
+                          checked={item.provider_access}
                           onCheckedChange={(checked) =>
-                            void updateChannelAccess(item.id, checked)
+                            void updateProviderAccess(item.id, checked)
                           }
                         />
                       ) : (
                         <div className="flex items-center gap-2">
                           <Switch
-                            aria-label={`${t.channelAccess}: ${item.email || item.id}`}
+                            aria-label={`${t.providerAccess}: ${item.email || item.id}`}
                             checked
                             disabled
                           />
@@ -3654,11 +3658,11 @@ function AdminAuditSection({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
   )
 }
 
-type PivotDimension = "user" | "key" | "model" | "date"
+type PivotDimension = "user" | "consumer" | "model" | "date"
 type PivotPlacement = "rows" | "columns" | "hidden"
 type UsageMetric = keyof PivotCell
 
-const pivotDimensions: PivotDimension[] = ["user", "key", "model", "date"]
+const pivotDimensions: PivotDimension[] = ["user", "consumer", "model", "date"]
 const usageMetrics: UsageMetric[] = [
   "input_tokens",
   "output_tokens",
@@ -3668,14 +3672,14 @@ const usageMetrics: UsageMetric[] = [
 function usageUserLabel(row: UsageRow) {
   return row.user_name || row.user_email || row.user_id
 }
-function usageKeyLabel(row: UsageRow) {
-  return `${row.key_name} · ${row.key_prefix}…`
+function usageConsumerLabel(row: UsageRow) {
+  return `${row.consumer_name} · ${row.consumer_prefix}…`
 }
 function usageDimensionLabel(row: UsageRow, dimension: PivotDimension) {
   return dimension === "user"
     ? usageUserLabel(row)
-    : dimension === "key"
-      ? usageKeyLabel(row)
+    : dimension === "consumer"
+      ? usageConsumerLabel(row)
       : row[dimension]
 }
 function usageAggregateLabel(metric: UsageMetric, t: typeof copy.zh) {
@@ -3919,7 +3923,7 @@ function formatLatency(milliseconds: number) {
     ? `${(milliseconds / 1000).toFixed(2)} s`
     : `${milliseconds} ms`
 }
-function usageEmail(usage: ChannelUsage | undefined) {
+function usageEmail(usage: ProviderUsage | undefined) {
   return usage?.email ?? usage?.account_email ?? usage?.account?.email
 }
 function quotaPercent(window: UsageWindow | undefined) {
@@ -3995,8 +3999,8 @@ function pageForPath(pathname: string): Page {
     (
       {
         "/dashboard": "dashboard",
-        "/channels": "channels",
-        "/keys": "keys",
+        "/providers": "providers",
+        "/consumers": "consumers",
         "/usage": "usage",
         "/audit": "audit",
         "/users": "users",
@@ -4013,8 +4017,8 @@ function pageDescription(page: Page, locale: Locale) {
   const t = copy[locale]
   return {
     dashboard: t.pageDashboard,
-    channels: t.pageChannels,
-    keys: t.pageKeys,
+    providers: t.pageProviders,
+    consumers: t.pageConsumers,
     usage: t.pageUsage,
     audit: t.pageAudit,
     "request-detail": t.pageRequestDetail,

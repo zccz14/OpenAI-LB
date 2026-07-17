@@ -8,16 +8,16 @@ product
 
 产品服务两类用户：
 
-- 管理员负责注册和维护 CodeX OAuth 上游提供商，观察容量、限流、故障、自动禁用与恢复状态，并审计逐次代理调用。
-- 租户用户通过 Auth Mini 注册和登录，为每个 AI App 创建、吊销独立的 Consumer，并按 Consumer 查看调用量、成功率和错误记录。
+- root 与管理员负责全局配置和审计，并可管理全部 CodeX OAuth 上游提供商。
+- 租户用户通过 Auth Mini 注册和登录，管理自己拥有的上游提供商及其用户授权；同时为每个 AI App 创建、吊销独立的 Consumer，并按 Consumer 查看调用量、成功率和错误记录。
 
 两类用户都处于明确的运维或集成任务中；界面必须让当前租户、Consumer、上游提供商和请求上下文始终清晰。
 
 ## Product Purpose
 
-本产品是一个以 Rust 编写、以 SQLite 持久化、最终可作为单一 Binary 部署的 CodeX OAuth 反向代理与负载均衡系统。管理员可使用多组 `(access_key, refresh_key)` 注册上游提供商；系统只代理 OpenAI / CodeX 能力，不兼容其他 AI 厂商协议，同时覆盖文本、推理、实时、语音、图像及后续 OpenAI 模态，而非绑定某一种 LLM 请求形态。
+本产品是一个以 Rust 编写、以 SQLite 持久化、最终可作为单一 Binary 部署的 CodeX OAuth 反向代理与负载均衡系统。用户可使用多组 `(access_key, refresh_key)` 注册自己拥有的上游提供商，root 与管理员可管理全局 Provider 池；系统只代理 OpenAI / CodeX 能力，不兼容其他 AI 厂商协议，同时覆盖文本、推理、实时、语音、图像及后续 OpenAI 模态，而非绑定某一种 LLM 请求形态。
 
-成功意味着：租户能用自有 Consumer 稳定访问代理；系统能按 Consumer 统计用量、为每次 API Call 留下基础审计记录；调度具备上游提供商亲和性；上游提供商 Rate Limit 可被跟踪，并能在受限或异常时自动禁用、在条件满足后自动恢复；管理员能从 UI 快速判断当前服务状态并采取行动。
+成功意味着：租户能用自有 Consumer 稳定访问自己拥有、被逐 Provider 授权或由 `provider_access` 全局权限覆盖的上游容量；系统能按 Consumer 统计用量、为每次 API Call 留下基础审计记录；调度具备上游提供商亲和性；上游提供商 Rate Limit 可被跟踪，并能在受限或异常时自动禁用、在条件满足后自动恢复；管理员能从 UI 快速判断当前服务状态并采取行动。
 
 ## Brand Personality
 

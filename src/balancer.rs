@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -33,6 +34,7 @@ pub struct Provider {
     pub last_used_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
+    pub owner_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -40,6 +42,7 @@ pub struct Balancer {
     inflight: Arc<DashMap<String, AtomicUsize>>,
     cursor: Arc<AtomicU64>,
     providers: Arc<ArcSwap<Vec<Provider>>>,
+    provider_grants: Arc<ArcSwap<HashMap<String, HashSet<String>>>>,
     affinities: Arc<DashMap<String, AffinityEntry>>,
     dirty_affinities: Arc<DashSet<String>>,
     provider_updates: Arc<DashMap<String, ProviderUpdate>>,
@@ -83,6 +86,7 @@ impl Default for Balancer {
             inflight: Arc::new(DashMap::new()),
             cursor: Arc::new(AtomicU64::new(0)),
             providers: Arc::new(ArcSwap::from_pointee(Vec::new())),
+            provider_grants: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             affinities: Arc::new(DashMap::new()),
             dirty_affinities: Arc::new(DashSet::new()),
             provider_updates: Arc::new(DashMap::new()),
@@ -94,14 +98,24 @@ impl Balancer {
     pub async fn select(
         &self,
         state: &AppState,
+        user_id: &str,
+        all_providers: bool,
         affinity: Option<&str>,
         excluded: Option<&str>,
     ) -> Result<Lease, AppError> {
         let now = chrono::Utc::now().timestamp();
         let providers = self.providers.load();
+        let provider_grants = self.provider_grants.load();
         let eligible: Vec<Provider> = providers
             .iter()
             .filter(|item| provider_is_available(item, now))
+            .filter(|item| {
+                all_providers
+                    || item.owner_id.as_deref() == Some(user_id)
+                    || provider_grants
+                        .get(&item.id)
+                        .is_some_and(|users| users.contains(user_id))
+            })
             .filter(|item| excluded != Some(item.id.as_str()))
             .cloned()
             .collect();
@@ -209,7 +223,18 @@ impl Balancer {
             sqlx::query_as::<_, Provider>("SELECT * FROM providers ORDER BY created_at,id")
                 .fetch_all(pool)
                 .await?;
+        let rows = sqlx::query("SELECT provider_id,user_id FROM provider_grants")
+            .fetch_all(pool)
+            .await?;
+        let mut provider_grants = HashMap::<String, HashSet<String>>::new();
+        for row in rows {
+            provider_grants
+                .entry(row.get(0))
+                .or_default()
+                .insert(row.get(1));
+        }
         self.providers.store(Arc::new(providers));
+        self.provider_grants.store(Arc::new(provider_grants));
         Ok(())
     }
 
@@ -219,6 +244,9 @@ impl Balancer {
         self.providers.store(Arc::new(providers));
         self.inflight.remove(provider_id);
         self.provider_updates.remove(provider_id);
+        let mut provider_grants = (**self.provider_grants.load()).clone();
+        provider_grants.remove(provider_id);
+        self.provider_grants.store(Arc::new(provider_grants));
 
         let hashes = self
             .affinities
@@ -497,14 +525,14 @@ mod tests {
         state.balancer.reload_providers(&state.db).await.unwrap();
         let first = state
             .balancer
-            .select(&state, Some("session-1"), None)
+            .select(&state, "test-user", true, Some("session-1"), None)
             .await
             .unwrap();
         let first_id = first.provider.id.clone();
         drop(first);
         let sticky = state
             .balancer
-            .select(&state, Some("session-1"), None)
+            .select(&state, "test-user", true, Some("session-1"), None)
             .await
             .unwrap();
         assert_eq!(sticky.provider.id, first_id);
@@ -518,10 +546,69 @@ mod tests {
         state.balancer.reload_providers(&state.db).await.unwrap();
         let reallocated = state
             .balancer
-            .select(&state, Some("session-1"), None)
+            .select(&state, "test-user", true, Some("session-1"), None)
             .await
             .unwrap();
         assert_ne!(reallocated.provider.id, first_id);
+    }
+
+    #[tokio::test]
+    async fn selection_respects_owner_grants_and_global_access() {
+        let state = crate::test_state("http://token.invalid").await;
+        let now = chrono::Utc::now().timestamp();
+        for user_id in ["owner-a", "owner-b", "owner-c", "ungranted"] {
+            sqlx::query("INSERT INTO users(id,role,created_at) VALUES(?,'user',?)")
+                .bind(user_id)
+                .bind(now)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+        for (provider_id, owner_id) in [
+            ("provider-a", "owner-a"),
+            ("provider-b", "owner-b"),
+            ("provider-c", "owner-c"),
+        ] {
+            sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,status,created_at,updated_at,owner_id) VALUES(?,?,?,?,?,'active',?,?,?)")
+                .bind(provider_id)
+                .bind(provider_id)
+                .bind(provider_id)
+                .bind("access")
+                .bind("refresh")
+                .bind(now)
+                .bind(now)
+                .bind(owner_id)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO provider_grants(provider_id,user_id,created_at) VALUES('provider-b','owner-a',?)")
+            .bind(now)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        state.balancer.reload_providers(&state.db).await.unwrap();
+
+        let granted = state
+            .balancer
+            .select(&state, "owner-a", false, None, Some("provider-a"))
+            .await
+            .unwrap();
+        assert_eq!(granted.provider.id, "provider-b");
+        assert!(
+            state
+                .balancer
+                .select(&state, "ungranted", false, None, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            state
+                .balancer
+                .select(&state, "ungranted", true, None, None)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]

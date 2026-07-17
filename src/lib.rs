@@ -105,6 +105,14 @@ pub fn router(state: AppState) -> Router {
                 .delete(api::delete_provider),
         )
         .route("/api/providers/{id}/test", post(api::test_provider))
+        .route(
+            "/api/providers/{id}/grants",
+            get(api::list_provider_grants).post(api::create_provider_grant),
+        )
+        .route(
+            "/api/providers/{id}/grants/{user_id}",
+            axum::routing::delete(api::delete_provider_grant),
+        )
         .route("/api/oauth/start", post(api::oauth_start))
         .route("/api/oauth/complete", post(api::oauth_complete))
         .route("/api/usage", get(api::usage))

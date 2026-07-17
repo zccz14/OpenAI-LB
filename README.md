@@ -27,6 +27,7 @@ OpenAI-LB 连接现有的品牌 Auth Mini 实例。用户不需要为 OpenAI-LB 
 ## 产品能力
 
 - 注册多组 CodeX OAuth `access_key` / `refresh_key`，支持 PKCE OAuth 和自动刷新。
+- 每个上游 Provider 记录 `owner_id`；普通用户可管理自己的 Provider，并按完整 `user_id` 授权其他用户使用。
 - 以 Consumer 为租户调用凭据，密钥只显示一次，数据库只保存 SHA-256 哈希。
 - 按 Consumer 汇总请求、Token、缓存 Token、错误和延迟。
 - 每次代理调用保留 Thread ID、请求 ID、用户、Consumer、上游提供商、接口、模型、状态、耗时和用量；请求/响应诊断记录仅对开启 `request_archive` 的 Consumer 保存，失败和客户端取消同样遵循该开关。
@@ -39,9 +40,9 @@ OpenAI-LB 连接现有的品牌 Auth Mini 实例。用户不需要为 OpenAI-LB 
 
 | 角色 | 权限 |
 | --- | --- |
-| `root` | 系统配置、用户角色、上游提供商、全局审计与个人 Consumer |
-| `admin` | 上游提供商、全局审计与个人 Consumer |
-| `user` | 个人 Consumer、个人用量与个人审计 |
+| `root` | 系统配置、用户角色、全部 Provider、全局审计与个人 Consumer；可使用全部 Provider |
+| `admin` | 全部 Provider、全局审计与个人 Consumer；可使用全部 Provider |
+| `user` | 自有 Provider 及其用户授权、个人 Consumer、个人用量与个人审计；可使用自有、获授权或由 `provider_access` 全局权限覆盖的 Provider |
 
 ## 调用示例
 
@@ -75,7 +76,7 @@ curl http://localhost:8080/v1/images/generations \
 
 SQLite 为单实例数据层。连接池中的每条连接统一启用 WAL、foreign keys、5 秒 busy timeout 和 `synchronous=NORMAL`，连接池上限为 4。
 
-代理热路径使用内存上游提供商快照和亲和映射。上游提供商 Rate Limit 观测、亲和持久化、过期清理和 cooldown 恢复由后台任务批量提交。逐调用审计与请求/响应诊断记录进入容量为 4096 的有界队列，由单 writer 以最多 128 条的事务写入；客户端取消仍结算为 HTTP 499。Consumer 的 `request_archive` 开关默认关闭，开启后才保存最多 1 MiB 的请求/响应正文预览并标记是否截断；认证、Cookie、Token、Secret 和 Consumer 凭据类请求头不会写入。诊断记录默认保留 24 小时，可由 root 在“设置”中配置为 1–365 天；后台每小时自动清理过期诊断记录，长期用量审计不受影响。写入或清理失败会在服务边界记录错误并持续重试，不会覆盖原始代理故障。
+代理热路径使用内存上游提供商与授权快照和亲和映射。每次选择先按调用用户过滤：具备全局权限时使用完整 Provider 池，否则只使用自有或已获授权的 Provider；随后在该集合内执行可用性、亲和和负载选择。撤销授权后重新加载快照，新请求立即停止使用对应 Provider。上游提供商 Rate Limit 观测、亲和持久化、过期清理和 cooldown 恢复由后台任务批量提交。逐调用审计与请求/响应诊断记录进入容量为 4096 的有界队列，由单 writer 以最多 128 条的事务写入；客户端取消仍结算为 HTTP 499。Consumer 的 `request_archive` 开关默认关闭，开启后才保存最多 1 MiB 的请求/响应正文预览并标记是否截断；认证、Cookie、Token、Secret 和 Consumer 凭据类请求头不会写入。诊断记录默认保留 24 小时，可由 root 在“设置”中配置为 1–365 天；后台每小时自动清理过期诊断记录，长期用量审计不受影响。写入或清理失败会在服务边界记录错误并持续重试，不会覆盖原始代理故障。
 
 音频 multipart 不会整体读入内存。请求体从 Axum `Body` 直接流入 Reqwest；因为流式请求体无法安全重放，音频上传开始后不执行跨上游提供商重试。Responses 和图像使用独立的小型 JSON 请求限制。
 

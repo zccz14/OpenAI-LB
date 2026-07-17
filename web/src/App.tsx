@@ -43,8 +43,10 @@ import {
   ScrollTextIcon,
   SettingsIcon,
   ShieldAlertIcon,
+  ShieldCheckIcon,
   SlidersHorizontalIcon,
   Trash2Icon,
+  UserPlusIcon,
   UserRoundCogIcon,
   XCircleIcon,
 } from "lucide-react"
@@ -177,6 +179,7 @@ type Provider = {
   id: string
   name: string
   account_id: string
+  owner_id?: string
   status: string
   manual_disabled: number
   cooldown_until?: number
@@ -185,6 +188,7 @@ type Provider = {
   inflight: number
   updated_at: number
 }
+type ProviderGrant = { user_id: string; created_at: number }
 type ProviderTokens = { access_key: string; refresh_key: string }
 type UsageWindow = {
   used_percent?: number
@@ -321,12 +325,12 @@ const copy = {
     continueAuthMini: "前往 Auth Mini 登录",
     loading: "正在加载 OpenAI-LB…",
     pageDashboard: "查看上游提供商容量与当前租户的 24 小时运行摘要。",
-    pageProviders: "注册、刷新、停用并观察 CodeX OAuth 上游提供商。",
+    pageProviders: "管理自己拥有的 CodeX OAuth Provider、运行状态与用户授权。",
     pageConsumers: "按 AI App 隔离下游消费者，分别跟踪调用量并独立吊销凭据。",
     pageUsage: "按消费者核算请求、Token、错误和延迟。",
     pageAudit: "逐次追踪请求、上游提供商、结果与用量；诊断内容按配置期限保留。",
     pageRequestDetail: "查看调用上下文、消息结构与同一 Thread ID 的相邻请求。",
-    pageUsers: "由 root 管理本地授权角色；用户身份仍由 Auth Mini 提供。",
+    pageUsers: "由 root 管理本地角色与全局 Provider 权限；用户身份仍由 Auth Mini 提供。",
     pageSettings: "确认身份边界、上游与部署限制。",
     operationalStatus: "运行状态",
     operationalDescription: "当前租户与上游提供商池的可行动摘要",
@@ -336,13 +340,14 @@ const copy = {
     errors24h: "24 小时错误",
     providerPool: "OAuth 上游提供商池",
     providerDescription:
-      "Token 以明文保存在 SQLite；管理员读取与变更会进入操作审计。",
+      "管理自己拥有的 OAuth 上游提供商；root 与管理员可管理全局 Provider。Token 读取与变更会进入操作审计。",
     addProvider: "添加上游提供商",
     noProviders: "尚无上游提供商",
     noProvidersDescription:
       "添加 access_key 与 refresh_key，或开始 PKCE OAuth。",
     name: "名称",
     account: "账户",
+    ownerId: "所有者 ID",
     status: "状态",
     recoveryReason: "恢复 / 原因",
     actions: "操作",
@@ -352,7 +357,7 @@ const copy = {
     oauthProviderAdded: "OAuth 上游提供商已添加",
     addProviderTitle: "添加 CodeX OAuth 上游提供商",
     addProviderDescription:
-      "直接导入凭据，或用 PKCE 授权后粘贴回调中的 code。Token 将以明文保存在 SQLite，并可由管理员再次读取和编辑。",
+      "直接导入凭据，或用 PKCE 授权后粘贴回调中的 code。Token 将以明文保存在 SQLite，并可由 Provider 所有者、root 或管理员再次读取和编辑。",
     accessClaimHelp: "必须是包含 CodeX account_id claim 的 JWT。",
     oauthCode: "OAuth code",
     oauthStateHelp: "State 已在服务器中一次性保存，有效期 10 分钟。",
@@ -372,6 +377,19 @@ const copy = {
       "此操作会永久删除该上游提供商及 Token；依赖该上游提供商的亲和记录也会一并删除。",
     confirmDeleteProvider: "确认删除",
     providerDeleted: "上游提供商已删除",
+    manageGrants: "授权",
+    providerGrantsTitle: "Provider 用户授权",
+    providerGrantsDescription:
+      "输入完整 user_id，允许该用户的全部 Consumer 使用此 Provider。所有者始终有权使用，无需重复授权。",
+    grantUserId: "完整 user_id",
+    grantUserIdHelp: "只进行精确匹配；当前不会搜索或展示用户目录。",
+    addGrant: "添加授权",
+    grantAdded: "Provider 授权已添加",
+    grantRemoved: "Provider 授权已移除",
+    noGrants: "尚未授权其他用户",
+    noGrantsDescription: "只有 Provider 所有者和具备全局权限的用户可以使用。",
+    grantedAt: "授权时间",
+    removeGrant: "移除授权",
     testProvider: "测试",
     testingProvider: "正在获取上游提供商 Usage…",
     testTitle: "上游提供商 Usage 测试",
@@ -507,10 +525,10 @@ const copy = {
     roleAdmin: "管理员",
     roleUser: "租户用户",
     loginUnknown: "认证失败，请重试。",
-    adminAuditTitle: "管理员操作审计",
+    adminAuditTitle: "Provider 操作审计",
     adminAuditDescription:
-      "记录上游提供商与 OAuth 管理操作、失败尝试、来源 IP 和目标。",
-    administrator: "管理员",
+      "记录 Provider 所有者、root 与管理员执行的 OAuth、Token、授权和 Provider 管理操作。",
+    administrator: "操作用户",
     action: "操作",
     target: "目标",
     clientIp: "客户端 IP",
@@ -537,13 +555,13 @@ const copy = {
       "Setup 完成后初始化入口会立即关闭；后续登录用户默认为 user。",
     usersTitle: "用户与上游提供商权限",
     usersDescription:
-      "新租户用户默认不能使用上游提供商；管理员可单独授权。管理员和 root 始终允许使用上游提供商。",
+      "此开关授予普通用户使用所有用户 Provider 的全局权限；逐 Provider 授权由 Provider 所有者在 Provider 页面管理。管理员和 root 始终拥有全局权限。",
     noUsers: "暂无用户",
     noUsersDescription: "用户首次通过 Auth Mini 登录后会自动出现在这里。",
     displayName: "显示名称",
     roleUpdated: "用户角色已更新",
-    providerAccess: "上游提供商访问",
-    providerAccessUpdated: "上游提供商访问权限已更新",
+    providerAccess: "全局 Provider 访问",
+    providerAccessUpdated: "全局 Provider 访问权限已更新",
     alwaysAllowed: "管理员始终允许",
     runtimeSettings: "运行配置",
     runtimeSettingsDescription:
@@ -583,7 +601,7 @@ const copy = {
     pageDashboard:
       "Review provider capacity and the tenant's 24-hour operating summary.",
     pageProviders:
-      "Register, refresh, disable, and observe CodeX OAuth providers.",
+      "Manage CodeX OAuth Providers you own, their runtime state, and user access.",
     pageConsumers:
       "Give each AI app its own downstream Consumer so usage, errors, and revocation stay isolated.",
     pageUsage:
@@ -593,7 +611,7 @@ const copy = {
     pageRequestDetail:
       "Review call context, message structure, and adjacent requests with the same Thread ID.",
     pageUsers:
-      "Root manages local authorization roles while Auth Mini remains the identity provider.",
+      "Root manages local roles and global Provider access while Auth Mini remains the identity provider.",
     pageSettings:
       "Confirm identity boundaries, upstream, and deployment limits.",
     operationalStatus: "Operational status",
@@ -604,13 +622,14 @@ const copy = {
     errors24h: "Errors in 24h",
     providerPool: "OAuth provider pool",
     providerDescription:
-      "Tokens are stored as plaintext in SQLite; administrator reads and changes are audited.",
+      "Manage OAuth providers you own. Root and administrators can manage the global pool. Token reads and changes are audited.",
     addProvider: "Add provider",
     noProviders: "No providers",
     noProvidersDescription:
       "Add access_key and refresh_key, or start PKCE OAuth.",
     name: "Name",
     account: "Account",
+    ownerId: "Owner ID",
     status: "Status",
     recoveryReason: "Recovery / reason",
     actions: "Actions",
@@ -620,7 +639,7 @@ const copy = {
     oauthProviderAdded: "OAuth provider added",
     addProviderTitle: "Add CodeX OAuth provider",
     addProviderDescription:
-      "Import credentials directly, or authorize with PKCE and paste the callback code. Tokens are stored as plaintext in SQLite and can be read and edited by administrators.",
+      "Import credentials directly, or authorize with PKCE and paste the callback code. Tokens are stored as plaintext in SQLite and can be read and edited by the Provider owner, root, or administrators.",
     accessClaimHelp: "Must be a JWT containing the CodeX account_id claim.",
     oauthCode: "OAuth code",
     oauthStateHelp:
@@ -641,6 +660,21 @@ const copy = {
       "This permanently deletes the provider and its Tokens. Affinity records that depend on it are deleted too.",
     confirmDeleteProvider: "Delete provider",
     providerDeleted: "Provider deleted",
+    manageGrants: "Access",
+    providerGrantsTitle: "Provider user access",
+    providerGrantsDescription:
+      "Enter a complete user_id to let all Consumers owned by that user use this Provider. The owner always has access and needs no grant.",
+    grantUserId: "Complete user_id",
+    grantUserIdHelp:
+      "Exact matches only. The user directory is not searched or displayed.",
+    addGrant: "Add access",
+    grantAdded: "Provider access added",
+    grantRemoved: "Provider access removed",
+    noGrants: "No additional users",
+    noGrantsDescription:
+      "Only the Provider owner and users with global access can use it.",
+    grantedAt: "Granted",
+    removeGrant: "Remove access",
     testProvider: "Test",
     testingProvider: "Fetching provider Usage…",
     testTitle: "Provider Usage test",
@@ -785,10 +819,10 @@ const copy = {
     roleAdmin: "Administrator",
     roleUser: "Tenant user",
     loginUnknown: "Authentication failed. Try again.",
-    adminAuditTitle: "Administrator action audit",
+    adminAuditTitle: "Provider operation audit",
     adminAuditDescription:
-      "Provider and OAuth operations, failed attempts, source IP, and target.",
-    administrator: "Administrator",
+      "Provider, OAuth, Token, and access operations performed by Provider owners, root, and administrators.",
+    administrator: "Actor",
     action: "Action",
     target: "Target",
     clientIp: "Client IP",
@@ -816,14 +850,14 @@ const copy = {
       "The setup endpoint closes immediately after completion. Later first-time users receive the user role.",
     usersTitle: "Users and provider access",
     usersDescription:
-      "New tenant users cannot use providers until an administrator grants access. Administrators and root always have access.",
+      "This switch lets a tenant user use every user's Provider. Provider owners manage per-Provider access on the Providers page. Administrators and root always have global access.",
     noUsers: "No users",
     noUsersDescription:
       "Users appear here after their first Auth Mini sign-in.",
     displayName: "Display name",
     roleUpdated: "User role updated",
-    providerAccess: "Provider access",
-    providerAccessUpdated: "Provider access updated",
+    providerAccess: "Global Provider access",
+    providerAccessUpdated: "Global Provider access updated",
     alwaysAllowed: "Administrators always allowed",
     runtimeSettings: "Runtime settings",
     runtimeSettingsDescription:
@@ -1230,9 +1264,7 @@ function Console({
     () =>
       [
         ["dashboard", CircleGaugeIcon],
-        ...(user?.role === "root" || user?.role === "admin"
-          ? [["providers", BoxesIcon]]
-          : []),
+        ["providers", BoxesIcon],
         ["consumers", KeyRoundIcon],
         ["usage", ActivityIcon],
         ["audit", ScrollTextIcon],
@@ -1434,6 +1466,7 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
   const [tokenDialog, setTokenDialog] =
     useState<ProviderTokenDialogState | null>(null)
   const [testState, setTestState] = useState<ProviderTestState | null>(null)
+  const [grantProvider, setGrantProvider] = useState<Provider | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<Provider | null>(null)
   const [deletePending, setDeletePending] = useState(false)
   const tokenRequest = useRef<AbortController | null>(null)
@@ -1561,6 +1594,7 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                   <TableRow>
                     <TableHead>{t.name}</TableHead>
                     <TableHead>{t.account}</TableHead>
+                    <TableHead>{t.ownerId}</TableHead>
                     <TableHead>{t.usageEmail}</TableHead>
                     <TableHead>{t.usagePlan}</TableHead>
                     <TableHead>{t.quotaRemaining}</TableHead>
@@ -1585,6 +1619,9 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                         </TableCell>
                         <TableCell className="font-mono text-xs">
                           {provider.account_id}
+                        </TableCell>
+                        <TableCell className="font-mono text-xs">
+                          {provider.owner_id || "—"}
                         </TableCell>
                         <TableCell className="text-xs">
                           {usageEmail(usage) || "—"}
@@ -1617,6 +1654,14 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                         </TableCell>
                         <TableCell>
                           <div className="flex justify-end gap-2">
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={() => setGrantProvider(provider)}
+                            >
+                              <ShieldCheckIcon data-icon="inline-start" />
+                              {t.manageGrants}
+                            </Button>
                             <Button
                               size="sm"
                               variant="outline"
@@ -1714,6 +1759,14 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
         state={testState}
         onClose={closeTest}
       />
+      {grantProvider && (
+        <ProviderGrantsDialog
+          sdk={sdk}
+          locale={locale}
+          provider={grantProvider}
+          onClose={() => setGrantProvider(null)}
+        />
+      )}
       <AlertDialog
         open={Boolean(deleteTarget)}
         onOpenChange={(next) =>
@@ -1954,6 +2007,165 @@ function ProviderTestDialog({
         )}
         <DialogFooter>
           <Button onClick={onClose}>{t.close}</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function ProviderGrantsDialog({
+  sdk,
+  locale,
+  provider,
+  onClose,
+}: {
+  sdk: AuthSdk
+  locale: Locale
+  provider: Provider
+  onClose: () => void
+}) {
+  const t = copy[locale]
+  const queryClient = useQueryClient()
+  const path = `/api/providers/${provider.id}/grants`
+  const { data, error, loading } = useApiQuery<ProviderGrant[]>(sdk, path)
+  const [userId, setUserId] = useState("")
+  const [pending, setPending] = useState(false)
+  const [removing, setRemoving] = useState<string | null>(null)
+
+  function refreshGrants() {
+    void queryClient.invalidateQueries({ queryKey: [path] })
+  }
+
+  async function addGrant(event: FormEvent) {
+    event.preventDefault()
+    const target = userId.trim()
+    if (!target || pending) return
+    setPending(true)
+    try {
+      await api(sdk, path, {
+        method: "POST",
+        body: JSON.stringify({ user_id: target }),
+      })
+      setUserId("")
+      refreshGrants()
+      toast.success(t.grantAdded)
+    } catch (cause) {
+      toast.error(message(cause, t))
+    } finally {
+      setPending(false)
+    }
+  }
+
+  async function removeGrant(user_id: string) {
+    if (removing) return
+    setRemoving(user_id)
+    try {
+      await api(sdk, `${path}/${encodeURIComponent(user_id)}`, {
+        method: "DELETE",
+      })
+      refreshGrants()
+      toast.success(t.grantRemoved)
+    } catch (cause) {
+      toast.error(message(cause, t))
+    } finally {
+      setRemoving(null)
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(next) => !next && onClose()}>
+      <DialogContent className="sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>
+            {t.providerGrantsTitle}: {provider.name}
+          </DialogTitle>
+          <DialogDescription>{t.providerGrantsDescription}</DialogDescription>
+        </DialogHeader>
+        <form onSubmit={addGrant}>
+          <FieldGroup>
+            <Field>
+              <FieldLabel htmlFor="provider-grant-user-id">
+                {t.grantUserId}
+              </FieldLabel>
+              <div className="flex flex-col gap-2 sm:flex-row">
+                <Input
+                  id="provider-grant-user-id"
+                  value={userId}
+                  onChange={(event) => setUserId(event.target.value)}
+                  autoComplete="off"
+                  spellCheck={false}
+                  required
+                />
+                <Button type="submit" disabled={pending || !userId.trim()}>
+                  {pending ? (
+                    <Spinner data-icon="inline-start" />
+                  ) : (
+                    <UserPlusIcon data-icon="inline-start" />
+                  )}
+                  {t.addGrant}
+                </Button>
+              </div>
+              <FieldDescription>{t.grantUserIdHelp}</FieldDescription>
+            </Field>
+          </FieldGroup>
+        </form>
+        {loading ? (
+          <div className="flex flex-col gap-2">
+            <Skeleton className="h-10 w-full" />
+            <Skeleton className="h-10 w-full" />
+          </div>
+        ) : error ? (
+          <ErrorState message={error} />
+        ) : data?.length ? (
+          <DataTable>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>{t.userId}</TableHead>
+                  <TableHead>{t.grantedAt}</TableHead>
+                  <TableHead className="text-right">{t.actions}</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {data.map((grant) => (
+                  <TableRow key={grant.user_id}>
+                    <TableCell className="font-mono text-xs">
+                      {grant.user_id}
+                    </TableCell>
+                    <TableCell className="tabular-nums">
+                      {formatTime(grant.created_at, locale)}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <Button
+                        size="icon-sm"
+                        variant="ghost"
+                        aria-label={`${t.removeGrant}: ${grant.user_id}`}
+                        disabled={removing === grant.user_id}
+                        onClick={() => void removeGrant(grant.user_id)}
+                      >
+                        {removing === grant.user_id ? <Spinner /> : <Trash2Icon />}
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </DataTable>
+        ) : (
+          <Empty>
+            <EmptyHeader>
+              <EmptyMedia variant="icon">
+                <ShieldCheckIcon />
+              </EmptyMedia>
+              <EmptyTitle>{t.noGrants}</EmptyTitle>
+              <EmptyDescription>{t.noGrantsDescription}</EmptyDescription>
+            </EmptyHeader>
+          </Empty>
+        )}
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>
+            {t.close}
+          </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

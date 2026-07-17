@@ -35,6 +35,13 @@ pub struct AppState {
     pub audit: AuditWriter,
     pub balancer: Balancer,
     pub refresh_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    pub(crate) oauth_flows: Arc<DashMap<String, OAuthFlow>>,
+}
+
+pub(crate) struct OAuthFlow {
+    pub verifier: String,
+    pub created_by: String,
+    pub expires_at: i64,
 }
 
 impl AppState {
@@ -61,6 +68,7 @@ impl AppState {
             audit,
             balancer,
             refresh_locks: Arc::new(DashMap::new()),
+            oauth_flows: Arc::new(DashMap::new()),
         })
     }
 }
@@ -282,7 +290,6 @@ pub(crate) async fn test_state_with_upstream(
         listen: "127.0.0.1:0".parse().unwrap(),
         data_dir: std::env::temp_dir(),
         database_path: std::path::PathBuf::from(":memory:"),
-        encryption_key: [9_u8; 32],
         setup_complete: true,
         auth_issuer: Some("http://auth.invalid".to_owned()),
         auth_audience: None,

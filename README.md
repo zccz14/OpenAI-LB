@@ -18,7 +18,6 @@ OpenAI-LB 是一个面向 OpenAI / CodeX OAuth 渠道的反向代理和负载均
 
 - 创建 `~/.openai-lb/`。
 - 创建 `~/.openai-lb/openai-lb.sqlite3` 并执行版本化迁移。
-- 创建 `~/.openai-lb/master.key`；Unix 权限固定为 `0600`。
 - 提供 Setup API 和 Setup GUI。
 
 打开 `http://localhost:8080`，填写品牌提供的 Auth Mini issuer，然后前往该 Auth Mini 实例的托管登录页面。登录成功后浏览器会返回 OpenAI-LB，再将当前用户绑定为唯一 `root`。Setup 完成后初始化入口立即关闭。
@@ -103,7 +102,7 @@ cargo build --release --locked
 
 ## 生产部署
 
-生产环境运行在 AWS Singapore 的 `openai-lb` EC2，并通过 <https://openai.ntnl.io> 提供 HTTPS 服务。Nginx 只负责 TLS 和流式反向代理；SQLite、master key 与应用配置保存在实例的 `/var/lib/openai-lb/.openai-lb/`。
+生产环境运行在 AWS Singapore 的 `openai-lb` EC2，并通过 <https://openai.ntnl.io> 提供 HTTPS 服务。Nginx 只负责 TLS 和流式反向代理；SQLite 与应用配置保存在实例的 `/var/lib/openai-lb/.openai-lb/`。
 
 推送 `v*` tag 后，Release workflow 会先发布三个官方平台资产，再使用 GitHub OIDC 和 AWS Systems Manager 将 Linux x86_64 资产部署到 EC2。部署过程校验 Release 的 SHA-256，使用 systemd 重启服务并执行本机健康检查；健康检查失败时恢复上一版本。仓库不保存 AWS 长期密钥，也不开放 SSH 入站端口。
 
@@ -126,11 +125,12 @@ Pull Request 工作流还会运行 RustSec 依赖审计。
 
 ## 安全说明
 
-- `master.key` 不进入 SQLite 或可执行文件。丢失该文件后，现有 OAuth 凭据无法解密。
+- OAuth PKCE verifier 只保存在单实例进程内，十分钟后过期；服务重启会使未完成的 OAuth 授权失效。
+- 升级前版本遗留的 `master.key` 已不再使用，可在新版本部署后删除。
 - 入站 `Authorization`、Cookie、hop-by-hop headers 和代理专用亲和头不会转发到上游。
 - 请求/响应诊断记录会保存最多 1 MiB 的正文预览以便排查；SQLite 文件因此可能包含 prompt、输出或音频片段，应按敏感业务数据保护并使用较短保留期。
 - 诊断记录不会保存 Authorization、Cookie、Token、Secret、API Key 类请求头或 OAuth 凭据。
-- SQLite 文件和 `master.key` 应位于本机磁盘；不要让多个实例通过网络文件系统同时写入同一数据库。
+- SQLite 文件应位于本机磁盘；不要让多个实例通过网络文件系统同时写入同一数据库。
 - 生产部署应在 OpenAI-LB 前提供 TLS，并限制数据目录的系统账户访问权限。
 
 ## License

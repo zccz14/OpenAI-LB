@@ -149,7 +149,8 @@ pub struct CreateConsumer {
 
 #[derive(Deserialize)]
 pub struct UpdateConsumer {
-    name: String,
+    name: Option<String>,
+    request_archive: Option<bool>,
 }
 
 fn consumer_name(value: &str) -> Result<&str, AppError> {
@@ -205,11 +206,6 @@ pub async fn create_consumer(
     ))
 }
 
-#[derive(Deserialize)]
-pub struct UpdateConsumer {
-    request_archive: bool,
-}
-
 pub async fn update_consumer(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -217,40 +213,37 @@ pub async fn update_consumer(
     Json(input): Json<UpdateConsumer>,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
-    let result = sqlx::query(
-        "UPDATE consumers SET request_archive=? WHERE id=? AND user_id=? AND revoked_at IS NULL",
+    if input.name.is_none() && input.request_archive.is_none() {
+        return Err(AppError::bad_request("consumer update is empty"));
+    }
+    let current = sqlx::query(
+        "SELECT name,request_archive,revoked_at FROM consumers WHERE id=? AND user_id=?",
     )
-    .bind(input.request_archive)
-    .bind(id)
-    .bind(user.id)
-    .execute(&state.db)
-    .await?;
-    if result.rows_affected() == 0 {
+    .bind(&id)
+    .bind(&user.id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::not_found("consumer not found"))?;
+    if input.request_archive.is_some() && current.get::<Option<i64>, _>(2).is_some() {
         return Err(AppError::not_found("consumer not found"));
     }
-    Ok(Json(
-        json!({"ok":true,"request_archive":input.request_archive}),
-    ))
-}
-
-pub async fn update_consumer(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(input): Json<UpdateConsumer>,
-) -> Result<Json<Value>, AppError> {
-    let user = browser_identity(&state, &headers).await?;
-    let name = consumer_name(&input.name)?;
-    let result = sqlx::query("UPDATE consumers SET name=? WHERE id=? AND user_id=?")
-        .bind(name)
+    let name = match input.name {
+        Some(name) => consumer_name(&name)?.to_owned(),
+        None => current.get(0),
+    };
+    let request_archive = input
+        .request_archive
+        .unwrap_or_else(|| current.get::<i64, _>(1) != 0);
+    sqlx::query("UPDATE consumers SET name=?,request_archive=? WHERE id=? AND user_id=?")
+        .bind(&name)
+        .bind(request_archive)
         .bind(&id)
         .bind(&user.id)
         .execute(&state.db)
         .await?;
-    if result.rows_affected() == 0 {
-        return Err(AppError::not_found("consumer not found"));
-    }
-    Ok(Json(json!({"id":id,"name":name})))
+    Ok(Json(
+        json!({"id":id,"name":name,"request_archive":request_archive}),
+    ))
 }
 
 pub async fn revoke_consumer(
@@ -1989,6 +1982,22 @@ mod tests {
                 .unwrap(),
             "Renamed app"
         );
+
+        let archive = provider_request(
+            &state,
+            Method::PATCH,
+            "/api/consumers/owned-consumer",
+            &token,
+            Some(json!({"request_archive":true})),
+        )
+        .await;
+        assert_eq!(archive.status(), StatusCode::OK);
+        let updated: (String, i64) =
+            sqlx::query_as("SELECT name,request_archive FROM consumers WHERE id='owned-consumer'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(updated, ("Renamed app".to_owned(), 1));
 
         let invalid = provider_request(
             &state,

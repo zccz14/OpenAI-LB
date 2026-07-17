@@ -666,12 +666,12 @@ pub async fn audit(
     let offset = page.offset.unwrap_or(0).max(0);
     let (sql, scope) = if is_admin(&user) {
         (
-            "SELECT c.id,c.request_id,c.user_id,k.prefix,c.channel_id,c.path,c.method,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at FROM api_calls c JOIN api_keys k ON k.id=c.api_key_id ORDER BY c.created_at DESC LIMIT ? OFFSET ?",
+            "SELECT c.id,c.request_id,c.user_id,k.prefix,c.channel_id,ch.name,c.path,c.method,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at FROM api_calls c JOIN api_keys k ON k.id=c.api_key_id LEFT JOIN channels ch ON ch.id=c.channel_id ORDER BY c.created_at DESC LIMIT ? OFFSET ?",
             None,
         )
     } else {
         (
-            "SELECT c.id,c.request_id,c.user_id,k.prefix,c.channel_id,c.path,c.method,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at FROM api_calls c JOIN api_keys k ON k.id=c.api_key_id WHERE c.user_id=? ORDER BY c.created_at DESC LIMIT ? OFFSET ?",
+            "SELECT c.id,c.request_id,c.user_id,k.prefix,c.channel_id,ch.name,c.path,c.method,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at FROM api_calls c JOIN api_keys k ON k.id=c.api_key_id LEFT JOIN channels ch ON ch.id=c.channel_id WHERE c.user_id=? ORDER BY c.created_at DESC LIMIT ? OFFSET ?",
             Some(user.id),
         )
     };
@@ -681,9 +681,9 @@ pub async fn audit(
     }
     let rows = query.bind(limit).bind(offset).fetch_all(&state.db).await?;
     Ok(Json(Value::Array(rows.into_iter().map(|row| json!({
-        "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"user_id":row.get::<String,_>(2),"key_prefix":row.get::<String,_>(3),"channel_id":row.get::<Option<String>,_>(4),
-        "path":row.get::<String,_>(5),"method":row.get::<String,_>(6),"model":row.get::<Option<String>,_>(7),"status":row.get::<i64,_>(8),"latency_ms":row.get::<i64,_>(9),
-        "input_tokens":row.get::<i64,_>(10),"output_tokens":row.get::<i64,_>(11),"cached_tokens":row.get::<i64,_>(12),"error":row.get::<Option<String>,_>(13),"client_ip":row.get::<Option<String>,_>(14),"created_at":row.get::<i64,_>(15)
+        "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"user_id":row.get::<String,_>(2),"key_prefix":row.get::<String,_>(3),"channel_id":row.get::<Option<String>,_>(4),"channel_name":row.get::<Option<String>,_>(5),
+        "path":row.get::<String,_>(6),"method":row.get::<String,_>(7),"model":row.get::<Option<String>,_>(8),"status":row.get::<i64,_>(9),"latency_ms":row.get::<i64,_>(10),
+        "input_tokens":row.get::<i64,_>(11),"output_tokens":row.get::<i64,_>(12),"cached_tokens":row.get::<i64,_>(13),"error":row.get::<Option<String>,_>(14),"client_ip":row.get::<Option<String>,_>(15),"created_at":row.get::<i64,_>(16)
     })).collect())))
 }
 
@@ -1389,6 +1389,21 @@ mod tests {
             )
             .await;
             assert_eq!(update.status(), StatusCode::OK);
+            let audit =
+                channel_request(&state, Method::GET, "/api/audit", &browser_token, None).await;
+            assert_eq!(audit.status(), StatusCode::OK);
+            let audits: Value =
+                serde_json::from_slice(&audit.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(
+                audits
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|audit| audit["id"] == call_id)
+                    .and_then(|audit| audit["channel_name"].as_str()),
+                Some("renamed")
+            );
             let test = channel_request(
                 &state,
                 Method::POST,

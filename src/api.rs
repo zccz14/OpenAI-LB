@@ -666,12 +666,12 @@ pub async fn audit(
     let offset = page.offset.unwrap_or(0).max(0);
     let (sql, scope) = if is_admin(&user) {
         (
-            "SELECT c.id,c.request_id,c.user_id,k.prefix,c.channel_id,ch.name,c.path,c.method,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at FROM api_calls c JOIN api_keys k ON k.id=c.api_key_id LEFT JOIN channels ch ON ch.id=c.channel_id ORDER BY c.created_at DESC LIMIT ? OFFSET ?",
+            "SELECT c.id,c.request_id,c.user_id,k.name,c.channel_id,ch.name,c.path,c.method,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at FROM api_calls c JOIN api_keys k ON k.id=c.api_key_id LEFT JOIN channels ch ON ch.id=c.channel_id ORDER BY c.created_at DESC LIMIT ? OFFSET ?",
             None,
         )
     } else {
         (
-            "SELECT c.id,c.request_id,c.user_id,k.prefix,c.channel_id,ch.name,c.path,c.method,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at FROM api_calls c JOIN api_keys k ON k.id=c.api_key_id LEFT JOIN channels ch ON ch.id=c.channel_id WHERE c.user_id=? ORDER BY c.created_at DESC LIMIT ? OFFSET ?",
+            "SELECT c.id,c.request_id,c.user_id,k.name,c.channel_id,ch.name,c.path,c.method,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at FROM api_calls c JOIN api_keys k ON k.id=c.api_key_id LEFT JOIN channels ch ON ch.id=c.channel_id WHERE c.user_id=? ORDER BY c.created_at DESC LIMIT ? OFFSET ?",
             Some(user.id),
         )
     };
@@ -681,7 +681,7 @@ pub async fn audit(
     }
     let rows = query.bind(limit).bind(offset).fetch_all(&state.db).await?;
     Ok(Json(Value::Array(rows.into_iter().map(|row| json!({
-        "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"user_id":row.get::<String,_>(2),"key_prefix":row.get::<String,_>(3),"channel_id":row.get::<Option<String>,_>(4),"channel_name":row.get::<Option<String>,_>(5),
+        "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"user_id":row.get::<String,_>(2),"key_name":row.get::<String,_>(3),"channel_id":row.get::<Option<String>,_>(4),"channel_name":row.get::<Option<String>,_>(5),
         "path":row.get::<String,_>(6),"method":row.get::<String,_>(7),"model":row.get::<Option<String>,_>(8),"status":row.get::<i64,_>(9),"latency_ms":row.get::<i64,_>(10),
         "input_tokens":row.get::<i64,_>(11),"output_tokens":row.get::<i64,_>(12),"cached_tokens":row.get::<i64,_>(13),"error":row.get::<Option<String>,_>(14),"client_ip":row.get::<Option<String>,_>(15),"created_at":row.get::<i64,_>(16)
     })).collect())))
@@ -695,12 +695,12 @@ pub async fn audit_detail(
     let user = browser_identity(&state, &headers).await?;
     let (sql, scope) = if is_admin(&user) {
         (
-            "SELECT c.id,c.request_id,c.user_id,k.prefix,c.channel_id,ch.name,c.method,c.path,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated FROM api_calls c JOIN api_keys k ON k.id=c.api_key_id LEFT JOIN channels ch ON ch.id=c.channel_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=?",
+            "SELECT c.id,c.request_id,c.user_id,k.name,c.channel_id,ch.name,c.method,c.path,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated FROM api_calls c JOIN api_keys k ON k.id=c.api_key_id LEFT JOIN channels ch ON ch.id=c.channel_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=?",
             None,
         )
     } else {
         (
-            "SELECT c.id,c.request_id,c.user_id,k.prefix,c.channel_id,ch.name,c.method,c.path,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated FROM api_calls c JOIN api_keys k ON k.id=c.api_key_id LEFT JOIN channels ch ON ch.id=c.channel_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=? AND c.user_id=?",
+            "SELECT c.id,c.request_id,c.user_id,k.name,c.channel_id,ch.name,c.method,c.path,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated FROM api_calls c JOIN api_keys k ON k.id=c.api_key_id LEFT JOIN channels ch ON ch.id=c.channel_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=? AND c.user_id=?",
             Some(user.id.clone()),
         )
     };
@@ -750,7 +750,7 @@ pub async fn audit_detail(
         .and_then(|index| navigation_rows.get(index));
     let next = position.and_then(|index| navigation_rows.get(index + 1));
     Ok(Json(json!({
-        "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"user_id":row.get::<String,_>(2),"key_prefix":row.get::<String,_>(3),
+        "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"user_id":row.get::<String,_>(2),"key_name":row.get::<String,_>(3),
         "channel_id":row.get::<Option<String>,_>(4),"channel_name":row.get::<Option<String>,_>(5),"method":row.get::<String,_>(6),"path":row.get::<String,_>(7),
         "model":row.get::<Option<String>,_>(8),"status":row.get::<i64,_>(9),"latency_ms":row.get::<i64,_>(10),"input_tokens":row.get::<i64,_>(11),
         "output_tokens":row.get::<i64,_>(12),"cached_tokens":row.get::<i64,_>(13),"error":row.get::<Option<String>,_>(14),"client_ip":row.get::<Option<String>,_>(15),
@@ -1509,6 +1509,15 @@ mod tests {
                     .and_then(|audit| audit["channel_name"].as_str()),
                 Some("renamed")
             );
+            assert_eq!(
+                audits
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|audit| audit["id"] == call_id)
+                    .and_then(|audit| audit["key_name"].as_str()),
+                Some("history")
+            );
             let detail = channel_request(
                 &state,
                 Method::GET,
@@ -1524,6 +1533,7 @@ mod tests {
             assert_eq!(detail["archive_available"], true);
             assert_eq!(detail["request_body"], json!(r#"{"input":"audit detail"}"#));
             assert_eq!(detail["response_body"], json!(r#"{"output":"diagnostic"}"#));
+            assert_eq!(detail["key_name"], "history");
             assert_eq!(detail["previous"]["id"], previous_id);
             let test = channel_request(
                 &state,

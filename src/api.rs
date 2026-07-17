@@ -687,6 +687,42 @@ pub async fn audit(
     })).collect())))
 }
 
+pub async fn audit_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let user = browser_identity(&state, &headers).await?;
+    let (sql, scope) = if is_admin(&user) {
+        (
+            "SELECT a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated FROM api_calls c LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=?",
+            None,
+        )
+    } else {
+        (
+            "SELECT a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated FROM api_calls c LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=? AND c.user_id=?",
+            Some(user.id),
+        )
+    };
+    let mut query = sqlx::query(sql).bind(&id);
+    if let Some(scope) = scope {
+        query = query.bind(scope);
+    }
+    let row = query
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::not_found("audit event not found"))?;
+    Ok(Json(json!({
+        "archive_available":row.get::<Option<String>,_>(0).is_some(),
+        "request_headers":row.get::<Option<String>,_>(1),
+        "request_body":row.get::<Option<Vec<u8>>,_>(2).map(|body| String::from_utf8_lossy(&body).into_owned()),
+        "request_body_truncated":row.get::<Option<i64>,_>(3).unwrap_or_default() != 0,
+        "response_headers":row.get::<Option<String>,_>(4),
+        "response_body":row.get::<Option<Vec<u8>>,_>(5).map(|body| String::from_utf8_lossy(&body).into_owned()),
+        "response_body_truncated":row.get::<Option<i64>,_>(6).unwrap_or_default() != 0
+    })))
+}
+
 pub async fn list_admin_audit(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1389,6 +1425,18 @@ mod tests {
             )
             .await;
             assert_eq!(update.status(), StatusCode::OK);
+            sqlx::query("INSERT INTO request_archives(api_call_id,request_headers_json,request_body,request_body_truncated,response_headers_json,response_body,response_body_truncated,created_at) VALUES(?,?,?,?,?,?,?,?)")
+                .bind(&call_id)
+                .bind(r#"[["content-type","application/json"]]"#)
+                .bind(br#"{"input":"audit detail"}"#.as_slice())
+                .bind(0)
+                .bind(r#"[["content-type","application/json"]]"#)
+                .bind(br#"{"output":"diagnostic"}"#.as_slice())
+                .bind(0)
+                .bind(now)
+                .execute(&state.db)
+                .await
+                .unwrap();
             let audit =
                 channel_request(&state, Method::GET, "/api/audit", &browser_token, None).await;
             assert_eq!(audit.status(), StatusCode::OK);
@@ -1404,6 +1452,21 @@ mod tests {
                     .and_then(|audit| audit["channel_name"].as_str()),
                 Some("renamed")
             );
+            let detail = channel_request(
+                &state,
+                Method::GET,
+                &format!("/api/audit/{call_id}"),
+                &browser_token,
+                None,
+            )
+            .await;
+            assert_eq!(detail.status(), StatusCode::OK);
+            let detail: Value =
+                serde_json::from_slice(&detail.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(detail["archive_available"], true);
+            assert_eq!(detail["request_body"], json!(r#"{"input":"audit detail"}"#));
+            assert_eq!(detail["response_body"], json!(r#"{"output":"diagnostic"}"#));
             let test = channel_request(
                 &state,
                 Method::POST,
@@ -1453,6 +1516,28 @@ mod tests {
         sqlx::query("INSERT INTO channels(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES('tenant-channel','tenant','tenant','access','refresh',?,?)")
             .bind(now).bind(now).execute(&state.db).await.unwrap();
         let tenant_token = setup_token(&signing, &issuer, "tenant-user");
+        sqlx::query("INSERT INTO api_keys(id,user_id,name,prefix,secret_hash,created_at) VALUES('tenant-audit-key','tenant-user','tenant audit','sk-tenant-audit','tenant-audit-hash',?)")
+            .bind(now).execute(&state.db).await.unwrap();
+        sqlx::query("INSERT INTO api_calls(id,request_id,api_key_id,user_id,method,path,status,latency_ms,created_at) VALUES('tenant-audit-call','tenant-audit-request','tenant-audit-key','tenant-user','POST','/v1/responses',200,1,?)")
+            .bind(now).execute(&state.db).await.unwrap();
+        let tenant_detail = channel_request(
+            &state,
+            Method::GET,
+            "/api/audit/tenant-audit-call",
+            &tenant_token,
+            None,
+        )
+        .await;
+        assert_eq!(tenant_detail.status(), StatusCode::OK);
+        let foreign_detail = channel_request(
+            &state,
+            Method::GET,
+            "/api/audit/call-root-user",
+            &tenant_token,
+            None,
+        )
+        .await;
+        assert_eq!(foreign_detail.status(), StatusCode::NOT_FOUND);
         for (method, path, body) in [
             (Method::GET, "/api/channels/usage", None),
             (Method::GET, "/api/channels/tenant-channel", None),

@@ -37,6 +37,7 @@ import {
   LanguagesIcon,
   LogInIcon,
   LogOutIcon,
+  PencilIcon,
   PlusIcon,
   RefreshCwIcon,
   ScrollTextIcon,
@@ -394,6 +395,9 @@ const copy = {
     revoked: "已吊销",
     active: "有效",
     revoke: "吊销",
+    editConsumer: "编辑",
+    saveConsumer: "保存",
+    consumerUpdated: "Consumer 已更新",
     revokeTitle: "吊销 Consumer？",
     revokeDescription: "此操作不可撤销；使用该 Consumer 的所有调用将立即失败。",
     cancel: "取消",
@@ -658,6 +662,9 @@ const copy = {
     revoked: "Revoked",
     active: "Active",
     revoke: "Revoke",
+    editConsumer: "Edit",
+    saveConsumer: "Save",
+    consumerUpdated: "Consumer updated",
     revokeTitle: "Revoke Consumer?",
     revokeDescription:
       "This cannot be undone. Every caller using this Consumer will fail immediately.",
@@ -2110,6 +2117,9 @@ function Consumers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
   const [open, setOpen] = useState(false)
   const [secret, setSecret] = useState("")
   const [revokeId, setRevokeId] = useState<string | null>(null)
+  const [editTarget, setEditTarget] = useState<Consumer | null>(null)
+  const [editName, setEditName] = useState("")
+  const [editPending, setEditPending] = useState(false)
   const { data, error, loading } = useApiQuery<Consumer[]>(sdk, "/api/consumers")
   function refreshConsumers() {
     void queryClient.invalidateQueries({ queryKey: ["/api/consumers"] })
@@ -2137,6 +2147,28 @@ function Consumers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
       toast.success(t.consumerRevoked)
     } catch (cause) {
       toast.error(message(cause, t))
+    }
+  }
+  function openEdit(consumer: Consumer) {
+    setEditTarget(consumer)
+    setEditName(consumer.name)
+  }
+  async function update(event: FormEvent) {
+    event.preventDefault()
+    if (!editTarget || editPending) return
+    setEditPending(true)
+    try {
+      await api(sdk, `/api/consumers/${editTarget.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name: editName }),
+      })
+      setEditTarget(null)
+      refreshConsumers()
+      toast.success(t.consumerUpdated)
+    } catch (cause) {
+      toast.error(message(cause, t))
+    } finally {
+      setEditPending(false)
     }
   }
   if (loading) return <LoadingTable />
@@ -2199,6 +2231,14 @@ function Consumers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                         <Button
                           size="sm"
                           variant="ghost"
+                          onClick={() => openEdit(consumer)}
+                        >
+                          <PencilIcon data-icon="inline-start" />
+                          {t.editConsumer}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
                           disabled={Boolean(consumer.revoked_at)}
                           onClick={() => setRevokeId(consumer.id)}
                         >
@@ -2233,6 +2273,38 @@ function Consumers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
               <DialogFooter>
                 <Button type="submit" disabled={!name.trim()}>
                   {t.create}
+                </Button>
+              </DialogFooter>
+            </FieldGroup>
+          </form>
+        </DialogContent>
+      </Dialog>
+      <Dialog
+        open={Boolean(editTarget)}
+        onOpenChange={(next) => !next && !editPending && setEditTarget(null)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t.editConsumer} Consumer</DialogTitle>
+          </DialogHeader>
+          <form onSubmit={update}>
+            <FieldGroup>
+              <Field>
+                <FieldLabel htmlFor="consumer-edit-name">{t.name}</FieldLabel>
+                <Input
+                  id="consumer-edit-name"
+                  value={editName}
+                  onChange={(event) => setEditName(event.target.value)}
+                  required
+                />
+              </Field>
+              <DialogFooter>
+                <Button
+                  type="submit"
+                  disabled={editPending || !editName.trim()}
+                >
+                  {editPending && <Spinner data-icon="inline-start" />}
+                  {t.saveConsumer}
                 </Button>
               </DialogFooter>
             </FieldGroup>

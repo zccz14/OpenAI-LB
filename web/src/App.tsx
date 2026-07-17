@@ -236,7 +236,7 @@ type UsageRow = {
 type UsageResponse = { period: UsagePeriod; since: number; rows: UsageRow[] }
 type PivotCell = Pick<
   UsageRow,
-  "input_tokens" | "cached_tokens" | "output_tokens"
+  "requests" | "input_tokens" | "cached_tokens" | "output_tokens"
 >
 type PivotTableRow = {
   id: string
@@ -447,6 +447,7 @@ const copy = {
     allUsers: "全部用户",
     allConsumers: "全部消费者",
     allModels: "全部模型",
+    userLabel: "用户",
     model: "模型",
     consumerLabel: "消费者",
     date: "日期",
@@ -457,12 +458,14 @@ const copy = {
     inputTokens: "输入 Token",
     cachedInputTokens: "缓存输入 Token",
     outputTokens: "输出 Token",
+    requestCount: "请求次数",
     usageRows: "条聚合记录",
     sortColumn: "排序",
     total: "总计",
     clearFilters: "清除筛选",
     pivotFields: "透视字段",
     groupOrder: "分组顺序",
+    dataOrder: "数据列顺序",
     sum: "求和",
     auditTitle: "逐调用审计",
     auditDescription:
@@ -737,6 +740,7 @@ const copy = {
     allUsers: "All users",
     allConsumers: "All Consumers",
     allModels: "All models",
+    userLabel: "User",
     model: "Model",
     consumerLabel: "Consumer",
     date: "Date",
@@ -747,12 +751,14 @@ const copy = {
     inputTokens: "Input Tokens",
     cachedInputTokens: "Cached Input Tokens",
     outputTokens: "Output Tokens",
+    requestCount: "Request count",
     usageRows: "aggregated rows",
     sortColumn: "Sort",
     total: "Total",
     clearFilters: "Clear filters",
     pivotFields: "Pivot fields",
     groupOrder: "Grouping order",
+    dataOrder: "Data column order",
     sum: "Sum",
     auditTitle: "Per-call audit",
     auditDescription:
@@ -2666,8 +2672,13 @@ function UsagePage({
   )
   const rows = useMemo(() => data?.rows ?? [], [data])
   const fieldLabels = useMemo<Record<PivotDimension, string>>(
-    () => ({ user: t.userId, consumer: t.consumerLabel, model: t.model, date: t.date }),
-    [t],
+    () => ({
+      user: t.userLabel,
+      consumer: t.consumerLabel,
+      model: t.model,
+      date: t.date,
+    }),
+    [t]
   )
   const users = useMemo(
     () => uniqueUsageOptions(rows, (row) => row.user_id, usageUserLabel),
@@ -2793,7 +2804,8 @@ function UsagePage({
           ))}
           {user.role !== "user" && (
             <UsageSelect
-              ariaLabel={t.userId}
+              id="usage-user-filter"
+              label={t.userLabel}
               value={userFilter}
               onValueChange={setUserFilter}
               allLabel={t.allUsers}
@@ -2801,14 +2813,16 @@ function UsagePage({
             />
           )}
           <UsageSelect
-            ariaLabel={t.consumerLabel}
+            id="usage-consumer-filter"
+            label={t.consumerLabel}
             value={consumerFilter}
             onValueChange={setConsumerFilter}
             allLabel={t.allConsumers}
             options={consumers}
           />
           <UsageSelect
-            ariaLabel={t.model}
+            id="usage-model-filter"
+            label={t.model}
             value={modelFilter}
             onValueChange={setModelFilter}
             allLabel={t.allModels}
@@ -2837,32 +2851,42 @@ function UsagePage({
           <div className="flex flex-col gap-1.5">
             <PivotOrder
               label={t.rows}
-              dimensions={rowDimensions}
-              labels={fieldLabels}
+              items={rowDimensions}
+              itemLabel={(dimension) => fieldLabels[dimension]}
               onChange={setRowDimensions}
             />
             <PivotOrder
               label={t.columns}
-              dimensions={columnDimensions}
-              labels={fieldLabels}
+              items={columnDimensions}
+              itemLabel={(dimension) => fieldLabels[dimension]}
               onChange={setColumnDimensions}
             />
           </div>
-          <div className="flex flex-wrap items-center gap-1.5">
-            <span className="text-muted-foreground">{t.data}</span>
-            {usageMetrics.map((field) => (
-              <Button
-                key={field}
-                size="xs"
-                variant={dataFields.includes(field) ? "secondary" : "ghost"}
-                aria-pressed={dataFields.includes(field)}
-                onClick={() =>
-                  setDataFields((current) => toggleUsageMetric(current, field))
-                }
-              >
-                {usageAggregateLabel(field, t)}
-              </Button>
-            ))}
+          <div className="flex flex-col gap-1.5">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-muted-foreground">{t.data}</span>
+              {usageMetrics.map((field) => (
+                <Button
+                  key={field}
+                  size="xs"
+                  variant={dataFields.includes(field) ? "secondary" : "ghost"}
+                  aria-pressed={dataFields.includes(field)}
+                  onClick={() =>
+                    setDataFields((current) =>
+                      toggleUsageMetric(current, field)
+                    )
+                  }
+                >
+                  {usageAggregateLabel(field, t)}
+                </Button>
+              ))}
+            </div>
+            <PivotOrder
+              label={t.dataOrder}
+              items={dataFields}
+              itemLabel={(field) => usageAggregateLabel(field, t)}
+              onChange={setDataFields}
+            />
           </div>
         </div>
         <span className="text-xs text-muted-foreground tabular-nums">
@@ -2943,39 +2967,44 @@ function UsagePage({
 }
 
 function UsageSelect({
-  ariaLabel,
+  id,
+  label,
   value,
   onValueChange,
   allLabel,
   options,
 }: {
-  ariaLabel: string
+  id: string
+  label: string
   value: string
   onValueChange: (value: string) => void
   allLabel: string
   options: [string, string][]
 }) {
   return (
-    <Select
-      value={value}
-      onValueChange={(next) => {
-        if (next) onValueChange(next)
-      }}
-    >
-      <SelectTrigger className="max-w-52" aria-label={ariaLabel}>
-        <SelectValue />
-      </SelectTrigger>
-      <SelectContent>
-        <SelectGroup>
-          <SelectItem value="all">{allLabel}</SelectItem>
-          {options.map(([optionValue, label]) => (
-            <SelectItem key={optionValue} value={optionValue}>
-              {label}
-            </SelectItem>
-          ))}
-        </SelectGroup>
-      </SelectContent>
-    </Select>
+    <Field orientation="horizontal" className="w-auto">
+      <FieldLabel htmlFor={id}>{label}</FieldLabel>
+      <Select
+        value={value}
+        onValueChange={(next) => {
+          if (next) onValueChange(next)
+        }}
+      >
+        <SelectTrigger id={id} className="max-w-52">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectGroup>
+            <SelectItem value="all">{allLabel}</SelectItem>
+            {options.map(([optionValue, optionLabel]) => (
+              <SelectItem key={optionValue} value={optionValue}>
+                {optionLabel}
+              </SelectItem>
+            ))}
+          </SelectGroup>
+        </SelectContent>
+      </Select>
+    </Field>
   )
 }
 
@@ -3021,44 +3050,42 @@ function PivotFieldAssignment({
   )
 }
 
-function PivotOrder({
+function PivotOrder<T extends string>({
   label,
-  dimensions,
-  labels,
+  items,
+  itemLabel,
   onChange,
 }: {
   label: string
-  dimensions: PivotDimension[]
-  labels: Record<PivotDimension, string>
-  onChange: (dimensions: PivotDimension[]) => void
+  items: T[]
+  itemLabel: (item: T) => string
+  onChange: (items: T[]) => void
 }) {
   return (
     <div className="flex flex-wrap items-center gap-1">
       <span className="mr-1 text-muted-foreground">{label}</span>
-      {dimensions.length ? (
-        dimensions.map((dimension, index) => (
+      {items.length ? (
+        items.map((item, index) => (
           <span
-            key={dimension}
+            key={item}
             className="inline-flex items-center rounded-md border bg-muted/50 pl-2"
           >
-            <span>{labels[dimension]}</span>
+            <span>{itemLabel(item)}</span>
             <Button
               size="icon-xs"
               variant="ghost"
-              aria-label={`${label}: ${labels[dimension]} ←`}
+              aria-label={`${label}: ${itemLabel(item)} ←`}
               disabled={index === 0}
-              onClick={() =>
-                onChange(movePivotDimension(dimensions, index, -1))
-              }
+              onClick={() => onChange(movePivotItem(items, index, -1))}
             >
               <ChevronLeftIcon />
             </Button>
             <Button
               size="icon-xs"
               variant="ghost"
-              aria-label={`${label}: ${labels[dimension]} →`}
-              disabled={index === dimensions.length - 1}
-              onClick={() => onChange(movePivotDimension(dimensions, index, 1))}
+              aria-label={`${label}: ${itemLabel(item)} →`}
+              disabled={index === items.length - 1}
+              onClick={() => onChange(movePivotItem(items, index, 1))}
             >
               <ChevronRightIcon />
             </Button>
@@ -4024,6 +4051,7 @@ type UsageMetric = keyof PivotCell
 
 const pivotDimensions: PivotDimension[] = ["user", "consumer", "model", "date"]
 const usageMetrics: UsageMetric[] = [
+  "requests",
   "input_tokens",
   "output_tokens",
   "cached_tokens",
@@ -4043,6 +4071,7 @@ function usageDimensionLabel(row: UsageRow, dimension: PivotDimension) {
       : row[dimension]
 }
 function usageAggregateLabel(metric: UsageMetric, t: typeof copy.zh) {
+  if (metric === "requests") return `COUNT(${t.requestCount})`
   return `SUM(${metric === "input_tokens" ? t.inputTokens : metric === "cached_tokens" ? t.cachedInputTokens : t.outputTokens})`
 }
 function uniqueUsageOptions(
@@ -4071,12 +4100,8 @@ function appendPivotDimension(
     ? dimensions
     : [...dimensions, dimension]
 }
-function movePivotDimension(
-  dimensions: PivotDimension[],
-  index: number,
-  distance: number
-) {
-  const next = [...dimensions]
+function movePivotItem<T>(items: T[], index: number, distance: number) {
+  const next = [...items]
   const target = index + distance
   ;[next[index], next[target]] = [next[target], next[index]]
   return next
@@ -4102,10 +4127,12 @@ function pivotUsageRows(
     columns.set(columnId, { id: columnId, label: label(row) })
     const pivotRow = grouped.get(rowId) ?? { id: rowId, values: row, cells: {} }
     const cell = pivotRow.cells[columnId] ?? {
+      requests: 0,
       input_tokens: 0,
       cached_tokens: 0,
       output_tokens: 0,
     }
+    cell.requests += row.requests
     cell.input_tokens += row.input_tokens
     cell.cached_tokens += row.cached_tokens
     cell.output_tokens += row.output_tokens

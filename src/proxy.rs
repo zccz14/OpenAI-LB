@@ -69,6 +69,7 @@ impl AuditTracker {
         state: &AppState,
         identity: &ApiIdentity,
         request_id: &str,
+        thread_id: Option<&str>,
         method: &Method,
         path: &str,
         client_ip: &str,
@@ -83,6 +84,7 @@ impl AuditTracker {
             event: Some(AuditEvent {
                 id: Uuid::new_v4().to_string(),
                 request_id: request_id.to_owned(),
+                thread_id: thread_id.map(str::to_owned),
                 consumer_id: identity.consumer_id.clone(),
                 user_id: identity.user_id.clone(),
                 request_archive: identity.request_archive,
@@ -256,12 +258,14 @@ pub async fn handle_json(
     body: Bytes,
 ) -> Result<Response, AppError> {
     let request_id = request_id(&headers);
+    let thread_id = thread_id(&headers);
     let identity = api_identity(&state, &headers).await?;
     let client_ip = peer.ip().to_string();
     let mut audit = AuditTracker::begin(
         &state,
         &identity,
         &request_id,
+        thread_id.as_deref(),
         &method,
         uri.path(),
         &client_ip,
@@ -301,11 +305,13 @@ pub async fn handle_audio(
     body: Body,
 ) -> Result<Response, AppError> {
     let request_id = request_id(&headers);
+    let thread_id = thread_id(&headers);
     let identity = api_identity(&state, &headers).await?;
     let mut audit = AuditTracker::begin(
         &state,
         &identity,
         &request_id,
+        thread_id.as_deref(),
         &method,
         uri.path(),
         &peer.ip().to_string(),
@@ -344,11 +350,13 @@ pub async fn handle_models(
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let request_id = request_id(&headers);
+    let thread_id = thread_id(&headers);
     let identity = api_identity(&state, &headers).await?;
     let mut audit = AuditTracker::begin(
         &state,
         &identity,
         &request_id,
+        thread_id.as_deref(),
         &method,
         uri.path(),
         &peer.ip().to_string(),
@@ -416,6 +424,19 @@ fn request_id(headers: &HeaderMap) -> String {
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| Uuid::new_v4().to_string())
+}
+
+fn thread_id(headers: &HeaderMap) -> Option<String> {
+    ["x-codex-conversation-id", "thread-id"]
+        .iter()
+        .find_map(|name| {
+            headers
+                .get(*name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
 }
 
 async fn dispatch(
@@ -1449,6 +1470,49 @@ mod tests {
     }
 
     #[test]
+    fn thread_id_extracts_existing_downstream_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("thread-id", HeaderValue::from_static("app-thread"));
+        assert_eq!(thread_id(&headers).as_deref(), Some("app-thread"));
+
+        headers.insert(
+            "x-codex-conversation-id",
+            HeaderValue::from_static("codex-thread"),
+        );
+        assert_eq!(thread_id(&headers).as_deref(), Some("codex-thread"));
+
+        headers.clear();
+        assert_eq!(thread_id(&headers), None);
+    }
+
+    #[tokio::test]
+    async fn thread_id_is_persisted_without_request_recording() {
+        let state = crate::test_state("http://token.invalid").await;
+        seed_proxy(&state, false).await;
+        sqlx::query("UPDATE consumers SET request_archive=0 WHERE id='key-1'")
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let app = crate::router(state.clone());
+        let mut request = proxy_request("/v1/models", "application/json", Body::empty());
+        request.headers_mut().insert(
+            "x-codex-conversation-id",
+            HeaderValue::from_static("codex-thread"),
+        );
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        wait_for_audits(&state, 1).await;
+        let stored: (Option<String>, i64) = sqlx::query_as(
+            "SELECT c.thread_id,COUNT(a.api_call_id) FROM api_calls c LEFT JOIN request_archives a ON a.api_call_id=c.id",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(stored, (Some("codex-thread".to_owned()), 0));
+    }
+
+    #[test]
     fn reads_usage_without_retaining_prompt() {
         let usage = usage_from_value(
             &json!({"usage":{"input_tokens":10,"output_tokens":4,"input_tokens_details":{"cached_tokens":3}}}),
@@ -1525,6 +1589,7 @@ mod tests {
             &state,
             &identity,
             "request-1",
+            Some("thread-1"),
             &Method::GET,
             "/v1/models",
             "127.0.0.1",
@@ -1579,6 +1644,7 @@ mod tests {
             &state,
             &identity,
             "cancelled-stream",
+            Some("cancelled-thread"),
             &Method::POST,
             "/v1/responses",
             "127.0.0.1",
@@ -1649,6 +1715,7 @@ mod tests {
             &state,
             &identity,
             "deleted-provider-request",
+            Some("deleted-provider-thread"),
             &Method::POST,
             "/v1/responses",
             "127.0.0.1",
@@ -2124,6 +2191,7 @@ mod tests {
             &state,
             &identity,
             "stream-request",
+            Some("stream-thread"),
             &Method::POST,
             "/v1/responses",
             "127.0.0.1",

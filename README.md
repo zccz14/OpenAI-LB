@@ -29,7 +29,7 @@ OpenAI-LB 连接现有的品牌 Auth Mini 实例。用户不需要为 OpenAI-LB 
 - 注册多组 CodeX OAuth `access_key` / `refresh_key`，支持 PKCE OAuth 和自动刷新。
 - 以 Consumer 为租户调用凭据，密钥只显示一次，数据库只保存 SHA-256 哈希。
 - 按 Consumer 汇总请求、Token、缓存 Token、错误和延迟。
-- 每次代理调用保留请求 ID、用户、Consumer、上游提供商、接口、模型、状态、耗时和用量；请求/响应诊断记录仅对开启 `request_archive` 的 Consumer 保存，失败和客户端取消同样遵循该开关。
+- 每次代理调用保留 Thread ID、请求 ID、用户、Consumer、上游提供商、接口、模型、状态、耗时和用量；请求/响应诊断记录仅对开启 `request_archive` 的 Consumer 保存，失败和客户端取消同样遵循该开关。
 - 支持显式亲和键、会话头和 Responses 会话字段；亲和键在持久化前进行 SHA-256 哈希。
 - 跟踪 `Retry-After` 与 `x-ratelimit-*`，对 429 上游提供商自动冷却并在到期后恢复。
 - 对 401/403 上游提供商标记认证错误；手工禁用上游提供商不会自动恢复。
@@ -54,6 +54,8 @@ curl http://localhost:8080/v1/responses \
   -H 'x-lb-affinity-key: deployment-a' \
   -d '{"model":"gpt-5.4","input":"Explain this Rust error","stream":true}'
 ```
+
+Thread ID 是逐调用审计从下游请求中提取的线程标识。CodeX 请求使用 `x-codex-conversation-id`，其他 App 可使用其已有的 `thread-id`；请求未携带这两个头时，审计记录中的 Thread ID 为空。Thread ID 属于基础审计字段，无论 Consumer 是否开启 `request_archive` 都会落库；代理不会向响应添加额外字段或请求头。
 
 ```bash
 curl http://localhost:8080/v1/audio/transcriptions \

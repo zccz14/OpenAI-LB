@@ -243,6 +243,7 @@ type PivotColumn = { id: string; label: string }
 type Audit = {
   id: string
   request_id: string
+  thread_id?: string
   user_id: string
   consumer_name: string
   provider_id?: string
@@ -324,7 +325,7 @@ const copy = {
     pageConsumers: "按 AI App 隔离下游消费者，分别跟踪调用量并独立吊销凭据。",
     pageUsage: "按消费者核算请求、Token、错误和延迟。",
     pageAudit: "逐次追踪请求、上游提供商、结果与用量；诊断内容按配置期限保留。",
-    pageRequestDetail: "查看调用上下文、消息结构与同一亲和链的相邻请求。",
+    pageRequestDetail: "查看调用上下文、消息结构与同一 Thread ID 的相邻请求。",
     pageUsers: "由 root 管理本地授权角色；用户身份仍由 Auth Mini 提供。",
     pageSettings: "确认身份边界、上游与部署限制。",
     operationalStatus: "运行状态",
@@ -452,8 +453,9 @@ const copy = {
     noAuditDescription: "每次代理调用结束后都会写入基础审计记录。",
     time: "时间",
     requestId: "请求 ID",
+    threadId: "Thread ID",
+    copyThreadId: "复制 Thread ID",
     provider: "上游提供商",
-    endpointModel: "接口 / 模型",
     latency: "延迟",
     cachedInput: "缓存输入",
     details: "详情",
@@ -589,7 +591,7 @@ const copy = {
     pageAudit:
       "Trace each request, provider, result, and usage; diagnostic content follows the configured retention.",
     pageRequestDetail:
-      "Review call context, message structure, and adjacent requests in the same affinity chain.",
+      "Review call context, message structure, and adjacent requests with the same Thread ID.",
     pageUsers:
       "Root manages local authorization roles while Auth Mini remains the identity provider.",
     pageSettings:
@@ -726,8 +728,9 @@ const copy = {
       "A basic audit record is written when each proxy call terminates.",
     time: "Time",
     requestId: "Request ID",
+    threadId: "Thread ID",
+    copyThreadId: "Copy Thread ID",
     provider: "Provider",
-    endpointModel: "Endpoint / model",
     latency: "Latency",
     cachedInput: "Cached input",
     details: "Details",
@@ -2921,7 +2924,8 @@ function AuditPage({
                 <TableHeader>
                   <TableRow>
                     <TableHead>{t.time}</TableHead>
-                    <TableHead>{t.endpointModel}</TableHead>
+                    <TableHead>{t.threadId}</TableHead>
+                    <TableHead>{t.model}</TableHead>
                     <TableHead>{t.consumer}</TableHead>
                     <TableHead>{t.userId}</TableHead>
                     <TableHead>{t.provider}</TableHead>
@@ -2937,22 +2941,42 @@ function AuditPage({
                         {formatTime(row.created_at, locale)}
                       </TableCell>
                       <TableCell>
-                        <div className="flex max-w-56 flex-col gap-0.5">
-                          <span className="font-medium">{row.path}</span>
-                          <code>{row.model || "—"}</code>
-                          <code
-                            title={row.request_id}
-                            aria-label={`${t.requestId}: ${row.request_id}`}
-                          >
-                            {row.request_id.slice(0, 12)}…
-                          </code>
-                        </div>
+                        {row.thread_id ? (
+                          <div className="flex items-center gap-1">
+                            <code
+                              title={row.thread_id}
+                              aria-label={`${t.threadId}: ${row.thread_id}`}
+                            >
+                              {row.thread_id.slice(0, 12)}
+                              {row.thread_id.length > 12 && "…"}
+                            </code>
+                            <Button
+                              size="icon-xs"
+                              variant="ghost"
+                              aria-label={`${t.copyThreadId}: ${row.thread_id}`}
+                              onClick={() =>
+                                void navigator.clipboard
+                                  .writeText(row.thread_id!)
+                                  .then(() => toast.success(t.copied))
+                              }
+                            >
+                              <ClipboardIcon />
+                            </Button>
+                          </div>
+                        ) : (
+                          "—"
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        <code>{row.model || "—"}</code>
                       </TableCell>
                       <TableCell className="font-medium">
                         {row.consumer_name}
                       </TableCell>
                       <TableCell>
-                        <code>{row.user_id}</code>
+                        <code title={row.user_id}>
+                          {row.user_id.slice(0, 8)}
+                        </code>
                       </TableCell>
                       <TableCell title={row.provider_id}>
                         {row.provider_name || "—"}
@@ -3075,10 +3099,11 @@ function RequestDetailPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
           <Definition
             rows={[
               [t.requestId, data.request_id],
+              [t.threadId, data.thread_id || "—"],
               [t.consumer, data.consumer_name],
               [t.userId, data.user_id],
               [t.provider, data.provider_name || data.provider_id || "—"],
-              [t.endpointModel, data.model || "—"],
+              [t.model, data.model || "—"],
               [t.status, data.status],
               [t.affinitySource, data.affinity_source || "—"],
               [t.affinityRequestId, affinityId || "—"],

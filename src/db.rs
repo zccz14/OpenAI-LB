@@ -159,6 +159,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(role, "admin");
+        let thread_id: Option<String> =
+            sqlx::query_scalar("SELECT thread_id FROM api_calls WHERE id='call'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(thread_id, None);
         for table in [
             "users",
             "consumers",

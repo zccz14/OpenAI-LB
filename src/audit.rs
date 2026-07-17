@@ -21,6 +21,7 @@ pub(crate) fn write_retries() -> usize {
 pub struct AuditEvent {
     pub id: String,
     pub request_id: String,
+    pub thread_id: Option<String>,
     pub consumer_id: String,
     pub user_id: String,
     pub request_archive: bool,
@@ -111,9 +112,10 @@ async fn insert(
     transaction: &mut Transaction<'_, Sqlite>,
     event: &AuditEvent,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,provider_id,affinity_hash,affinity_source,method,path,model,status,latency_ms,input_tokens,output_tokens,cached_tokens,error,client_ip,created_at) VALUES(?,?,?,?,(SELECT id FROM providers WHERE id=?),?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO api_calls(id,request_id,thread_id,consumer_id,user_id,provider_id,affinity_hash,affinity_source,method,path,model,status,latency_ms,input_tokens,output_tokens,cached_tokens,error,client_ip,created_at) VALUES(?,?,?,?,?,(SELECT id FROM providers WHERE id=?),?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(&event.id)
         .bind(&event.request_id)
+        .bind(&event.thread_id)
         .bind(&event.consumer_id)
         .bind(&event.user_id)
         .bind(&event.provider_id)

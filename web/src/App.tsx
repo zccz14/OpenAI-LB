@@ -88,6 +88,7 @@ import {
 } from "@/components/ui/empty"
 import {
   Field,
+  FieldContent,
   FieldDescription,
   FieldError,
   FieldGroup,
@@ -170,6 +171,7 @@ type Consumer = {
   created_at: number
   last_used_at?: number
   revoked_at?: number
+  request_archive: boolean
 }
 type Provider = {
   id: string
@@ -392,6 +394,9 @@ const copy = {
     prefix: "前缀",
     createdAt: "创建时间",
     lastUsed: "最近使用",
+    requestArchive: "诊断入库",
+    requestArchiveHelp: "打开后，该 Consumer 的请求/响应诊断预览才会保存到 SQLite。",
+    requestArchiveUpdated: "诊断入库开关已更新",
     revoked: "已吊销",
     active: "有效",
     revoke: "吊销",
@@ -659,6 +664,10 @@ const copy = {
     prefix: "Prefix",
     createdAt: "Created",
     lastUsed: "Last used",
+    requestArchive: "Archive diagnostics",
+    requestArchiveHelp:
+      "When enabled, this Consumer's request/response diagnostic previews are saved to SQLite.",
+    requestArchiveUpdated: "Diagnostic archive setting updated",
     revoked: "Revoked",
     active: "Active",
     revoke: "Revoke",
@@ -2114,6 +2123,7 @@ function Consumers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
   const t = copy[locale]
   const queryClient = useQueryClient()
   const [name, setName] = useState("")
+  const [requestArchive, setRequestArchive] = useState(false)
   const [open, setOpen] = useState(false)
   const [secret, setSecret] = useState("")
   const [revokeId, setRevokeId] = useState<string | null>(null)
@@ -2129,11 +2139,24 @@ function Consumers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
     try {
       const value = await api<{ secret: string }>(sdk, "/api/consumers", {
         method: "POST",
-        body: JSON.stringify({ name }),
+        body: JSON.stringify({ name, request_archive: requestArchive }),
       })
       setSecret(value.secret)
       setName("")
+      setRequestArchive(false)
       refreshConsumers()
+    } catch (cause) {
+      toast.error(message(cause, t))
+    }
+  }
+  async function updateArchive(id: string, checked: boolean) {
+    try {
+      await api(sdk, `/api/consumers/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ request_archive: checked }),
+      })
+      refreshConsumers()
+      toast.success(t.requestArchiveUpdated)
     } catch (cause) {
       toast.error(message(cause, t))
     }
@@ -2203,6 +2226,7 @@ function Consumers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                     <TableHead>{t.prefix}</TableHead>
                     <TableHead>{t.createdAt}</TableHead>
                     <TableHead>{t.lastUsed}</TableHead>
+                    <TableHead>{t.requestArchive}</TableHead>
                     <TableHead>{t.status}</TableHead>
                     <TableHead />
                   </TableRow>
@@ -2219,6 +2243,16 @@ function Consumers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                       </TableCell>
                       <TableCell>
                         {formatTime(consumer.last_used_at, locale)}
+                      </TableCell>
+                      <TableCell>
+                        <Switch
+                          aria-label={`${t.requestArchive}: ${consumer.name}`}
+                          checked={consumer.request_archive}
+                          disabled={Boolean(consumer.revoked_at)}
+                          onCheckedChange={(checked) =>
+                            void updateArchive(consumer.id, checked)
+                          }
+                        />
                       </TableCell>
                       <TableCell>
                         <Badge
@@ -2270,6 +2304,19 @@ function Consumers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                   value={name}
                   onChange={(e) => setName(e.target.value)}
                   required
+                />
+              </Field>
+              <Field orientation="horizontal">
+                <FieldContent>
+                  <FieldLabel htmlFor="consumer-request-archive">
+                    {t.requestArchive}
+                  </FieldLabel>
+                  <FieldDescription>{t.requestArchiveHelp}</FieldDescription>
+                </FieldContent>
+                <Switch
+                  id="consumer-request-archive"
+                  checked={requestArchive}
+                  onCheckedChange={setRequestArchive}
                 />
               </Field>
               <DialogFooter>

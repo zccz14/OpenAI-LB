@@ -24,6 +24,7 @@ pub struct UserIdentity {
 pub struct ApiIdentity {
     pub consumer_id: String,
     pub user_id: String,
+    pub request_archive: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -231,7 +232,7 @@ pub async fn api_identity(state: &AppState, headers: &HeaderMap) -> Result<ApiId
         return Err(AppError::unauthorized("invalid consumer credential"));
     }
     let row = sqlx::query(
-        "SELECT k.id,k.user_id,u.role,u.provider_access FROM consumers k JOIN users u ON u.id=k.user_id WHERE k.secret_hash=? AND k.revoked_at IS NULL",
+        "SELECT k.id,k.user_id,u.role,u.provider_access,k.request_archive FROM consumers k JOIN users u ON u.id=k.user_id WHERE k.secret_hash=? AND k.revoked_at IS NULL",
     )
             .bind(consumer_secret_hash(secret))
             .fetch_optional(&state.db)
@@ -247,6 +248,7 @@ pub async fn api_identity(state: &AppState, headers: &HeaderMap) -> Result<ApiId
     let identity = ApiIdentity {
         consumer_id: row.get(0),
         user_id: row.get(1),
+        request_archive: row.get::<i64, _>(4) != 0,
     };
     Ok(identity)
 }

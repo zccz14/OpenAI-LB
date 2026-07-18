@@ -90,8 +90,9 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/consumers/{id}",
-            patch(api::update_consumer).delete(api::revoke_consumer),
+            patch(api::update_consumer).delete(api::delete_consumer),
         )
+        .route("/api/consumers/{id}/revoke", post(api::revoke_consumer))
         .route(
             "/api/providers",
             get(api::list_providers).post(api::create_provider),

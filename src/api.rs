@@ -18,6 +18,7 @@ use crate::{
     balancer::Provider,
     crypto::consumer_secret_hash,
     oauth,
+    resources::SystemResourcesSnapshot,
 };
 
 pub async fn public_config(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
@@ -1206,6 +1207,21 @@ pub async fn dashboard(
     ))
 }
 
+pub async fn system_resources(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<SystemResourcesSnapshot>, AppError> {
+    let user = browser_identity(&state, &headers).await?;
+    require_admin(&user)?;
+    let snapshot = state
+        .resources
+        .lock()
+        .await
+        .sample()
+        .map_err(anyhow::Error::from)?;
+    Ok(Json(snapshot))
+}
+
 pub async fn settings(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1590,6 +1606,17 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(second.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn system_resources_requires_browser_authentication() {
+        let state = crate::test_state("http://token.invalid").await;
+
+        let error = system_resources(State(state), HeaderMap::new())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

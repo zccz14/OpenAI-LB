@@ -33,10 +33,15 @@ import {
   ChevronRightIcon,
   CircleGaugeIcon,
   ClipboardIcon,
+  CpuIcon,
+  DatabaseIcon,
+  HardDriveIcon,
   KeyRoundIcon,
   LanguagesIcon,
   LogInIcon,
   LogOutIcon,
+  MemoryStickIcon,
+  NetworkIcon,
   PencilIcon,
   PlusIcon,
   RefreshCwIcon,
@@ -49,6 +54,7 @@ import {
   UserPlusIcon,
   UserRoundCogIcon,
   XCircleIcon,
+  type LucideIcon,
 } from "lucide-react"
 import { toast } from "sonner"
 
@@ -157,6 +163,41 @@ type Page =
 type NavPage = Exclude<Page, "request-detail">
 type Role = "root" | "admin" | "user"
 type User = { id: string; email?: string; name?: string; role: Role }
+type SystemResources = {
+  sampled_at: number
+  sample_interval_ms: number
+  cpu: {
+    usage_percent: number
+    load_1m: number
+    logical_cpus: number
+  }
+  memory: {
+    used_bytes: number
+    total_bytes: number
+    available_bytes: number
+    usage_percent: number
+    swap_used_bytes: number
+    swap_total_bytes: number
+  }
+  network: {
+    receive_bytes_per_second: number
+    transmit_bytes_per_second: number
+    interfaces: number
+  }
+  disk: {
+    mount_point: string
+    used_bytes: number
+    total_bytes: number
+    available_bytes: number
+    usage_percent: number
+  } | null
+  sqlite: {
+    main_bytes: number
+    wal_bytes: number
+    shm_bytes: number
+    total_bytes: number
+  }
+}
 type ManagedUser = {
   id: string
   email?: string
@@ -342,6 +383,29 @@ const copy = {
     activeConsumers: "有效消费者",
     calls24h: "24 小时调用",
     errors24h: "24 小时错误",
+    systemResources: "系统资源",
+    systemResourcesDescription:
+      "宿主机当前负载与 OpenAI-LB 数据占用，仅 root 和管理员可见。",
+    refreshEvery5s: "每 5 秒刷新",
+    sampledAt: "采样于",
+    resourceUnavailable: "无法读取系统资源",
+    resourceUnavailableDescription: "自动刷新会继续重试，无需重新加载页面。",
+    cpu: "CPU",
+    memory: "内存",
+    network: "网络",
+    disk: "磁盘",
+    sqlite: "SQLite 数据库",
+    load1m: "1 分钟负载",
+    logicalCpus: "逻辑核心",
+    available: "可用",
+    swap: "Swap",
+    received: "接收",
+    transmitted: "发送",
+    networkInterfaces: "网络接口",
+    mountPoint: "挂载点",
+    mainFile: "主文件",
+    walFile: "WAL",
+    shmFile: "SHM",
     providerPool: "OAuth 上游提供商池",
     providerDescription:
       "管理自己拥有的 OAuth 上游提供商；root 与管理员可管理全局 Provider。Token 读取与变更会进入操作审计。",
@@ -650,6 +714,30 @@ const copy = {
     activeConsumers: "Active Consumers",
     calls24h: "Calls in 24h",
     errors24h: "Errors in 24h",
+    systemResources: "System resources",
+    systemResourcesDescription:
+      "Current host load and OpenAI-LB data footprint. Visible to root and administrators only.",
+    refreshEvery5s: "Refreshes every 5 seconds",
+    sampledAt: "Sampled",
+    resourceUnavailable: "System resources unavailable",
+    resourceUnavailableDescription:
+      "Automatic refresh will keep retrying; there is no need to reload the page.",
+    cpu: "CPU",
+    memory: "Memory",
+    network: "Network",
+    disk: "Disk",
+    sqlite: "SQLite database",
+    load1m: "1-minute load",
+    logicalCpus: "Logical CPUs",
+    available: "Available",
+    swap: "Swap",
+    received: "Received",
+    transmitted: "Transmitted",
+    networkInterfaces: "Network interfaces",
+    mountPoint: "Mount point",
+    mainFile: "Main file",
+    walFile: "WAL",
+    shmFile: "SHM",
     providerPool: "OAuth provider pool",
     providerDescription:
       "Manage OAuth providers you own. Root and administrators can manage the global pool. Token reads and changes are audited.",
@@ -1407,7 +1495,7 @@ function Console({
               <Route path="/" element={<Navigate replace to="/dashboard" />} />
               <Route
                 path="/dashboard"
-                element={<Dashboard sdk={sdk} locale={locale} />}
+                element={<Dashboard sdk={sdk} locale={locale} user={user} />}
               />
               <Route
                 path="/providers"
@@ -1472,7 +1560,15 @@ function PageHeader({
   )
 }
 
-function Dashboard({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
+function Dashboard({
+  sdk,
+  locale,
+  user,
+}: {
+  sdk: AuthSdk
+  locale: Locale
+  user: User
+}) {
   const t = copy[locale]
   const { data, error, loading } = useApiQuery<Record<string, number>>(
     sdk,
@@ -1487,25 +1583,174 @@ function Dashboard({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
     [t.errors24h, data?.errors_24h],
   ]
   return (
+    <div className="flex flex-col gap-5">
+      <Card>
+        <CardHeader>
+          <CardTitle>{t.operationalStatus}</CardTitle>
+          <CardDescription>{t.operationalDescription}</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <dl className="grid gap-px overflow-hidden rounded-lg border bg-border sm:grid-cols-2 lg:grid-cols-4">
+            {rows.map(([label, value]) => (
+              <div
+                key={String(label)}
+                className="flex flex-col gap-1 bg-background p-4"
+              >
+                <dt>{label}</dt>
+                <dd className="text-2xl font-semibold tabular-nums">
+                  {value ?? 0}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        </CardContent>
+      </Card>
+      {user.role !== "user" && (
+        <SystemResourcesCard sdk={sdk} locale={locale} />
+      )}
+    </div>
+  )
+}
+
+function SystemResourcesCard({
+  sdk,
+  locale,
+}: {
+  sdk: AuthSdk
+  locale: Locale
+}) {
+  const t = copy[locale]
+  const query = useQuery({
+    queryKey: ["/api/system/resources"],
+    queryFn: ({ signal }) =>
+      api<SystemResources>(sdk, "/api/system/resources", { signal }),
+    refetchInterval: 5_000,
+  })
+  if (query.isPending) return <SystemResourcesLoading locale={locale} />
+  if (query.error || !query.data)
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>{t.systemResources}</CardTitle>
+          <CardDescription>{t.systemResourcesDescription}</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Alert variant="destructive">
+            <ShieldAlertIcon />
+            <AlertTitle>{t.resourceUnavailable}</AlertTitle>
+            <AlertDescription>
+              {message(query.error, t)} {t.resourceUnavailableDescription}
+            </AlertDescription>
+          </Alert>
+        </CardContent>
+      </Card>
+    )
+
+  const data = query.data
+  const disk = data.disk
+  const metrics: Array<{
+    icon: LucideIcon
+    label: string
+    value: string
+    detail: string
+    percent?: number
+  }> = [
+    {
+      icon: CpuIcon,
+      label: t.cpu,
+      value: formatPercent(data.cpu.usage_percent, locale),
+      detail: `${t.load1m}: ${data.cpu.load_1m.toFixed(2)} · ${t.logicalCpus}: ${data.cpu.logical_cpus}`,
+      percent: data.cpu.usage_percent,
+    },
+    {
+      icon: MemoryStickIcon,
+      label: t.memory,
+      value: `${formatStorageBytes(data.memory.used_bytes, locale)} / ${formatStorageBytes(data.memory.total_bytes, locale)}`,
+      detail: `${t.available}: ${formatStorageBytes(data.memory.available_bytes, locale)} · ${t.swap}: ${formatStorageBytes(data.memory.swap_used_bytes, locale)} / ${formatStorageBytes(data.memory.swap_total_bytes, locale)}`,
+      percent: data.memory.usage_percent,
+    },
+    {
+      icon: NetworkIcon,
+      label: t.network,
+      value: `${t.received}: ${formatRate(data.network.receive_bytes_per_second, locale)} · ${t.transmitted}: ${formatRate(data.network.transmit_bytes_per_second, locale)}`,
+      detail: `${t.networkInterfaces}: ${data.network.interfaces}`,
+    },
+    {
+      icon: HardDriveIcon,
+      label: t.disk,
+      value: disk
+        ? `${formatStorageBytes(disk.used_bytes, locale)} / ${formatStorageBytes(disk.total_bytes, locale)}`
+        : "—",
+      detail: disk
+        ? `${t.available}: ${formatStorageBytes(disk.available_bytes, locale)} · ${t.mountPoint}: ${disk.mount_point}`
+        : t.resourceUnavailable,
+      percent: disk?.usage_percent,
+    },
+    {
+      icon: DatabaseIcon,
+      label: t.sqlite,
+      value: formatStorageBytes(data.sqlite.total_bytes, locale),
+      detail: `${t.mainFile}: ${formatStorageBytes(data.sqlite.main_bytes, locale)} · ${t.walFile}: ${formatStorageBytes(data.sqlite.wal_bytes, locale)} · ${t.shmFile}: ${formatStorageBytes(data.sqlite.shm_bytes, locale)}`,
+    },
+  ]
+
+  return (
     <Card>
       <CardHeader>
-        <CardTitle>{t.operationalStatus}</CardTitle>
-        <CardDescription>{t.operationalDescription}</CardDescription>
+        <CardTitle>{t.systemResources}</CardTitle>
+        <CardDescription>{t.systemResourcesDescription}</CardDescription>
+        <Badge variant="outline" className="mt-2 w-fit">
+          {t.sampledAt} {formatTime(data.sampled_at, locale)} · {t.refreshEvery5s}
+        </Badge>
       </CardHeader>
       <CardContent>
-        <dl className="grid gap-px overflow-hidden rounded-lg border bg-border sm:grid-cols-2 lg:grid-cols-4">
-          {rows.map(([label, value]) => (
-            <div
-              key={String(label)}
-              className="flex flex-col gap-1 bg-background p-4"
-            >
-              <dt>{label}</dt>
-              <dd className="text-2xl font-semibold tabular-nums">
-                {value ?? 0}
-              </dd>
-            </div>
-          ))}
+        <dl className="divide-y overflow-hidden rounded-lg border">
+          {metrics.map((metric) => {
+            const Icon = metric.icon
+            return (
+              <div
+                key={metric.label}
+                className="grid gap-3 px-4 py-3 md:grid-cols-[minmax(10rem,0.75fr)_minmax(14rem,1fr)_minmax(16rem,1.5fr)] md:items-center"
+              >
+                <dt className="flex items-center gap-2 font-medium">
+                  <Icon className="size-4 text-muted-foreground" />
+                  {metric.label}
+                </dt>
+                <dd className="font-medium tabular-nums">{metric.value}</dd>
+                <dd className="flex min-w-0 flex-col gap-2 text-xs text-muted-foreground">
+                  <span className="truncate" title={metric.detail}>
+                    {metric.detail}
+                  </span>
+                  {metric.percent !== undefined && (
+                    <progress
+                      aria-label={`${metric.label}: ${formatPercent(metric.percent, locale)}`}
+                      className="h-1.5 w-full accent-primary"
+                      max={100}
+                      value={Math.max(0, Math.min(100, metric.percent))}
+                    />
+                  )}
+                </dd>
+              </div>
+            )
+          })}
         </dl>
+      </CardContent>
+    </Card>
+  )
+}
+
+function SystemResourcesLoading({ locale }: { locale: Locale }) {
+  const t = copy[locale]
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{t.systemResources}</CardTitle>
+        <CardDescription>{t.systemResourcesDescription}</CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-2">
+        {Array.from({ length: 5 }, (_, index) => (
+          <Skeleton key={index} className="h-12 w-full" />
+        ))}
       </CardContent>
     </Card>
   )
@@ -4608,6 +4853,27 @@ function formatTime(timestamp: number | undefined, locale: Locale) {
         timeStyle: "medium",
       }).format(timestamp * 1000)
     : "—"
+}
+function formatPercent(value: number, locale: Locale) {
+  return new Intl.NumberFormat(locale === "zh" ? "zh-CN" : "en-US", {
+    style: "percent",
+    maximumFractionDigits: 1,
+  }).format(value / 100)
+}
+function formatStorageBytes(bytes: number, locale: Locale) {
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"]
+  let value = Math.max(0, bytes)
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit += 1
+  }
+  return `${new Intl.NumberFormat(locale === "zh" ? "zh-CN" : "en-US", {
+    maximumFractionDigits: value >= 100 || unit === 0 ? 0 : 1,
+  }).format(value)} ${units[unit]}`
+}
+function formatRate(bytesPerSecond: number, locale: Locale) {
+  return `${formatStorageBytes(bytesPerSecond, locale)}/s`
 }
 function formatLatency(milliseconds: number | undefined) {
   return typeof milliseconds === "number"

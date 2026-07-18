@@ -262,6 +262,7 @@ type Audit = {
   error?: string
   created_at: number
 }
+type AuditPageResponse = { rows: Audit[]; total: number }
 type AuditNavigation = { id: string; request_id: string; created_at: number }
 type AuditDetail = Audit & {
   method: string
@@ -476,10 +477,23 @@ const copy = {
     requestId: "请求 ID",
     threadId: "Thread ID",
     copyThreadId: "复制 Thread ID",
+    copyUserId: "复制用户 ID",
     provider: "上游提供商",
     latency: "延迟",
     cachedInput: "缓存输入",
     details: "详情",
+    filter: "筛选",
+    filterUserId: "用户 ID",
+    filterConsumer: "消费者",
+    filterProvider: "提供商",
+    filterModel: "模型",
+    allStatuses: "全部状态",
+    successfulCalls: "成功",
+    failedCalls: "失败",
+    auditResults: "条调用",
+    page: "第",
+    previousPage: "上一页",
+    nextPage: "下一页",
     requestDetail: "请求详情",
     backToAudit: "返回审计",
     auditDetailDescription:
@@ -770,10 +784,23 @@ const copy = {
     requestId: "Request ID",
     threadId: "Thread ID",
     copyThreadId: "Copy Thread ID",
+    copyUserId: "Copy User ID",
     provider: "Provider",
     latency: "Latency",
     cachedInput: "Cached input",
     details: "Details",
+    filter: "Filter",
+    filterUserId: "User ID",
+    filterConsumer: "Consumer",
+    filterProvider: "Provider",
+    filterModel: "Model",
+    allStatuses: "All statuses",
+    successfulCalls: "Successful",
+    failedCalls: "Failed",
+    auditResults: "calls",
+    page: "Page",
+    previousPage: "Previous",
+    nextPage: "Next",
     requestDetail: "Request details",
     backToAudit: "Back to audit",
     auditDetailDescription:
@@ -3134,10 +3161,50 @@ function AuditPage({
   onOpenDetail: (id: string) => void
 }) {
   const t = copy[locale]
-  const { data, error, loading } = useApiQuery<Audit[]>(
-    sdk,
-    "/api/audit?limit=200"
-  )
+  const pageSize = 25
+  const [page, setPage] = useState(0)
+  const [draftFilters, setDraftFilters] = useState({
+    user_id: "",
+    consumer: "",
+    provider: "",
+    model: "",
+    status: "all",
+  })
+  const [filters, setFilters] = useState(draftFilters)
+  const query = useMemo(() => {
+    const params = new URLSearchParams({
+      limit: String(pageSize),
+      offset: String(page * pageSize),
+    })
+    for (const [key, value] of Object.entries(filters)) {
+      if (value && value !== "all") params.set(key, value)
+    }
+    return `/api/audit?${params}`
+  }, [filters, page])
+  const { data, error, loading } = useApiQuery<AuditPageResponse>(sdk, query)
+  const rows = data?.rows ?? []
+  const total = data?.total ?? 0
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+
+  function applyFilters(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setPage(0)
+    setFilters(draftFilters)
+  }
+
+  function clearFilters() {
+    const empty = {
+      user_id: "",
+      consumer: "",
+      provider: "",
+      model: "",
+      status: "all",
+    }
+    setDraftFilters(empty)
+    setFilters(empty)
+    setPage(0)
+  }
+
   async function openDetail(row: Audit) {
     onOpenDetail(row.id)
   }
@@ -3151,135 +3218,285 @@ function AuditPage({
           <CardDescription>{t.auditDescription}</CardDescription>
         </CardHeader>
         <CardContent>
-          {!data?.length ? (
+          <form
+            className="mb-4 grid gap-3 border-b pb-4 md:grid-cols-2 xl:grid-cols-5"
+            onSubmit={applyFilters}
+          >
+            <Field>
+              <FieldLabel htmlFor="audit-user-filter">
+                {t.filterUserId}
+              </FieldLabel>
+              <Input
+                id="audit-user-filter"
+                value={draftFilters.user_id}
+                onChange={(event) =>
+                  setDraftFilters((current) => ({
+                    ...current,
+                    user_id: event.target.value,
+                  }))
+                }
+              />
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="audit-consumer-filter">
+                {t.filterConsumer}
+              </FieldLabel>
+              <Input
+                id="audit-consumer-filter"
+                value={draftFilters.consumer}
+                onChange={(event) =>
+                  setDraftFilters((current) => ({
+                    ...current,
+                    consumer: event.target.value,
+                  }))
+                }
+              />
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="audit-provider-filter">
+                {t.filterProvider}
+              </FieldLabel>
+              <Input
+                id="audit-provider-filter"
+                value={draftFilters.provider}
+                onChange={(event) =>
+                  setDraftFilters((current) => ({
+                    ...current,
+                    provider: event.target.value,
+                  }))
+                }
+              />
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="audit-model-filter">
+                {t.filterModel}
+              </FieldLabel>
+              <Input
+                id="audit-model-filter"
+                value={draftFilters.model}
+                onChange={(event) =>
+                  setDraftFilters((current) => ({
+                    ...current,
+                    model: event.target.value,
+                  }))
+                }
+              />
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="audit-status-filter">{t.status}</FieldLabel>
+              <Select
+                value={draftFilters.status}
+                onValueChange={(status) =>
+                  status &&
+                  setDraftFilters((current) => ({ ...current, status }))
+                }
+              >
+                <SelectTrigger id="audit-status-filter">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value="all">{t.allStatuses}</SelectItem>
+                    <SelectItem value="success">{t.successfulCalls}</SelectItem>
+                    <SelectItem value="error">{t.failedCalls}</SelectItem>
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            </Field>
+            <div className="flex flex-wrap items-end gap-2 xl:col-span-5">
+              <Button type="submit">{t.filter}</Button>
+              <Button type="button" variant="outline" onClick={clearFilters}>
+                {t.clearFilters}
+              </Button>
+              <span className="self-center text-sm text-muted-foreground tabular-nums">
+                {total.toLocaleString(locale)} {t.auditResults}
+              </span>
+            </div>
+          </form>
+          {!rows.length ? (
             <EmptyState
               icon={<ScrollTextIcon />}
               title={t.noAudit}
               description={t.noAuditDescription}
+              action={
+                Object.values(filters).some(
+                  (value) => value && value !== "all"
+                ) ? (
+                  <Button variant="outline" onClick={clearFilters}>
+                    {t.clearFilters}
+                  </Button>
+                ) : undefined
+              }
             />
           ) : (
-            <DataTable>
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>{t.time}</TableHead>
-                    <TableHead>{t.threadId}</TableHead>
-                    <TableHead>{t.model}</TableHead>
-                    <TableHead>{t.consumer}</TableHead>
-                    <TableHead>{t.userId}</TableHead>
-                    <TableHead>{t.provider}</TableHead>
-                    <TableHead>{t.status}</TableHead>
-                    <TableHead>{t.usage}</TableHead>
-                    <TableHead className="text-right">{t.actions}</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {data.map((row) => (
-                    <TableRow key={row.id}>
-                      <TableCell className="whitespace-nowrap">
-                        {formatTime(row.created_at, locale)}
-                      </TableCell>
-                      <TableCell>
-                        {row.thread_id ? (
-                          <div className="flex items-center gap-1">
-                            <code
-                              title={row.thread_id}
-                              aria-label={`${t.threadId}: ${row.thread_id}`}
-                            >
-                              {row.thread_id.slice(0, 12)}
-                              {row.thread_id.length > 12 && "…"}
-                            </code>
-                            <Button
-                              size="icon-xs"
-                              variant="ghost"
-                              aria-label={`${t.copyThreadId}: ${row.thread_id}`}
-                              onClick={() =>
-                                void navigator.clipboard
-                                  .writeText(row.thread_id!)
-                                  .then(() => toast.success(t.copied))
+            <>
+              <DataTable>
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>{t.time}</TableHead>
+                      <TableHead>{t.model}</TableHead>
+                      <TableHead>{t.userId}</TableHead>
+                      <TableHead>{t.consumer}</TableHead>
+                      <TableHead>{t.provider}</TableHead>
+                      <TableHead>{t.threadId}</TableHead>
+                      <TableHead>{t.status}</TableHead>
+                      <TableHead>{t.usage}</TableHead>
+                      <TableHead className="text-right">{t.actions}</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {rows.map((row) => (
+                      <TableRow key={row.id}>
+                        <TableCell className="whitespace-nowrap">
+                          {formatTime(row.created_at, locale)}
+                        </TableCell>
+                        <TableCell>
+                          <code>{row.model || "—"}</code>
+                        </TableCell>
+                        <TableCell>
+                          <CopyableIdentifier
+                            value={row.user_id}
+                            label={t.userId}
+                            copyLabel={t.copyUserId}
+                            copiedLabel={t.copied}
+                          />
+                        </TableCell>
+                        <TableCell className="font-medium">
+                          {row.consumer_name}
+                        </TableCell>
+                        <TableCell title={row.provider_id}>
+                          {row.provider_name || "—"}
+                        </TableCell>
+                        <TableCell>
+                          {row.thread_id ? (
+                            <CopyableIdentifier
+                              value={row.thread_id}
+                              label={t.threadId}
+                              copyLabel={t.copyThreadId}
+                              copiedLabel={t.copied}
+                            />
+                          ) : (
+                            "—"
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex max-w-48 flex-col gap-1">
+                            <Badge
+                              className="w-fit"
+                              variant={
+                                row.status >= 400 ? "destructive" : "secondary"
                               }
                             >
-                              <ClipboardIcon />
-                            </Button>
+                              {row.status}
+                            </Badge>
+                            <span className="text-xs text-muted-foreground tabular-nums">
+                              {formatLatency(row.latency_ms)}
+                            </span>
+                            {row.error && (
+                              <span className="text-xs text-destructive">
+                                {row.error}
+                              </span>
+                            )}
                           </div>
-                        ) : (
-                          "—"
-                        )}
-                      </TableCell>
-                      <TableCell>
-                        <code>{row.model || "—"}</code>
-                      </TableCell>
-                      <TableCell className="font-medium">
-                        {row.consumer_name}
-                      </TableCell>
-                      <TableCell>
-                        <code title={row.user_id}>
-                          {row.user_id.slice(0, 8)}
-                        </code>
-                      </TableCell>
-                      <TableCell title={row.provider_id}>
-                        {row.provider_name || "—"}
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex max-w-48 flex-col gap-1">
-                          <Badge
-                            className="w-fit"
-                            variant={
-                              row.status >= 400 ? "destructive" : "secondary"
-                            }
+                        </TableCell>
+                        <TableCell>
+                          <div className="flex items-center gap-3 text-xs tabular-nums">
+                            <div className="flex flex-col gap-0.5">
+                              <span className="text-muted-foreground">
+                                {t.input}
+                              </span>
+                              <span>{row.input_tokens.toLocaleString()}</span>
+                            </div>
+                            <div className="flex flex-col gap-0.5">
+                              <span className="text-muted-foreground">
+                                {t.cachedInput}
+                              </span>
+                              <span>{row.cached_tokens.toLocaleString()}</span>
+                            </div>
+                            <div className="flex flex-col gap-0.5">
+                              <span className="text-muted-foreground">
+                                {t.output}
+                              </span>
+                              <span>{row.output_tokens.toLocaleString()}</span>
+                            </div>
+                          </div>
+                        </TableCell>
+                        <TableCell className="text-right">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => void openDetail(row)}
                           >
-                            {row.status}
-                          </Badge>
-                          <span className="text-xs text-muted-foreground tabular-nums">
-                            {formatLatency(row.latency_ms)}
-                          </span>
-                          {row.error && (
-                            <span className="text-xs text-destructive">
-                              {row.error}
-                            </span>
-                          )}
-                        </div>
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex items-center gap-3 text-xs tabular-nums">
-                          <div className="flex flex-col gap-0.5">
-                            <span className="text-muted-foreground">
-                              {t.input}
-                            </span>
-                            <span>{row.input_tokens.toLocaleString()}</span>
-                          </div>
-                          <div className="flex flex-col gap-0.5">
-                            <span className="text-muted-foreground">
-                              {t.cachedInput}
-                            </span>
-                            <span>{row.cached_tokens.toLocaleString()}</span>
-                          </div>
-                          <div className="flex flex-col gap-0.5">
-                            <span className="text-muted-foreground">
-                              {t.output}
-                            </span>
-                            <span>{row.output_tokens.toLocaleString()}</span>
-                          </div>
-                        </div>
-                      </TableCell>
-                      <TableCell className="text-right">
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => void openDetail(row)}
-                        >
-                          {t.details}
-                        </Button>
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </DataTable>
+                            {t.details}
+                          </Button>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </DataTable>
+              <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
+                <span className="mr-auto text-sm text-muted-foreground tabular-nums">
+                  {t.page} {page + 1} / {totalPages}
+                </span>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={page === 0}
+                  onClick={() => setPage((current) => current - 1)}
+                >
+                  <ChevronLeftIcon data-icon="inline-start" />
+                  {t.previousPage}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={page + 1 >= totalPages}
+                  onClick={() => setPage((current) => current + 1)}
+                >
+                  {t.nextPage}
+                  <ChevronRightIcon data-icon="inline-end" />
+                </Button>
+              </div>
+            </>
           )}
         </CardContent>
       </Card>
       {user.role !== "user" && <AdminAuditSection sdk={sdk} locale={locale} />}
+    </div>
+  )
+}
+
+function CopyableIdentifier({
+  value,
+  label,
+  copyLabel,
+  copiedLabel,
+}: {
+  value: string
+  label: string
+  copyLabel: string
+  copiedLabel: string
+}) {
+  return (
+    <div className="flex items-center gap-1">
+      <code title={value} aria-label={`${label}: ${value}`}>
+        {value.slice(0, 12)}
+        {value.length > 12 && "…"}
+      </code>
+      <Button
+        size="icon-xs"
+        variant="ghost"
+        aria-label={`${copyLabel}: ${value}`}
+        onClick={() =>
+          void navigator.clipboard
+            .writeText(value)
+            .then(() => toast.success(copiedLabel))
+        }
+      >
+        <ClipboardIcon />
+      </Button>
     </div>
   )
 }

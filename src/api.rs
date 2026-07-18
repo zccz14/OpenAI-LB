@@ -9,7 +9,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sqlx::Row;
+use sqlx::{QueryBuilder, Row, Sqlite};
 use uuid::Uuid;
 
 use crate::{
@@ -859,6 +859,24 @@ pub struct Page {
 }
 
 #[derive(Deserialize)]
+pub struct AuditQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+    user_id: Option<String>,
+    consumer: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    status: Option<AuditStatus>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditStatus {
+    Success,
+    Error,
+}
+
+#[derive(Deserialize)]
 pub struct UsageQuery {
     period: Option<UsagePeriod>,
 }
@@ -945,32 +963,80 @@ async fn usage_rows(
 pub async fn audit(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(page): Query<Page>,
+    Query(filters): Query<AuditQuery>,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
-    let limit = page.limit.unwrap_or(100).clamp(1, 500);
-    let offset = page.offset.unwrap_or(0).max(0);
-    let (sql, scope) = if is_admin(&user) {
-        (
-            "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.path,c.method,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id ORDER BY c.created_at DESC LIMIT ? OFFSET ?",
-            None,
-        )
-    } else {
-        (
-            "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.path,c.method,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id WHERE c.user_id=? ORDER BY c.created_at DESC LIMIT ? OFFSET ?",
-            Some(user.id),
-        )
-    };
-    let mut query = sqlx::query(sql);
-    if let Some(scope) = scope {
-        query = query.bind(scope);
-    }
-    let rows = query.bind(limit).bind(offset).fetch_all(&state.db).await?;
-    Ok(Json(Value::Array(rows.into_iter().map(|row| json!({
+    let limit = filters.limit.unwrap_or(100).clamp(1, 500);
+    let offset = filters.offset.unwrap_or(0).max(0);
+
+    let mut total_query = QueryBuilder::<Sqlite>::new(
+        "SELECT COUNT(*) FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id",
+    );
+    append_audit_filters(&mut total_query, &filters, &user);
+    let total: i64 = total_query
+        .build_query_scalar()
+        .fetch_one(&state.db)
+        .await?;
+
+    let mut rows_query = QueryBuilder::<Sqlite>::new(
+        "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.path,c.method,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id",
+    );
+    append_audit_filters(&mut rows_query, &filters, &user);
+    rows_query
+        .push(" ORDER BY c.created_at DESC LIMIT ")
+        .push_bind(limit)
+        .push(" OFFSET ")
+        .push_bind(offset);
+    let rows = rows_query.build().fetch_all(&state.db).await?;
+    Ok(Json(json!({
+        "rows": rows.into_iter().map(|row| json!({
         "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"thread_id":row.get::<Option<String>,_>(2),"user_id":row.get::<String,_>(3),"consumer_name":row.get::<String,_>(4),"provider_id":row.get::<Option<String>,_>(5),"provider_name":row.get::<Option<String>,_>(6),
         "path":row.get::<String,_>(7),"method":row.get::<String,_>(8),"model":row.get::<Option<String>,_>(9),"status":row.get::<i64,_>(10),"latency_ms":row.get::<i64,_>(11),
         "input_tokens":row.get::<i64,_>(12),"output_tokens":row.get::<i64,_>(13),"cached_tokens":row.get::<i64,_>(14),"error":row.get::<Option<String>,_>(15),"client_ip":row.get::<Option<String>,_>(16),"created_at":row.get::<i64,_>(17)
-    })).collect())))
+    })).collect::<Vec<_>>(),
+        "total": total
+    })))
+}
+
+fn append_audit_filters(
+    query: &mut QueryBuilder<Sqlite>,
+    filters: &AuditQuery,
+    user: &UserIdentity,
+) {
+    query.push(" WHERE 1=1");
+    if !is_admin(user) {
+        query.push(" AND c.user_id=").push_bind(user.id.clone());
+    }
+    append_audit_text_filter(query, "c.user_id", filters.user_id.as_deref());
+    append_audit_text_filter(query, "k.name", filters.consumer.as_deref());
+    append_audit_text_filter(query, "ch.name", filters.provider.as_deref());
+    append_audit_text_filter(query, "c.model", filters.model.as_deref());
+    if let Some(status) = &filters.status {
+        match status {
+            AuditStatus::Success => query.push(" AND c.status<400"),
+            AuditStatus::Error => query.push(" AND c.status>=400"),
+        };
+    }
+}
+
+fn append_audit_text_filter(
+    query: &mut QueryBuilder<Sqlite>,
+    column: &'static str,
+    value: Option<&str>,
+) {
+    let Some(value) = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    query
+        .push(" AND instr(lower(COALESCE(")
+        .push(column)
+        .push(",'')),lower(")
+        .push_bind(value)
+        .push("))>0");
 }
 
 pub async fn audit_detail(
@@ -1933,6 +1999,13 @@ mod tests {
                 .execute(&state.db)
                 .await
                 .unwrap();
+            let audit_model = format!("gpt-audit-{user_id}");
+            sqlx::query("UPDATE api_calls SET model=? WHERE id=?")
+                .bind(&audit_model)
+                .bind(&call_id)
+                .execute(&state.db)
+                .await
+                .unwrap();
             let previous_id = format!("previous-{user_id}");
             sqlx::query("INSERT INTO api_calls(id,request_id,thread_id,consumer_id,user_id,affinity_hash,affinity_source,method,path,status,latency_ms,created_at) VALUES(?,?,?,'history-key','root-user',?,'previous_response_id','POST','/v1/responses',200,1,?)")
                 .bind(&previous_id)
@@ -1950,7 +2023,7 @@ mod tests {
                 serde_json::from_slice(&audit.into_body().collect().await.unwrap().to_bytes())
                     .unwrap();
             assert_eq!(
-                audits
+                audits["rows"]
                     .as_array()
                     .unwrap()
                     .iter()
@@ -1959,7 +2032,7 @@ mod tests {
                 Some("renamed")
             );
             assert_eq!(
-                audits
+                audits["rows"]
                     .as_array()
                     .unwrap()
                     .iter()
@@ -1968,7 +2041,7 @@ mod tests {
                 Some("history")
             );
             assert_eq!(
-                audits
+                audits["rows"]
                     .as_array()
                     .unwrap()
                     .iter()
@@ -1976,6 +2049,21 @@ mod tests {
                     .and_then(|audit| audit["thread_id"].as_str()),
                 Some(thread_id.as_str())
             );
+            let filtered = provider_request(
+                &state,
+                Method::GET,
+                &format!("/api/audit?model={audit_model}&provider=renamed&status=success&limit=1"),
+                &browser_token,
+                None,
+            )
+            .await;
+            assert_eq!(filtered.status(), StatusCode::OK);
+            let filtered: Value =
+                serde_json::from_slice(&filtered.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(filtered["total"], 1);
+            assert_eq!(filtered["rows"].as_array().unwrap().len(), 1);
+            assert_eq!(filtered["rows"][0]["id"], call_id);
             let detail = provider_request(
                 &state,
                 Method::GET,

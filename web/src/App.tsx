@@ -255,6 +255,7 @@ type Audit = {
   path: string
   model?: string
   status: number
+  first_byte_latency_ms?: number
   latency_ms: number
   input_tokens: number
   output_tokens: number
@@ -480,6 +481,8 @@ const copy = {
     copyUserId: "复制用户 ID",
     provider: "上游提供商",
     latency: "延迟",
+    firstByteLatency: "首字节",
+    totalLatency: "总耗时",
     cachedInput: "缓存输入",
     details: "详情",
     filter: "筛选",
@@ -787,6 +790,8 @@ const copy = {
     copyUserId: "Copy User ID",
     provider: "Provider",
     latency: "Latency",
+    firstByteLatency: "First byte",
+    totalLatency: "Total",
     cachedInput: "Cached input",
     details: "Details",
     filter: "Filter",
@@ -3390,9 +3395,16 @@ function AuditPage({
                             >
                               {row.status}
                             </Badge>
-                            <span className="text-xs text-muted-foreground tabular-nums">
-                              {formatLatency(row.latency_ms)}
-                            </span>
+                            <div className="flex flex-col text-xs text-muted-foreground tabular-nums">
+                              <span>
+                                {t.firstByteLatency} ·{" "}
+                                {formatLatency(row.first_byte_latency_ms)}
+                              </span>
+                              <span>
+                                {t.totalLatency} ·{" "}
+                                {formatLatency(row.latency_ms)}
+                              </span>
+                            </div>
                             {row.error && (
                               <span className="text-xs text-destructive">
                                 {row.error}
@@ -3547,7 +3559,8 @@ function RequestDetailPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
         <CardHeader>
           <CardTitle>{data.path}</CardTitle>
           <CardDescription>
-            {formatTime(data.created_at, locale)} ·{" "}
+            {formatTime(data.created_at, locale)} · {t.firstByteLatency}{" "}
+            {formatLatency(data.first_byte_latency_ms)} · {t.totalLatency}{" "}
             {formatLatency(data.latency_ms)}
           </CardDescription>
         </CardHeader>
@@ -4522,10 +4535,10 @@ function formatTime(timestamp: number | undefined, locale: Locale) {
       }).format(timestamp * 1000)
     : "—"
 }
-function formatLatency(milliseconds: number) {
-  return milliseconds >= 1000
-    ? `${(milliseconds / 1000).toFixed(2)} s`
-    : `${milliseconds} ms`
+function formatLatency(milliseconds: number | undefined) {
+  return typeof milliseconds === "number"
+    ? `${(milliseconds / 1000).toFixed(1)} s`
+    : "—"
 }
 function usageEmail(usage: ProviderUsage | undefined) {
   return usage?.email ?? usage?.account_email ?? usage?.account?.email

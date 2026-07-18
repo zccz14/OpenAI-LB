@@ -979,7 +979,7 @@ pub async fn audit(
         .await?;
 
     let mut rows_query = QueryBuilder::<Sqlite>::new(
-        "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.path,c.method,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id",
+        "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.path,c.method,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at,c.first_byte_latency_ms FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id",
     );
     append_audit_filters(&mut rows_query, &filters, &user);
     rows_query
@@ -992,7 +992,7 @@ pub async fn audit(
         "rows": rows.into_iter().map(|row| json!({
         "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"thread_id":row.get::<Option<String>,_>(2),"user_id":row.get::<String,_>(3),"consumer_name":row.get::<String,_>(4),"provider_id":row.get::<Option<String>,_>(5),"provider_name":row.get::<Option<String>,_>(6),
         "path":row.get::<String,_>(7),"method":row.get::<String,_>(8),"model":row.get::<Option<String>,_>(9),"status":row.get::<i64,_>(10),"latency_ms":row.get::<i64,_>(11),
-        "input_tokens":row.get::<i64,_>(12),"output_tokens":row.get::<i64,_>(13),"cached_tokens":row.get::<i64,_>(14),"error":row.get::<Option<String>,_>(15),"client_ip":row.get::<Option<String>,_>(16),"created_at":row.get::<i64,_>(17)
+        "input_tokens":row.get::<i64,_>(12),"output_tokens":row.get::<i64,_>(13),"cached_tokens":row.get::<i64,_>(14),"error":row.get::<Option<String>,_>(15),"client_ip":row.get::<Option<String>,_>(16),"created_at":row.get::<i64,_>(17),"first_byte_latency_ms":row.get::<Option<i64>,_>(18)
     })).collect::<Vec<_>>(),
         "total": total
     })))
@@ -1047,12 +1047,12 @@ pub async fn audit_detail(
     let user = browser_identity(&state, &headers).await?;
     let (sql, scope) = if is_admin(&user) {
         (
-            "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.method,c.path,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated,c.consumer_id FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=?",
+            "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.method,c.path,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated,c.consumer_id,c.first_byte_latency_ms FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=?",
             None,
         )
     } else {
         (
-            "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.method,c.path,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated,c.consumer_id FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=? AND c.user_id=?",
+            "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.method,c.path,c.model,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated,c.consumer_id,c.first_byte_latency_ms FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=? AND c.user_id=?",
             Some(user.id.clone()),
         )
     };
@@ -1106,7 +1106,7 @@ pub async fn audit_detail(
         "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"thread_id":thread_id,"user_id":row.get::<String,_>(3),"consumer_name":row.get::<String,_>(4),
         "provider_id":row.get::<Option<String>,_>(5),"provider_name":row.get::<Option<String>,_>(6),"method":row.get::<String,_>(7),"path":row.get::<String,_>(8),
         "model":row.get::<Option<String>,_>(9),"status":row.get::<i64,_>(10),"latency_ms":row.get::<i64,_>(11),"input_tokens":row.get::<i64,_>(12),
-        "output_tokens":row.get::<i64,_>(13),"cached_tokens":row.get::<i64,_>(14),"error":row.get::<Option<String>,_>(15),"client_ip":row.get::<Option<String>,_>(16),
+        "output_tokens":row.get::<i64,_>(13),"cached_tokens":row.get::<i64,_>(14),"error":row.get::<Option<String>,_>(15),"client_ip":row.get::<Option<String>,_>(16),"first_byte_latency_ms":row.get::<Option<i64>,_>(28),
         "affinity_hash":row.get::<Option<String>,_>(17),"affinity_source":row.get::<Option<String>,_>(18),"created_at":row.get::<i64,_>(19),
         "archive_available":row.get::<Option<String>,_>(20).is_some(),"request_headers":row.get::<Option<String>,_>(21),
         "request_body":row.get::<Option<Vec<u8>>,_>(22).map(|body| String::from_utf8_lossy(&body).into_owned()),"request_body_truncated":row.get::<Option<i64>,_>(23).unwrap_or_default() != 0,
@@ -2000,7 +2000,7 @@ mod tests {
                 .await
                 .unwrap();
             let audit_model = format!("gpt-audit-{user_id}");
-            sqlx::query("UPDATE api_calls SET model=? WHERE id=?")
+            sqlx::query("UPDATE api_calls SET model=?,first_byte_latency_ms=125 WHERE id=?")
                 .bind(&audit_model)
                 .bind(&call_id)
                 .execute(&state.db)
@@ -2049,6 +2049,15 @@ mod tests {
                     .and_then(|audit| audit["thread_id"].as_str()),
                 Some(thread_id.as_str())
             );
+            assert_eq!(
+                audits["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|audit| audit["id"] == call_id)
+                    .and_then(|audit| audit["first_byte_latency_ms"].as_i64()),
+                Some(125)
+            );
             let filtered = provider_request(
                 &state,
                 Method::GET,
@@ -2081,6 +2090,7 @@ mod tests {
             assert_eq!(detail["response_body"], json!(r#"{"output":"diagnostic"}"#));
             assert_eq!(detail["consumer_name"], "history");
             assert_eq!(detail["thread_id"], thread_id);
+            assert_eq!(detail["first_byte_latency_ms"], 125);
             assert_eq!(detail["previous"]["id"], previous_id);
             let test = provider_request(
                 &state,

@@ -95,6 +95,7 @@ impl AuditTracker {
                 path: path.to_owned(),
                 model: None,
                 status: 0,
+                first_byte_latency_ms: None,
                 latency_ms: 0,
                 input_tokens: 0,
                 output_tokens: 0,
@@ -144,6 +145,13 @@ impl AuditTracker {
                 return;
             }
             event.response_headers_json = Some(archive_headers(headers));
+        }
+    }
+
+    fn mark_first_byte(&mut self) {
+        let elapsed = self.started.elapsed().as_millis().max(1) as i64;
+        if let Some(event) = &mut self.event {
+            event.first_byte_latency_ms.get_or_insert(elapsed);
         }
     }
 
@@ -949,6 +957,7 @@ async fn relay_response(
     upstream: reqwest::Response,
     audit: &mut AuditTracker,
 ) -> Result<Response, AppError> {
+    audit.mark_first_byte();
     let status = upstream.status();
     audit.set_response_headers(upstream.headers());
     let headers = filtered_response_headers(upstream.headers());
@@ -996,6 +1005,7 @@ async fn image_response(
     upstream: reqwest::Response,
     audit: &mut AuditTracker,
 ) -> Result<Response, AppError> {
+    audit.mark_first_byte();
     let status = upstream.status();
     if !status.is_success() {
         return relay_response(context, lease, upstream, audit).await;
@@ -1623,6 +1633,7 @@ mod tests {
             Some("key-1:previous-response"),
             Some("previous_response_id"),
         );
+        audit.mark_first_byte();
         audit.finish(
             StatusCode::OK,
             None,
@@ -1634,7 +1645,7 @@ mod tests {
             None,
         );
         wait_for_audits(&state, 1).await;
-        let row: (i64, i64, i64, i64, String, String) = sqlx::query_as("SELECT input_tokens,output_tokens,cached_tokens,COUNT(*),affinity_hash,affinity_source FROM api_calls WHERE request_id='request-1'")
+        let row: (i64, i64, i64, Option<i64>, i64, String, String) = sqlx::query_as("SELECT input_tokens,output_tokens,cached_tokens,first_byte_latency_ms,COUNT(*),affinity_hash,affinity_source FROM api_calls WHERE request_id='request-1'")
             .fetch_one(&state.db).await.unwrap();
         assert_eq!(
             row,
@@ -1642,6 +1653,7 @@ mod tests {
                 12,
                 4,
                 3,
+                Some(1),
                 1,
                 affinity_hash("key-1:previous-response"),
                 "previous_response_id".to_owned(),

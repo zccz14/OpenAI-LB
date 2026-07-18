@@ -426,6 +426,12 @@ const copy = {
     consumerUpdated: "消费者已更新",
     revokeTitle: "吊销消费者？",
     revokeDescription: "此操作不可撤销；使用该消费者的所有调用将立即失败。",
+    deleteConsumer: "删除",
+    deleteConsumerTitle: "彻底删除消费者？",
+    deleteConsumerDescription:
+      "此操作不可撤销，将同时删除该消费者、所有调用记录和已保存的诊断内容。",
+    confirmDeleteConsumer: "确认删除消费者",
+    consumerDeleted: "消费者已删除",
     cancel: "取消",
     confirmRevoke: "确认吊销",
     consumerAppHelp:
@@ -733,6 +739,12 @@ const copy = {
     revokeTitle: "Revoke Consumer?",
     revokeDescription:
       "This cannot be undone. Every caller using this Consumer will fail immediately.",
+    deleteConsumer: "Delete",
+    deleteConsumerTitle: "Permanently delete Consumer?",
+    deleteConsumerDescription:
+      "This cannot be undone. The Consumer, all call history, and saved diagnostics will be deleted.",
+    confirmDeleteConsumer: "Delete Consumer",
+    consumerDeleted: "Consumer deleted",
     cancel: "Cancel",
     confirmRevoke: "Revoke Consumer",
     consumerAppHelp:
@@ -2380,6 +2392,7 @@ function Consumers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
   const [open, setOpen] = useState(false)
   const [secret, setSecret] = useState("")
   const [revokeId, setRevokeId] = useState<string | null>(null)
+  const [deleteId, setDeleteId] = useState<string | null>(null)
   const [editTarget, setEditTarget] = useState<Consumer | null>(null)
   const [editName, setEditName] = useState("")
   const [editPending, setEditPending] = useState(false)
@@ -2417,10 +2430,21 @@ function Consumers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
   async function revoke() {
     if (!revokeId) return
     try {
-      await api(sdk, `/api/consumers/${revokeId}`, { method: "DELETE" })
+      await api(sdk, `/api/consumers/${revokeId}/revoke`, { method: "POST" })
       refreshConsumers()
       setRevokeId(null)
       toast.success(t.consumerRevoked)
+    } catch (cause) {
+      toast.error(message(cause, t))
+    }
+  }
+  async function remove() {
+    if (!deleteId) return
+    try {
+      await api(sdk, `/api/consumers/${deleteId}`, { method: "DELETE" })
+      refreshConsumers()
+      setDeleteId(null)
+      toast.success(t.consumerDeleted)
     } catch (cause) {
       toast.error(message(cause, t))
     }
@@ -2530,6 +2554,14 @@ function Consumers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                           onClick={() => setRevokeId(consumer.id)}
                         >
                           {t.revoke}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => setDeleteId(consumer.id)}
+                        >
+                          <Trash2Icon data-icon="inline-start" />
+                          {t.deleteConsumer}
                         </Button>
                       </TableCell>
                     </TableRow>
@@ -2662,6 +2694,28 @@ function Consumers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
               onClick={() => void revoke()}
             >
               {t.confirmRevoke}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+      <AlertDialog
+        open={Boolean(deleteId)}
+        onOpenChange={(next) => !next && setDeleteId(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t.deleteConsumerTitle}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t.deleteConsumerDescription}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t.cancel}</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={() => void remove()}
+            >
+              {t.confirmDeleteConsumer}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

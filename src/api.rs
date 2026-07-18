@@ -270,6 +270,23 @@ pub async fn revoke_consumer(
     Ok(Json(json!({"ok":true})))
 }
 
+pub async fn delete_consumer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let user = browser_identity(&state, &headers).await?;
+    let result = sqlx::query("DELETE FROM consumers WHERE id=? AND user_id=?")
+        .bind(id)
+        .bind(user.id)
+        .execute(&state.db)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::not_found("consumer not found"));
+    }
+    Ok(Json(json!({"ok":true})))
+}
+
 #[derive(Deserialize)]
 pub struct CreateProvider {
     name: String,
@@ -2400,6 +2417,70 @@ mod tests {
             .unwrap(),
             "Foreign"
         );
+
+        let revoked = provider_request(
+            &state,
+            Method::POST,
+            "/api/consumers/owned-consumer/revoke",
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(revoked.status(), StatusCode::OK);
+        assert!(
+            sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT revoked_at FROM consumers WHERE id='owned-consumer'"
+            )
+            .fetch_one(&state.db)
+            .await
+            .unwrap()
+            .is_some()
+        );
+
+        sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,method,path,status,latency_ms,created_at) VALUES('owned-call','owned-request','owned-consumer','consumer-owner','POST','/v1/responses',200,1,?)")
+            .bind(now)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO request_archives(api_call_id,request_headers_json,request_body,request_body_truncated,response_body_truncated,created_at) VALUES('owned-call','{}',X'7B7D',0,0,?)")
+            .bind(now)
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        let foreign_delete = provider_request(
+            &state,
+            Method::DELETE,
+            "/api/consumers/foreign-consumer",
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(foreign_delete.status(), StatusCode::NOT_FOUND);
+
+        let deleted = provider_request(
+            &state,
+            Method::DELETE,
+            "/api/consumers/owned-consumer",
+            &token,
+            None,
+        )
+        .await;
+        assert_eq!(deleted.status(), StatusCode::OK);
+        for table in ["consumers", "api_calls", "request_archives"] {
+            let count: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE {}",
+                match table {
+                    "consumers" => "id='owned-consumer'",
+                    "api_calls" => "id='owned-call'",
+                    _ => "api_call_id='owned-call'",
+                }
+            ))
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+            assert_eq!(count, 0, "deleted consumer data remains in {table}");
+        }
     }
 
     #[tokio::test]

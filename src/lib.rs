@@ -7,6 +7,7 @@ pub mod crypto;
 pub mod db;
 pub mod oauth;
 pub mod proxy;
+pub mod resources;
 
 use std::{sync::Arc, time::Duration};
 
@@ -24,7 +25,7 @@ use sqlx::SqlitePool;
 use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
 
 use crate::audit::AuditWriter;
-use crate::{auth::AuthManager, balancer::Balancer, config::Config};
+use crate::{auth::AuthManager, balancer::Balancer, config::Config, resources::ResourceMonitor};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -34,6 +35,7 @@ pub struct AppState {
     pub auth: AuthManager,
     pub audit: AuditWriter,
     pub balancer: Balancer,
+    pub(crate) resources: Arc<tokio::sync::Mutex<ResourceMonitor>>,
     pub refresh_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub(crate) oauth_flows: Arc<DashMap<String, OAuthFlow>>,
 }
@@ -57,6 +59,9 @@ impl AppState {
         );
         let config = Arc::new(ArcSwap::from_pointee(config));
         let audit = AuditWriter::new(db.clone(), config.clone());
+        let resources = Arc::new(tokio::sync::Mutex::new(ResourceMonitor::new(
+            config.load().database_path.clone(),
+        )));
         let balancer = Balancer::default();
         balancer.hydrate(&db).await?;
         balancer.start_maintenance(db.clone());
@@ -67,6 +72,7 @@ impl AppState {
             auth,
             audit,
             balancer,
+            resources,
             refresh_locks: Arc::new(DashMap::new()),
             oauth_flows: Arc::new(DashMap::new()),
         })
@@ -121,6 +127,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/audit/{id}", get(api::audit_detail))
         .route("/api/admin-audit", get(api::list_admin_audit))
         .route("/api/dashboard", get(api::dashboard))
+        .route("/api/system/resources", get(api::system_resources))
         .route(
             "/api/settings",
             get(api::settings).patch(api::update_settings),

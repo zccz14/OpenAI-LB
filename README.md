@@ -30,6 +30,7 @@ OpenAI-LB 连接现有的品牌 Auth Mini 实例。用户不需要为 OpenAI-LB 
 - 每个上游 Provider 记录 `owner_id`；普通用户可管理自己的 Provider，并按完整 `user_id` 授权其他用户使用。
 - 以 Consumer 为租户调用凭据，密钥只显示一次，数据库只保存 SHA-256 哈希。
 - 按 Consumer 汇总请求、Token、缓存 Token、错误和延迟。
+- root 与管理员可在总览查看宿主机 CPU、内存、网络、磁盘和 SQLite 文件占用。
 - 每次代理调用保留 Thread ID、请求 ID、用户、Consumer、上游提供商、接口、模型、状态、耗时和用量；请求/响应诊断记录仅对开启 `request_archive` 的 Consumer 保存，失败和客户端取消同样遵循该开关。
 - 支持显式亲和键、会话头和 Responses 会话字段；亲和键在持久化前进行 SHA-256 哈希。
 - 跟踪 `Retry-After` 与 `x-ratelimit-*`，对 429 上游提供商自动冷却并在到期后恢复。

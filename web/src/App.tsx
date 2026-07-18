@@ -256,6 +256,8 @@ type Audit = {
   model?: string
   status: number
   first_byte_latency_ms?: number
+  request_bytes: number
+  response_bytes: number
   latency_ms: number
   input_tokens: number
   output_tokens: number
@@ -489,6 +491,8 @@ const copy = {
     latency: "延迟",
     firstByteLatency: "首字节",
     totalLatency: "总耗时",
+    requestSize: "请求大小",
+    responseSize: "响应大小",
     cachedInput: "缓存输入",
     details: "详情",
     filter: "筛选",
@@ -804,6 +808,8 @@ const copy = {
     latency: "Latency",
     firstByteLatency: "First byte",
     totalLatency: "Total",
+    requestSize: "Request size",
+    responseSize: "Response size",
     cachedInput: "Cached input",
     details: "Details",
     filter: "Filter",
@@ -3486,6 +3492,18 @@ function AuditPage({
                               </span>
                               <span>{row.output_tokens.toLocaleString()}</span>
                             </div>
+                            <div className="flex flex-col gap-0.5">
+                              <span className="text-muted-foreground">
+                                {t.requestSize}
+                              </span>
+                              <span>{formatBytes(row.request_bytes, locale)}</span>
+                            </div>
+                            <div className="flex flex-col gap-0.5">
+                              <span className="text-muted-foreground">
+                                {t.responseSize}
+                              </span>
+                              <span>{formatBytes(row.response_bytes, locale)}</span>
+                            </div>
                           </div>
                         </TableCell>
                         <TableCell className="text-right">
@@ -3628,6 +3646,8 @@ function RequestDetailPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
               [t.provider, data.provider_name || data.provider_id || "—"],
               [t.model, data.model || "—"],
               [t.status, data.status],
+              [t.requestSize, formatBytes(data.request_bytes, locale)],
+              [t.responseSize, formatBytes(data.response_bytes, locale)],
               [t.affinitySource, data.affinity_source || "—"],
               [t.affinityRequestId, affinityId || "—"],
               [t.affinityHash, data.affinity_hash || "—"],
@@ -4593,6 +4613,9 @@ function formatLatency(milliseconds: number | undefined) {
   return typeof milliseconds === "number"
     ? `${(milliseconds / 1000).toFixed(1)} s`
     : "—"
+}
+function formatBytes(bytes: number, locale: Locale) {
+  return `${bytes.toLocaleString(locale)} B`
 }
 function usageEmail(usage: ProviderUsage | undefined) {
   return usage?.email ?? usage?.account_email ?? usage?.account?.email

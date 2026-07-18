@@ -96,6 +96,8 @@ impl AuditTracker {
                 model: None,
                 status: 0,
                 first_byte_latency_ms: None,
+                request_bytes: 0,
+                response_bytes: 0,
                 latency_ms: 0,
                 input_tokens: 0,
                 output_tokens: 0,
@@ -155,6 +157,18 @@ impl AuditTracker {
         }
     }
 
+    fn set_request_size(&mut self, bytes: i64) {
+        if let Some(event) = &mut self.event {
+            event.request_bytes = bytes;
+        }
+    }
+
+    fn set_response_size(&mut self, bytes: i64) {
+        if let Some(event) = &mut self.event {
+            event.response_bytes = bytes;
+        }
+    }
+
     fn set_response_body(&mut self, body: &[u8], truncated: bool) {
         if let Some(event) = &mut self.event {
             if !event.request_archive {
@@ -173,6 +187,7 @@ impl AuditTracker {
             "code":error.status().as_u16()
         }}))
         .expect("proxy error response is serializable");
+        self.set_response_size(body.len() as i64);
         let mut headers = HeaderMap::new();
         headers.insert(
             header::CONTENT_TYPE,
@@ -280,6 +295,7 @@ pub async fn handle_json(
     )
     .await?;
     audit.set_request(&headers, &body, false);
+    audit.set_request_size(body.len() as i64);
     let result = dispatch(
         state,
         identity,
@@ -414,10 +430,12 @@ fn archive_header_allowed(name: &HeaderName) -> bool {
 struct StreamingPreview {
     body: Vec<u8>,
     truncated: bool,
+    bytes: i64,
 }
 
 impl StreamingPreview {
     fn capture(&mut self, bytes: &[u8]) {
+        self.bytes += bytes.len() as i64;
         let remaining = ARCHIVE_BODY_LIMIT.saturating_sub(self.body.len());
         let copied = remaining.min(bytes.len());
         self.body.extend_from_slice(&bytes[..copied]);
@@ -593,11 +611,12 @@ async fn dispatch_audio(
         reqwest::Body::wrap_stream(stream),
     )
     .await;
-    let (body, truncated) = {
+    let (body, truncated, bytes) = {
         let preview = preview.lock().expect("audio preview mutex is not poisoned");
-        (preview.body.clone(), preview.truncated)
+        (preview.body.clone(), preview.truncated, preview.bytes)
     };
     audit.set_request(headers, &body, truncated);
+    audit.set_request_size(bytes);
     let upstream = upstream?;
     track_response(
         &state,
@@ -964,6 +983,7 @@ async fn relay_response(
     let is_stream = context.stream && status.is_success();
     if !is_stream {
         let bytes = upstream.bytes().await?;
+        audit.set_response_size(bytes.len() as i64);
         audit.set_response_body(&bytes, false);
         let usage = usage_from_bytes(&bytes);
         audit.finish(
@@ -1015,6 +1035,7 @@ async fn image_response(
     let envelope = serde_json::to_vec(
         &json!({"created": chrono::Utc::now().timestamp(), "data": images, "usage": usage}),
     )?;
+    audit.set_response_size(envelope.len() as i64);
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
@@ -1095,6 +1116,7 @@ struct StreamCompletion {
     started: Instant,
     usage: Usage,
     response_preview: StreamingPreview,
+    response_bytes: i64,
 }
 
 impl StreamCompletion {
@@ -1105,10 +1127,12 @@ impl StreamCompletion {
             started,
             usage: Usage::default(),
             response_preview: StreamingPreview::default(),
+            response_bytes: 0,
         }
     }
 
     fn capture_sse(&mut self, pending: &mut Vec<u8>, bytes: &[u8]) {
+        self.response_bytes += bytes.len() as i64;
         update_sse_usage(pending, bytes, &mut self.usage);
         if self
             .event
@@ -1128,6 +1152,7 @@ impl StreamCompletion {
         let model = event.model.clone();
         event.response_body = Some(std::mem::take(&mut self.response_preview.body));
         event.response_body_truncated = self.response_preview.truncated || failed;
+        event.response_bytes = self.response_bytes;
         settle(
             &mut event,
             status,
@@ -1149,6 +1174,7 @@ impl Drop for StreamCompletion {
             let model = event.model.clone();
             event.response_body = Some(std::mem::take(&mut self.response_preview.body));
             event.response_body_truncated = true;
+            event.response_bytes = self.response_bytes;
             settle(
                 &mut event,
                 499,
@@ -1270,6 +1296,7 @@ async fn models_response(
     );
     audit.set_response_headers(&headers);
     audit.set_response_body(&body, false);
+    audit.set_response_size(body.len() as i64);
     audit.finish(StatusCode::OK, None, Usage::default(), None);
     build_response(
         StatusCode::OK,
@@ -1634,6 +1661,8 @@ mod tests {
             Some("previous_response_id"),
         );
         audit.mark_first_byte();
+        audit.set_request_size(42);
+        audit.set_response_size(64);
         audit.finish(
             StatusCode::OK,
             None,
@@ -1645,7 +1674,7 @@ mod tests {
             None,
         );
         wait_for_audits(&state, 1).await;
-        let row: (i64, i64, i64, Option<i64>, i64, String, String) = sqlx::query_as("SELECT input_tokens,output_tokens,cached_tokens,first_byte_latency_ms,COUNT(*),affinity_hash,affinity_source FROM api_calls WHERE request_id='request-1'")
+        let row: (i64, i64, i64, Option<i64>, i64, i64, i64, String, String) = sqlx::query_as("SELECT input_tokens,output_tokens,cached_tokens,first_byte_latency_ms,request_bytes,response_bytes,COUNT(*),affinity_hash,affinity_source FROM api_calls WHERE request_id='request-1'")
             .fetch_one(&state.db).await.unwrap();
         assert_eq!(
             row,
@@ -1654,6 +1683,8 @@ mod tests {
                 4,
                 3,
                 Some(1),
+                42,
+                64,
                 1,
                 affinity_hash("key-1:previous-response"),
                 "previous_response_id".to_owned(),
@@ -1730,12 +1761,13 @@ mod tests {
         assert!(body.ends_with(b"\n\n"));
         wait_for_audits(&state, 1).await;
 
-        let row: (i64, i64, i64) =
-            sqlx::query_as("SELECT input_tokens,cached_tokens,output_tokens FROM api_calls")
-                .fetch_one(&state.db)
-                .await
-                .unwrap();
-        assert_eq!(row, (19, 0, 6));
+        let row: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT input_tokens,cached_tokens,output_tokens,response_bytes FROM api_calls",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(row, (19, 0, 6, body.len() as i64));
     }
 
     #[tokio::test]
@@ -1947,6 +1979,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(archived_audio, audio);
+        let audio_sizes: (i64, i64) = sqlx::query_as(
+            "SELECT request_bytes,response_bytes FROM api_calls WHERE path='/v1/audio/transcriptions'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(audio_sizes, (audio.len() as i64, audio.len() as i64));
     }
 
     #[tokio::test]

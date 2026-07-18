@@ -1,0 +1,5 @@
+ALTER TABLE api_calls
+ADD COLUMN request_bytes INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE api_calls
+ADD COLUMN response_bytes INTEGER NOT NULL DEFAULT 0;

@@ -165,6 +165,12 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(thread_id, None);
+        let first_byte_latency_ms: Option<i64> =
+            sqlx::query_scalar("SELECT first_byte_latency_ms FROM api_calls WHERE id='call'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(first_byte_latency_ms, None);
         for table in [
             "users",
             "consumers",

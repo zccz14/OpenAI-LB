@@ -175,6 +175,8 @@ type SystemResources = {
     used_bytes: number
     total_bytes: number
     available_bytes: number
+    process_used_bytes: number
+    other_used_bytes: number
     usage_percent: number
     swap_used_bytes: number
     swap_total_bytes: number
@@ -196,6 +198,8 @@ type SystemResources = {
     wal_bytes: number
     shm_bytes: number
     total_bytes: number
+    freelist_bytes: number
+    freelist_percent: number
   }
 }
 type ManagedUser = {
@@ -398,6 +402,9 @@ const copy = {
     load1m: "1 分钟负载",
     logicalCpus: "逻辑核心",
     available: "可用",
+    openaiLbRss: "OpenAI-LB RSS",
+    otherSystemMemory: "其他系统占用",
+    systemAvailableMemory: "系统可用内存",
     swap: "Swap",
     received: "接收",
     transmitted: "发送",
@@ -406,6 +413,7 @@ const copy = {
     mainFile: "主文件",
     walFile: "WAL",
     shmFile: "SHM",
+    reclaimableSpace: "可回收空间（VACUUM）",
     providerPool: "OAuth 上游提供商池",
     providerDescription:
       "管理自己拥有的 OAuth 上游提供商；root 与管理员可管理全局 Provider。Token 读取与变更会进入操作审计。",
@@ -730,6 +738,9 @@ const copy = {
     load1m: "1-minute load",
     logicalCpus: "Logical CPUs",
     available: "Available",
+    openaiLbRss: "OpenAI-LB RSS",
+    otherSystemMemory: "Other system usage",
+    systemAvailableMemory: "System available memory",
     swap: "Swap",
     received: "Received",
     transmitted: "Transmitted",
@@ -738,6 +749,7 @@ const copy = {
     mainFile: "Main file",
     walFile: "WAL",
     shmFile: "SHM",
+    reclaimableSpace: "Reclaimable (VACUUM)",
     providerPool: "OAuth provider pool",
     providerDescription:
       "Manage OAuth providers you own. Root and administrators can manage the global pool. Token reads and changes are audited.",
@@ -1653,6 +1665,7 @@ function SystemResourcesCard({
     label: string
     value: string
     detail: string
+    secondaryDetail?: string
     percent?: number
   }> = [
     {
@@ -1666,7 +1679,8 @@ function SystemResourcesCard({
       icon: MemoryStickIcon,
       label: t.memory,
       value: `${formatStorageBytes(data.memory.used_bytes, locale)} / ${formatStorageBytes(data.memory.total_bytes, locale)}`,
-      detail: `${t.available}: ${formatStorageBytes(data.memory.available_bytes, locale)} · ${t.swap}: ${formatStorageBytes(data.memory.swap_used_bytes, locale)} / ${formatStorageBytes(data.memory.swap_total_bytes, locale)}`,
+      detail: `${t.openaiLbRss}: ${formatStorageBytes(data.memory.process_used_bytes, locale)} · ${t.otherSystemMemory}: ${formatStorageBytes(data.memory.other_used_bytes, locale)} · ${t.systemAvailableMemory}: ${formatStorageBytes(data.memory.available_bytes, locale)}`,
+      secondaryDetail: `${t.swap}: ${formatStorageBytes(data.memory.swap_used_bytes, locale)} / ${formatStorageBytes(data.memory.swap_total_bytes, locale)}`,
       percent: data.memory.usage_percent,
     },
     {
@@ -1691,6 +1705,7 @@ function SystemResourcesCard({
       label: t.sqlite,
       value: formatStorageBytes(data.sqlite.total_bytes, locale),
       detail: `${t.mainFile}: ${formatStorageBytes(data.sqlite.main_bytes, locale)} · ${t.walFile}: ${formatStorageBytes(data.sqlite.wal_bytes, locale)} · ${t.shmFile}: ${formatStorageBytes(data.sqlite.shm_bytes, locale)}`,
+      secondaryDetail: `${t.reclaimableSpace}: ${formatStorageBytes(data.sqlite.freelist_bytes, locale)} · ${formatPercent(data.sqlite.freelist_percent, locale)}`,
     },
   ]
 
@@ -1721,6 +1736,14 @@ function SystemResourcesCard({
                   <span className="truncate" title={metric.detail}>
                     {metric.detail}
                   </span>
+                  {metric.secondaryDetail && (
+                    <span
+                      className="truncate font-medium text-foreground"
+                      title={metric.secondaryDetail}
+                    >
+                      {metric.secondaryDetail}
+                    </span>
+                  )}
                   {metric.percent !== undefined && (
                     <progress
                       aria-label={`${metric.label}: ${formatPercent(metric.percent, locale)}`}

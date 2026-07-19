@@ -4,8 +4,10 @@ use std::{
     time::Instant,
 };
 
+use anyhow::Result;
 use serde::Serialize;
-use sysinfo::{CpuRefreshKind, Disks, Networks, System};
+use sqlx::{Row, SqlitePool};
+use sysinfo::{CpuRefreshKind, Disks, Networks, Pid, ProcessesToUpdate, System};
 
 #[derive(Debug, Serialize)]
 pub struct SystemResourcesSnapshot {
@@ -30,6 +32,8 @@ pub struct MemorySnapshot {
     pub used_bytes: u64,
     pub total_bytes: u64,
     pub available_bytes: u64,
+    pub process_used_bytes: u64,
+    pub other_used_bytes: u64,
     pub usage_percent: f64,
     pub swap_used_bytes: u64,
     pub swap_total_bytes: u64,
@@ -57,10 +61,13 @@ pub struct SqliteSnapshot {
     pub wal_bytes: u64,
     pub shm_bytes: u64,
     pub total_bytes: u64,
+    pub freelist_bytes: u64,
+    pub freelist_percent: f64,
 }
 
 pub struct ResourceMonitor {
     database_path: PathBuf,
+    database: SqlitePool,
     system: System,
     disks: Disks,
     networks: Networks,
@@ -68,12 +75,13 @@ pub struct ResourceMonitor {
 }
 
 impl ResourceMonitor {
-    pub fn new(database_path: PathBuf) -> Self {
+    pub fn new(database_path: PathBuf, database: SqlitePool) -> Self {
         let mut system = System::new();
         system.refresh_memory();
         system.refresh_cpu_list(CpuRefreshKind::nothing().with_cpu_usage());
         Self {
             database_path,
+            database,
             system,
             disks: Disks::new_with_refreshed_list(),
             networks: Networks::new_with_refreshed_list(),
@@ -81,9 +89,12 @@ impl ResourceMonitor {
         }
     }
 
-    pub fn sample(&mut self) -> io::Result<SystemResourcesSnapshot> {
+    pub async fn sample(&mut self) -> Result<SystemResourcesSnapshot> {
         self.system.refresh_cpu_usage();
         self.system.refresh_memory();
+        let process_id = Pid::from_u32(std::process::id());
+        self.system
+            .refresh_processes(ProcessesToUpdate::Some(&[process_id]), true);
         self.disks.refresh(true);
         self.networks.refresh(true);
 
@@ -105,7 +116,12 @@ impl ResourceMonitor {
             .sum::<u64>();
         let memory_used = self.system.used_memory();
         let memory_total = self.system.total_memory();
-        let sqlite = sqlite_usage(&self.database_path)?;
+        let process_used = self
+            .system
+            .process(process_id)
+            .map(sysinfo::Process::memory)
+            .unwrap_or_default();
+        let sqlite = sqlite_usage(&self.database_path, &self.database).await?;
 
         Ok(SystemResourcesSnapshot {
             sampled_at: chrono::Utc::now().timestamp(),
@@ -119,6 +135,8 @@ impl ResourceMonitor {
                 used_bytes: memory_used,
                 total_bytes: memory_total,
                 available_bytes: self.system.available_memory(),
+                process_used_bytes: process_used,
+                other_used_bytes: memory_used.saturating_sub(process_used),
                 usage_percent: percentage(memory_used, memory_total),
                 swap_used_bytes: self.system.used_swap(),
                 swap_total_bytes: self.system.total_swap(),
@@ -152,7 +170,24 @@ fn disk_usage(disks: &Disks, database_path: &Path) -> Option<DiskSnapshot> {
     })
 }
 
-fn sqlite_usage(database_path: &Path) -> io::Result<SqliteSnapshot> {
+async fn sqlite_usage(database_path: &Path, database: &SqlitePool) -> Result<SqliteSnapshot> {
+    let mut snapshot = sqlite_file_usage(database_path)?;
+    let row = sqlx::query(
+        "SELECT (SELECT * FROM pragma_page_size()), (SELECT * FROM pragma_page_count()), (SELECT * FROM pragma_freelist_count())",
+    )
+    .fetch_one(database)
+    .await?;
+    let page_size = u64::try_from(row.get::<i64, _>(0)).expect("SQLite page size is non-negative");
+    let page_count =
+        u64::try_from(row.get::<i64, _>(1)).expect("SQLite page count is non-negative");
+    let freelist_count =
+        u64::try_from(row.get::<i64, _>(2)).expect("SQLite freelist count is non-negative");
+    snapshot.freelist_bytes = page_size.saturating_mul(freelist_count);
+    snapshot.freelist_percent = percentage(freelist_count, page_count);
+    Ok(snapshot)
+}
+
+fn sqlite_file_usage(database_path: &Path) -> io::Result<SqliteSnapshot> {
     let main_bytes = file_size(database_path)?;
     let wal_bytes = file_size(&with_suffix(database_path, "-wal"))?;
     let shm_bytes = file_size(&with_suffix(database_path, "-shm"))?;
@@ -163,6 +198,8 @@ fn sqlite_usage(database_path: &Path) -> io::Result<SqliteSnapshot> {
         total_bytes: main_bytes
             .saturating_add(wal_bytes)
             .saturating_add(shm_bytes),
+        freelist_bytes: 0,
+        freelist_percent: 0.0,
     })
 }
 
@@ -206,7 +243,7 @@ mod tests {
         std::fs::write(with_suffix(&database, "-wal"), [0_u8; 7]).unwrap();
         std::fs::write(with_suffix(&database, "-shm"), [0_u8; 3]).unwrap();
 
-        let usage = sqlite_usage(&database).unwrap();
+        let usage = sqlite_file_usage(&database).unwrap();
 
         assert_eq!(usage.main_bytes, 11);
         assert_eq!(usage.wal_bytes, 7);
@@ -223,7 +260,7 @@ mod tests {
         ));
         std::fs::write(&database, [0_u8; 5]).unwrap();
 
-        let usage = sqlite_usage(&database).unwrap();
+        let usage = sqlite_file_usage(&database).unwrap();
 
         assert_eq!(usage.main_bytes, 5);
         assert_eq!(usage.wal_bytes, 0);
@@ -232,16 +269,55 @@ mod tests {
         std::fs::remove_file(database).unwrap();
     }
 
-    #[test]
-    fn monitor_samples_host_resources_without_a_physical_database() {
-        let mut monitor = ResourceMonitor::new(PathBuf::from(":memory:"));
+    #[tokio::test]
+    async fn monitor_samples_host_resources_without_a_physical_database() {
+        let pool = crate::db::connect_memory().await.unwrap();
+        let mut monitor = ResourceMonitor::new(PathBuf::from(":memory:"), pool);
         std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
 
-        let snapshot = monitor.sample().unwrap();
+        let snapshot = monitor.sample().await.unwrap();
 
         assert!(snapshot.cpu.logical_cpus > 0);
         assert!(snapshot.memory.total_bytes > 0);
+        assert_eq!(
+            snapshot.memory.other_used_bytes,
+            snapshot
+                .memory
+                .used_bytes
+                .saturating_sub(snapshot.memory.process_used_bytes)
+        );
         assert_eq!(snapshot.sqlite.total_bytes, 0);
         assert!(snapshot.sampled_at > 0);
+    }
+
+    #[tokio::test]
+    async fn sqlite_usage_reports_reclaimable_freelist_space() {
+        let path = std::env::temp_dir().join(format!(
+            "openai-lb-resource-freelist-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = crate::db::connect_test_file(&path).await.unwrap();
+        sqlx::query("CREATE TABLE resource_freelist_test(payload BLOB NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO resource_freelist_test(payload) VALUES(?)")
+            .bind(vec![0_u8; 64 * 1024])
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM resource_freelist_test")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let usage = sqlite_usage(&path, &pool).await.unwrap();
+
+        assert!(usage.freelist_bytes > 0);
+        assert!(usage.freelist_percent > 0.0);
+        pool.close().await;
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 }

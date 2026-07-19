@@ -61,6 +61,7 @@ impl AppState {
         let audit = AuditWriter::new(db.clone(), config.clone());
         let resources = Arc::new(tokio::sync::Mutex::new(ResourceMonitor::new(
             config.load().database_path.clone(),
+            db.clone(),
         )));
         let balancer = Balancer::default();
         balancer.hydrate(&db).await?;

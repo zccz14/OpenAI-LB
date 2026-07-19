@@ -1213,12 +1213,7 @@ pub async fn system_resources(
 ) -> Result<Json<SystemResourcesSnapshot>, AppError> {
     let user = browser_identity(&state, &headers).await?;
     require_admin(&user)?;
-    let snapshot = state
-        .resources
-        .lock()
-        .await
-        .sample()
-        .map_err(anyhow::Error::from)?;
+    let snapshot = state.resources.lock().await.sample().await?;
     Ok(Json(snapshot))
 }
 

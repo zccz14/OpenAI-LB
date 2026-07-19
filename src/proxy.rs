@@ -13,12 +13,12 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::OwnedSemaphorePermit;
 use uuid::Uuid;
 
 use crate::{
     AppError, AppState,
-    audit::AuditEvent,
+    audit::{ARCHIVE_BODY_LIMIT, AuditEvent, AuditReservation},
     auth::{ApiIdentity, api_identity},
     balancer::{Lease, affinity_hash, track_response},
     oauth,
@@ -50,8 +50,6 @@ const PROXY_ONLY_HEADERS: &[&str] = &[
     "thread-id",
 ];
 
-const ARCHIVE_BODY_LIMIT: usize = 1024 * 1024;
-
 struct CallContext {
     request_id: String,
     model: Option<String>,
@@ -59,13 +57,14 @@ struct CallContext {
 }
 
 struct AuditTracker {
-    permit: Option<mpsc::OwnedPermit<AuditEvent>>,
+    permit: Option<AuditReservation>,
+    archive_budget: Option<OwnedSemaphorePermit>,
     event: Option<AuditEvent>,
     started: Instant,
 }
 
 impl AuditTracker {
-    async fn begin(
+    fn begin(
         state: &AppState,
         identity: &ApiIdentity,
         request_id: &str,
@@ -73,47 +72,50 @@ impl AuditTracker {
         method: &Method,
         path: &str,
         client_ip: &str,
-    ) -> Result<Self, AppError> {
-        let permit = state
-            .audit
-            .reserve()
-            .await
-            .ok_or_else(|| AppError::unavailable("audit writer is unavailable"))?;
-        Ok(Self {
-            permit: Some(permit),
-            event: Some(AuditEvent {
-                id: Uuid::new_v4().to_string(),
-                request_id: request_id.to_owned(),
-                thread_id: thread_id.map(str::to_owned),
-                consumer_id: identity.consumer_id.clone(),
-                user_id: identity.user_id.clone(),
-                request_archive: identity.request_archive,
-                provider_id: None,
-                affinity_hash: None,
-                affinity_source: None,
-                method: method.as_str().to_owned(),
-                path: path.to_owned(),
-                model: None,
-                status: 0,
-                first_byte_latency_ms: None,
-                request_bytes: 0,
-                response_bytes: 0,
-                latency_ms: 0,
-                input_tokens: 0,
-                output_tokens: 0,
-                cached_tokens: 0,
-                error: None,
-                client_ip: client_ip.to_owned(),
-                created_at: chrono::Utc::now().timestamp(),
-                request_headers_json: "[]".to_owned(),
-                request_body: Vec::new(),
-                request_body_truncated: false,
-                response_headers_json: None,
-                response_body: None,
-                response_body_truncated: false,
-            }),
+    ) -> Self {
+        let permit = state.audit.try_reserve();
+        let archive_budget = if permit.is_some() && identity.request_archive {
+            state.audit.try_reserve_archive()
+        } else {
+            None
+        };
+        let event = permit.as_ref().map(|_| AuditEvent {
+            id: Uuid::new_v4().to_string(),
+            request_id: request_id.to_owned(),
+            thread_id: thread_id.map(str::to_owned),
+            consumer_id: identity.consumer_id.clone(),
+            user_id: identity.user_id.clone(),
+            request_archive: archive_budget.is_some(),
+            provider_id: None,
+            affinity_hash: None,
+            affinity_source: None,
+            method: method.as_str().to_owned(),
+            path: path.to_owned(),
+            model: None,
+            status: 0,
+            first_byte_latency_ms: None,
+            request_bytes: 0,
+            response_bytes: 0,
+            latency_ms: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
+            error: None,
+            client_ip: client_ip.to_owned(),
+            created_at: chrono::Utc::now().timestamp(),
+            request_headers_json: "[]".to_owned(),
+            request_body: Vec::new(),
+            request_body_truncated: false,
+            response_headers_json: None,
+            response_body: None,
+            response_body_truncated: false,
+        });
+        Self {
+            permit,
+            archive_budget,
+            event,
             started: Instant::now(),
-        })
+        }
     }
 
     fn set_provider(&mut self, provider_id: &str) {
@@ -218,18 +220,18 @@ impl AuditTracker {
         self.permit
             .take()
             .expect("audit queue capacity is reserved once")
-            .send(event);
+            .send(event, self.archive_budget.take());
     }
 
     fn take_stream(&mut self, status: StatusCode, model: Option<&str>) -> StreamCompletion {
-        let mut event = self.event.take().expect("audit event is available once");
-        event.status = status.as_u16() as i64;
-        event.model = model.map(str::to_owned);
+        if let Some(event) = &mut self.event {
+            event.status = status.as_u16() as i64;
+            event.model = model.map(str::to_owned);
+        }
         StreamCompletion::new(
-            self.permit
-                .take()
-                .expect("audit queue capacity is reserved once"),
-            event,
+            self.permit.take(),
+            self.archive_budget.take(),
+            self.event.take(),
             self.started,
         )
     }
@@ -250,7 +252,7 @@ impl Drop for AuditTracker {
             self.permit
                 .take()
                 .expect("audit queue capacity is reserved once")
-                .send(event);
+                .send(event, self.archive_budget.take());
         }
     }
 }
@@ -292,8 +294,7 @@ pub async fn handle_json(
         &method,
         uri.path(),
         &client_ip,
-    )
-    .await?;
+    );
     audit.set_request(&headers, &body, false);
     audit.set_request_size(body.len() as i64);
     let result = dispatch(
@@ -339,8 +340,7 @@ pub async fn handle_audio(
         &method,
         uri.path(),
         &peer.ip().to_string(),
-    )
-    .await?;
+    );
     audit.set_request(&headers, &[], true);
     let result = dispatch_audio(
         state,
@@ -384,8 +384,7 @@ pub async fn handle_models(
         &method,
         uri.path(),
         &peer.ip().to_string(),
-    )
-    .await?;
+    );
     audit.set_request(&headers, &[], false);
     models_response(&state, &mut audit).await
 }
@@ -1111,7 +1110,8 @@ fn filtered_response_headers(headers: &HeaderMap) -> Vec<(HeaderName, HeaderValu
 }
 
 struct StreamCompletion {
-    permit: Option<mpsc::OwnedPermit<AuditEvent>>,
+    permit: Option<AuditReservation>,
+    archive_budget: Option<OwnedSemaphorePermit>,
     event: Option<AuditEvent>,
     started: Instant,
     usage: Usage,
@@ -1120,10 +1120,16 @@ struct StreamCompletion {
 }
 
 impl StreamCompletion {
-    fn new(permit: mpsc::OwnedPermit<AuditEvent>, event: AuditEvent, started: Instant) -> Self {
+    fn new(
+        permit: Option<AuditReservation>,
+        archive_budget: Option<OwnedSemaphorePermit>,
+        event: Option<AuditEvent>,
+        started: Instant,
+    ) -> Self {
         Self {
-            permit: Some(permit),
-            event: Some(event),
+            permit,
+            archive_budget,
+            event,
             started,
             usage: Usage::default(),
             response_preview: StreamingPreview::default(),
@@ -1132,13 +1138,12 @@ impl StreamCompletion {
     }
 
     fn capture_sse(&mut self, pending: &mut Vec<u8>, bytes: &[u8]) {
+        let Some(request_archive) = self.event.as_ref().map(|event| event.request_archive) else {
+            return;
+        };
         self.response_bytes += bytes.len() as i64;
         update_sse_usage(pending, bytes, &mut self.usage);
-        if self
-            .event
-            .as_ref()
-            .is_some_and(|event| event.request_archive)
-        {
+        if request_archive {
             self.response_preview.capture(bytes);
         }
     }
@@ -1164,7 +1169,7 @@ impl StreamCompletion {
         self.permit
             .take()
             .expect("audit queue capacity is reserved once")
-            .send(event);
+            .send(event, self.archive_budget.take());
     }
 }
 
@@ -1186,7 +1191,7 @@ impl Drop for StreamCompletion {
             self.permit
                 .take()
                 .expect("audit queue capacity is reserved once")
-                .send(event);
+                .send(event, self.archive_budget.take());
         }
     }
 }
@@ -1653,9 +1658,7 @@ mod tests {
             &Method::GET,
             "/v1/models",
             "127.0.0.1",
-        )
-        .await
-        .unwrap();
+        );
         audit.set_affinity(
             Some("key-1:previous-response"),
             Some("previous_response_id"),
@@ -1715,9 +1718,7 @@ mod tests {
             &Method::POST,
             "/v1/responses",
             "127.0.0.1",
-        )
-        .await
-        .unwrap();
+        );
         let mut completion = audit.take_stream(StatusCode::OK, Some("gpt-5.5"));
         let mut pending = Vec::new();
         completion.capture_sse(
@@ -1788,9 +1789,7 @@ mod tests {
             &Method::POST,
             "/v1/responses",
             "127.0.0.1",
-        )
-        .await
-        .unwrap();
+        );
         audit.set_provider("provider-1");
         sqlx::query("DELETE FROM providers WHERE id='provider-1'")
             .execute(&state.db)
@@ -2123,6 +2122,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_audit_queue_does_not_delay_proxy_or_capture_diagnostics() {
+        let state = crate::test_state("http://token.invalid").await;
+        seed_proxy(&state, false).await;
+        let mut reservations = Vec::new();
+        while let Some(reservation) = state.audit.try_reserve() {
+            reservations.push(reservation);
+        }
+        assert!(!reservations.is_empty());
+
+        let dropped_before = crate::audit::dropped_events();
+        let identity = ApiIdentity {
+            consumer_id: "key-1".to_owned(),
+            user_id: "user-1".to_owned(),
+            request_archive: true,
+            all_providers: false,
+        };
+        let mut audit = AuditTracker::begin(
+            &state,
+            &identity,
+            "dropped-diagnostic",
+            None,
+            &Method::POST,
+            "/v1/responses",
+            "127.0.0.1",
+        );
+        audit.set_request(&HeaderMap::new(), &vec![0; ARCHIVE_BODY_LIMIT], false);
+        assert!(audit.event.is_none());
+        drop(audit);
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::router(state.clone()).oneshot(proxy_request(
+                "/v1/models",
+                "application/json",
+                Body::empty(),
+            )),
+        )
+        .await
+        .expect("full audit queue must not block the proxy")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(crate::audit::dropped_events() >= dropped_before + 2);
+        let calls: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_calls")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(calls, 0);
+
+        drop(reservations);
+    }
+
+    #[tokio::test]
+    async fn full_archive_budget_preserves_base_audit_without_diagnostics() {
+        let state = crate::test_state("http://token.invalid").await;
+        seed_proxy(&state, false).await;
+        let mut archive_budgets = Vec::new();
+        while let Some(budget) = state.audit.try_reserve_archive() {
+            archive_budgets.push(budget);
+        }
+        assert!(!archive_budgets.is_empty());
+
+        let response = crate::router(state.clone())
+            .oneshot(proxy_request(
+                "/v1/models",
+                "application/json",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        wait_for_audits(&state, 1).await;
+        let stored: (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*),COUNT(a.api_call_id) FROM api_calls c LEFT JOIN request_archives a ON a.api_call_id=c.id",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(stored, (1, 0));
+
+        drop(archive_budgets);
+    }
+
+    #[tokio::test]
     async fn single_provider_error_is_forwarded_and_failed_calls_are_audited() {
         for expected in [
             StatusCode::UNAUTHORIZED,
@@ -2280,9 +2362,7 @@ mod tests {
             &Method::POST,
             "/v1/responses",
             "127.0.0.1",
-        )
-        .await
-        .unwrap();
+        );
         drop(audit.take_stream(StatusCode::OK, Some("gpt-5.4")));
         wait_for_audits(&state, 1).await;
         let row: (i64, bool) = sqlx::query_as(

@@ -1,13 +1,27 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use arc_swap::ArcSwap;
 use sqlx::{Sqlite, SqlitePool, Transaction};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::config::Config;
 
 const QUEUE_CAPACITY: usize = 4_096;
 const BATCH_CAPACITY: usize = 128;
+const QUEUE_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
+pub const ARCHIVE_BODY_LIMIT: usize = 1024 * 1024;
+const ARCHIVE_RESERVATION_BYTES: u32 = (ARCHIVE_BODY_LIMIT * 2 + 16 * 1024) as u32;
+const RETRY_INITIAL_DELAY: Duration = Duration::from_millis(100);
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+
+static DROPPED_EVENTS: AtomicU64 = AtomicU64::new(0);
+static DROPPED_ARCHIVES: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 static WRITE_RETRIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -15,6 +29,11 @@ static WRITE_RETRIES: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 #[cfg(test)]
 pub(crate) fn write_retries() -> usize {
     WRITE_RETRIES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn dropped_events() -> u64 {
+    DROPPED_EVENTS.load(Ordering::Relaxed)
 }
 
 #[derive(Debug)]
@@ -52,7 +71,26 @@ pub struct AuditEvent {
 
 #[derive(Clone)]
 pub struct AuditWriter {
-    sender: mpsc::Sender<AuditEvent>,
+    sender: mpsc::Sender<QueuedAudit>,
+    budget: Arc<Semaphore>,
+}
+
+pub(crate) struct AuditReservation {
+    permit: mpsc::OwnedPermit<QueuedAudit>,
+}
+
+struct QueuedAudit {
+    event: AuditEvent,
+    _archive_budget: Option<OwnedSemaphorePermit>,
+}
+
+impl AuditReservation {
+    pub(crate) fn send(self, event: AuditEvent, archive_budget: Option<OwnedSemaphorePermit>) {
+        self.permit.send(QueuedAudit {
+            event,
+            _archive_budget: archive_budget,
+        });
+    }
 }
 
 impl AuditWriter {
@@ -60,15 +98,52 @@ impl AuditWriter {
         let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
         tokio::spawn(run(pool.clone(), receiver));
         tokio::spawn(cleanup(pool, config));
-        Self { sender }
+        Self {
+            sender,
+            budget: Arc::new(Semaphore::new(QUEUE_BYTE_CAPACITY)),
+        }
     }
 
-    pub async fn reserve(&self) -> Option<mpsc::OwnedPermit<AuditEvent>> {
-        self.sender.clone().reserve_owned().await.ok()
+    pub(crate) fn try_reserve(&self) -> Option<AuditReservation> {
+        let permit = match self.sender.clone().try_reserve_owned() {
+            Ok(permit) => permit,
+            Err(_) => return dropped(),
+        };
+        Some(AuditReservation { permit })
+    }
+
+    pub(crate) fn try_reserve_archive(&self) -> Option<OwnedSemaphorePermit> {
+        self.budget
+            .clone()
+            .try_acquire_many_owned(ARCHIVE_RESERVATION_BYTES)
+            .ok()
+            .or_else(dropped_archive)
     }
 }
 
-async fn run(pool: SqlitePool, mut receiver: mpsc::Receiver<AuditEvent>) {
+fn dropped<T>() -> Option<T> {
+    let count = DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if count == 1 || count.is_power_of_two() {
+        tracing::warn!(
+            dropped_events = count,
+            "audit queue is full; dropping request audit"
+        );
+    }
+    None
+}
+
+fn dropped_archive<T>() -> Option<T> {
+    let count = DROPPED_ARCHIVES.fetch_add(1, Ordering::Relaxed) + 1;
+    if count == 1 || count.is_power_of_two() {
+        tracing::warn!(
+            dropped_archives = count,
+            "audit archive memory budget is full; dropping request diagnostics"
+        );
+    }
+    None
+}
+
+async fn run(pool: SqlitePool, mut receiver: mpsc::Receiver<QueuedAudit>) {
     while let Some(first) = receiver.recv().await {
         let mut batch = Vec::with_capacity(BATCH_CAPACITY);
         batch.push(first);
@@ -79,26 +154,28 @@ async fn run(pool: SqlitePool, mut receiver: mpsc::Receiver<AuditEvent>) {
                 Err(_) => break,
             }
         }
+        let mut retry_delay = RETRY_INITIAL_DELAY;
         loop {
             match persist(&pool, &batch).await {
                 Ok(()) => break,
                 Err(error) => {
                     #[cfg(test)]
                     WRITE_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    tracing::error!(events = batch.len(), %error, "audit batch write failed; retrying");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tracing::error!(events = batch.len(), retry_ms = retry_delay.as_millis(), %error, "audit batch write failed; retrying");
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = retry_delay.saturating_mul(2).min(RETRY_MAX_DELAY);
                 }
             }
         }
     }
 }
 
-async fn persist(pool: &SqlitePool, batch: &[AuditEvent]) -> Result<(), sqlx::Error> {
+async fn persist(pool: &SqlitePool, batch: &[QueuedAudit]) -> Result<(), sqlx::Error> {
     let mut transaction = pool.begin().await?;
     let mut touched_keys = std::collections::HashSet::new();
-    for event in batch {
-        insert(&mut transaction, event).await?;
-        touched_keys.insert(event.consumer_id.as_str());
+    for queued in batch {
+        insert(&mut transaction, &queued.event).await?;
+        touched_keys.insert(queued.event.consumer_id.as_str());
     }
     let used_at = chrono::Utc::now().timestamp();
     for consumer_id in touched_keys {

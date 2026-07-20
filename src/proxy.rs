@@ -92,6 +92,7 @@ impl AuditTracker {
             method: method.as_str().to_owned(),
             path: path.to_owned(),
             model: None,
+            reasoning_effort: None,
             status: 0,
             first_byte_latency_ms: None,
             request_bytes: 0,
@@ -128,6 +129,12 @@ impl AuditTracker {
         if let Some(event) = &mut self.event {
             event.affinity_hash = key.map(affinity_hash);
             event.affinity_source = source.map(str::to_owned);
+        }
+    }
+
+    fn set_reasoning_effort(&mut self, effort: Option<&str>) {
+        if let Some(event) = &mut self.event {
+            event.reasoning_effort = effort.map(str::to_owned);
         }
     }
 
@@ -479,6 +486,7 @@ async fn dispatch(
         .and_then(|value| value.get("model"))
         .and_then(Value::as_str)
         .map(str::to_owned);
+    audit.set_reasoning_effort(parsed.as_ref().and_then(reasoning_effort).as_deref());
     let stream = parsed
         .as_ref()
         .and_then(|value| value.get("stream"))
@@ -569,6 +577,14 @@ async fn dispatch(
         stream,
     };
     relay_response(context, lease, upstream, audit).await
+}
+
+fn reasoning_effort(request: &Value) -> Option<String> {
+    request
+        .pointer("/reasoning/effort")
+        .and_then(Value::as_str)
+        .or_else(|| request.get("reasoning_effort").and_then(Value::as_str))
+        .map(str::to_owned)
 }
 
 async fn dispatch_audio(
@@ -1633,6 +1649,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reads_reasoning_effort_from_supported_request_shapes() {
+        assert_eq!(
+            reasoning_effort(&json!({"reasoning":{"effort":"high"}})),
+            Some("high".to_owned())
+        );
+        assert_eq!(
+            reasoning_effort(&json!({"reasoning_effort":"medium"})),
+            Some("medium".to_owned())
+        );
+        assert_eq!(reasoning_effort(&json!({"reasoning":{}})), None);
+    }
+
     #[tokio::test]
     async fn audit_persists_usage_without_request_body() {
         let state = crate::test_state("http://token.invalid").await;
@@ -1663,6 +1692,7 @@ mod tests {
             Some("key-1:previous-response"),
             Some("previous_response_id"),
         );
+        audit.set_reasoning_effort(Some("high"));
         audit.mark_first_byte();
         audit.set_request_size(42);
         audit.set_response_size(64);
@@ -1693,6 +1723,13 @@ mod tests {
                 "previous_response_id".to_owned(),
             )
         );
+        let effort: Option<String> = sqlx::query_scalar(
+            "SELECT reasoning_effort FROM api_calls WHERE request_id='request-1'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(effort.as_deref(), Some("high"));
         let archives: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_archives")
             .fetch_one(&state.db)
             .await

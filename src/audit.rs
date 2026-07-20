@@ -50,6 +50,7 @@ pub struct AuditEvent {
     pub method: String,
     pub path: String,
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub status: i64,
     pub first_byte_latency_ms: Option<i64>,
     pub request_bytes: i64,
@@ -192,7 +193,7 @@ async fn insert(
     transaction: &mut Transaction<'_, Sqlite>,
     event: &AuditEvent,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO api_calls(id,request_id,thread_id,consumer_id,user_id,provider_id,affinity_hash,affinity_source,method,path,model,status,first_byte_latency_ms,request_bytes,response_bytes,latency_ms,input_tokens,output_tokens,cached_tokens,error,client_ip,created_at) VALUES(?,?,?,?,?,(SELECT id FROM providers WHERE id=?),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO api_calls(id,request_id,thread_id,consumer_id,user_id,provider_id,affinity_hash,affinity_source,method,path,model,reasoning_effort,status,first_byte_latency_ms,request_bytes,response_bytes,latency_ms,input_tokens,output_tokens,cached_tokens,error,client_ip,created_at) VALUES(?,?,?,?,?,(SELECT id FROM providers WHERE id=?),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(&event.id)
         .bind(&event.request_id)
         .bind(&event.thread_id)
@@ -204,6 +205,7 @@ async fn insert(
         .bind(&event.method)
         .bind(&event.path)
         .bind(&event.model)
+        .bind(&event.reasoning_effort)
         .bind(event.status)
         .bind(event.first_byte_latency_ms)
         .bind(event.request_bytes)

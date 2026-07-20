@@ -299,6 +299,7 @@ type Audit = {
   provider_name?: string
   path: string
   model?: string
+  reasoning_effort?: string
   status: number
   first_byte_latency_ms?: number
   request_bytes: number
@@ -565,6 +566,7 @@ const copy = {
     totalLatency: "总耗时",
     requestSize: "请求大小",
     responseSize: "响应大小",
+    reasoningEffort: "推理强度",
     cachedInput: "缓存输入",
     details: "详情",
     filter: "筛选",
@@ -910,6 +912,7 @@ const copy = {
     totalLatency: "Total",
     requestSize: "Request size",
     responseSize: "Response size",
+    reasoningEffort: "Reasoning effort",
     cachedInput: "Cached input",
     details: "Details",
     filter: "Filter",
@@ -3669,6 +3672,7 @@ function AuditPage({
                     <TableRow>
                       <TableHead>{t.time}</TableHead>
                       <TableHead>{t.model}</TableHead>
+                      <TableHead>{t.reasoningEffort}</TableHead>
                       <TableHead>{t.userId}</TableHead>
                       <TableHead>{t.consumer}</TableHead>
                       <TableHead>{t.provider}</TableHead>
@@ -3686,6 +3690,9 @@ function AuditPage({
                         </TableCell>
                         <TableCell>
                           <code>{row.model || "—"}</code>
+                        </TableCell>
+                        <TableCell>
+                          <code>{row.reasoning_effort || "—"}</code>
                         </TableCell>
                         <TableCell>
                           <CopyableIdentifier
@@ -3913,6 +3920,7 @@ function RequestDetailPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
               [t.userId, data.user_id],
               [t.provider, data.provider_name || data.provider_id || "—"],
               [t.model, data.model || "—"],
+              [t.reasoningEffort, data.reasoning_effort || "—"],
               [t.status, data.status],
               [t.requestSize, formatBytes(data.request_bytes, locale)],
               [t.responseSize, formatBytes(data.response_bytes, locale)],

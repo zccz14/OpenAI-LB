@@ -415,6 +415,11 @@ const copy = {
     walFile: "WAL",
     shmFile: "SHM",
     reclaimableSpace: "可回收空间（VACUUM）",
+    vacuumDatabase: "执行 VACUUM",
+    vacuumDatabaseTitle: "整理 SQLite 数据库？",
+    vacuumDatabaseDescription:
+      "此操作会重写数据库文件以回收可回收空间。执行期间数据库写入可能短暂等待。",
+    vacuumDatabaseComplete: "SQLite 数据库已整理，资源指标已刷新。",
     providerPool: "OAuth 上游提供商池",
     providerDescription:
       "管理自己拥有的 OAuth 上游提供商；root 与管理员可管理全局 Provider。Token 读取与变更会进入操作审计。",
@@ -752,6 +757,12 @@ const copy = {
     walFile: "WAL",
     shmFile: "SHM",
     reclaimableSpace: "Reclaimable (VACUUM)",
+    vacuumDatabase: "Run VACUUM",
+    vacuumDatabaseTitle: "Compact the SQLite database?",
+    vacuumDatabaseDescription:
+      "This rewrites the database file to reclaim free space. Database writes may wait briefly while it runs.",
+    vacuumDatabaseComplete:
+      "SQLite database compacted and resource metrics refreshed.",
     providerPool: "OAuth provider pool",
     providerDescription:
       "Manage OAuth providers you own. Root and administrators can manage the global pool. Token reads and changes are audited.",
@@ -1635,12 +1646,29 @@ function SystemResourcesCard({
   locale: Locale
 }) {
   const t = copy[locale]
+  const queryClient = useQueryClient()
+  const [vacuumDialogOpen, setVacuumDialogOpen] = useState(false)
+  const [vacuumPending, setVacuumPending] = useState(false)
   const query = useQuery({
     queryKey: ["/api/system/resources"],
     queryFn: ({ signal }) =>
       api<SystemResources>(sdk, "/api/system/resources", { signal }),
     refetchInterval: 5_000,
   })
+  async function vacuumDatabase() {
+    setVacuumPending(true)
+    try {
+      const snapshot = await api<SystemResources>(sdk, "/api/system/resources", {
+        method: "POST",
+      })
+      queryClient.setQueryData(["/api/system/resources"], snapshot)
+      toast.success(t.vacuumDatabaseComplete)
+    } catch (cause) {
+      toast.error(message(cause, t))
+    } finally {
+      setVacuumPending(false)
+    }
+  }
   if (query.isPending) return <SystemResourcesLoading locale={locale} />
   if (query.error || !query.data)
     return (
@@ -1670,6 +1698,7 @@ function SystemResourcesCard({
     detail: string
     secondaryDetail?: string
     percent?: number
+    action?: ReactNode
   }> = [
     {
       icon: CpuIcon,
@@ -1709,6 +1738,17 @@ function SystemResourcesCard({
       value: formatStorageBytes(data.sqlite.total_bytes, locale),
       detail: `${t.mainFile}: ${formatStorageBytes(data.sqlite.main_bytes, locale)} · ${t.walFile}: ${formatStorageBytes(data.sqlite.wal_bytes, locale)} · ${t.shmFile}: ${formatStorageBytes(data.sqlite.shm_bytes, locale)}`,
       secondaryDetail: `${t.reclaimableSpace}: ${formatStorageBytes(data.sqlite.freelist_bytes, locale)} · ${formatPercent(data.sqlite.freelist_percent, locale)}`,
+      action: (
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={vacuumPending}
+          onClick={() => setVacuumDialogOpen(true)}
+        >
+          {vacuumPending ? <Spinner data-icon="inline-start" /> : <DatabaseIcon />}
+          {t.vacuumDatabase}
+        </Button>
+      ),
     },
   ]
 
@@ -1755,12 +1795,35 @@ function SystemResourcesCard({
                       value={Math.max(0, Math.min(100, metric.percent))}
                     />
                   )}
+                  {metric.action && <div className="pt-1">{metric.action}</div>}
                 </dd>
               </div>
             )
           })}
         </dl>
       </CardContent>
+      <AlertDialog open={vacuumDialogOpen} onOpenChange={setVacuumDialogOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t.vacuumDatabaseTitle}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t.vacuumDatabaseDescription}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={vacuumPending}>
+              {t.cancel}
+            </AlertDialogCancel>
+            <AlertDialogAction
+              disabled={vacuumPending}
+              onClick={() => void vacuumDatabase()}
+            >
+              {vacuumPending && <Spinner data-icon="inline-start" />}
+              {t.vacuumDatabase}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </Card>
   )
 }

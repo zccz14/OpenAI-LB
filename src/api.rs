@@ -1217,6 +1217,23 @@ pub async fn system_resources(
     Ok(Json(snapshot))
 }
 
+pub async fn vacuum_system_database(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<SystemResourcesSnapshot>, AppError> {
+    let user = browser_identity(&state, &headers).await?;
+    require_admin(&user)?;
+    let result = state.resources.lock().await.vacuum().await;
+    let action = if result.is_ok() {
+        "system.database.vacuum"
+    } else {
+        "system.database.vacuum.failed"
+    };
+    write_admin_audit(&state, &user.id, action, None, &peer.ip().to_string()).await?;
+    Ok(Json(result?))
+}
+
 pub async fn settings(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1965,6 +1982,22 @@ mod tests {
                 .and_then(|user| user["provider_access"].as_bool()),
             Some(false)
         );
+        let vacuum = provider_request(
+            &state,
+            Method::POST,
+            "/api/system/resources",
+            &admin_browser_token,
+            None,
+        )
+        .await;
+        assert_eq!(vacuum.status(), StatusCode::OK);
+        let vacuum_audits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM admin_audit WHERE action='system.database.vacuum'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(vacuum_audits, 1);
         let grant = provider_request(
             &state,
             Method::PATCH,
@@ -2192,6 +2225,15 @@ mod tests {
         sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,created_at,updated_at,owner_id) VALUES('tenant-provider','tenant','tenant','access','refresh',?,?, 'tenant-user')")
             .bind(now).bind(now).execute(&state.db).await.unwrap();
         let tenant_token = setup_token(&signing, &issuer, "tenant-user");
+        let tenant_vacuum = provider_request(
+            &state,
+            Method::POST,
+            "/api/system/resources",
+            &tenant_token,
+            None,
+        )
+        .await;
+        assert_eq!(tenant_vacuum.status(), StatusCode::FORBIDDEN);
         let created = provider_request(
             &state,
             Method::POST,

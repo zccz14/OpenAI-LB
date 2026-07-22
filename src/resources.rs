@@ -150,6 +150,11 @@ impl ResourceMonitor {
             sqlite,
         })
     }
+
+    pub async fn vacuum(&mut self) -> Result<SystemResourcesSnapshot> {
+        sqlx::query("VACUUM").execute(&self.database).await?;
+        self.sample().await
+    }
 }
 
 fn disk_usage(disks: &Disks, database_path: &Path) -> Option<DiskSnapshot> {
@@ -315,6 +320,40 @@ mod tests {
 
         assert!(usage.freelist_bytes > 0);
         assert!(usage.freelist_percent > 0.0);
+        pool.close().await;
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn vacuum_reclaims_sqlite_freelist_space() {
+        let path = std::env::temp_dir().join(format!(
+            "openai-lb-resource-vacuum-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = crate::db::connect_test_file(&path).await.unwrap();
+        sqlx::query("CREATE TABLE resource_vacuum_test(payload BLOB NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO resource_vacuum_test(payload) VALUES(?)")
+            .bind(vec![0_u8; 64 * 1024])
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM resource_vacuum_test")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let before = sqlite_usage(&path, &pool).await.unwrap();
+        assert!(before.freelist_bytes > 0);
+
+        let mut monitor = ResourceMonitor::new(path.clone(), pool.clone());
+        let after = monitor.vacuum().await.unwrap();
+        assert_eq!(after.sqlite.freelist_bytes, 0);
+
         pool.close().await;
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));

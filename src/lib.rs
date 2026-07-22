@@ -128,7 +128,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/audit/{id}", get(api::audit_detail))
         .route("/api/admin-audit", get(api::list_admin_audit))
         .route("/api/dashboard", get(api::dashboard))
-        .route("/api/system/resources", get(api::system_resources))
+        .route(
+            "/api/system/resources",
+            get(api::system_resources).post(api::vacuum_system_database),
+        )
         .route(
             "/api/settings",
             get(api::settings).patch(api::update_settings),

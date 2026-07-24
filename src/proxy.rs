@@ -375,25 +375,10 @@ pub async fn handle_audio(
 
 pub async fn handle_models(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    OriginalUri(uri): OriginalUri,
-    method: Method,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let request_id = request_id(&headers);
-    let thread_id = thread_id(&headers);
-    let identity = api_identity(&state, &headers).await?;
-    let mut audit = AuditTracker::begin(
-        &state,
-        &identity,
-        &request_id,
-        thread_id.as_deref(),
-        &method,
-        uri.path(),
-        &peer.ip().to_string(),
-    );
-    audit.set_request(&headers, &[], false);
-    models_response(&state, &mut audit).await
+    api_identity(&state, &headers).await?;
+    models_response()
 }
 
 fn body_preview(body: &[u8]) -> (Vec<u8>, bool) {
@@ -1295,10 +1280,7 @@ fn error_from(status: StatusCode, bytes: &[u8]) -> Option<String> {
     })
 }
 
-async fn models_response(
-    _state: &AppState,
-    audit: &mut AuditTracker,
-) -> Result<Response, AppError> {
+fn models_response() -> Result<Response, AppError> {
     let models = [
         "gpt-5.4",
         "gpt-5.3-codex",
@@ -1315,10 +1297,6 @@ async fn models_response(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
-    audit.set_response_headers(&headers);
-    audit.set_response_body(&body, false);
-    audit.set_response_size(body.len() as i64);
-    audit.finish(StatusCode::OK, None, Usage::default(), None);
     build_response(
         StatusCode::OK,
         vec![(
@@ -1566,13 +1544,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thread_id_is_persisted_without_request_recording() {
+    async fn models_calls_are_not_audited() {
         let state = crate::test_state("http://token.invalid").await;
         seed_proxy(&state, false).await;
-        sqlx::query("UPDATE consumers SET request_archive=0 WHERE id='key-1'")
-            .execute(&state.db)
-            .await
-            .unwrap();
         let app = crate::router(state.clone());
         let mut request = proxy_request("/v1/models", "application/json", Body::empty());
         request.headers_mut().insert(
@@ -1582,14 +1556,11 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        wait_for_audits(&state, 1).await;
-        let stored: (Option<String>, i64) = sqlx::query_as(
-            "SELECT c.thread_id,COUNT(a.api_call_id) FROM api_calls c LEFT JOIN request_archives a ON a.api_call_id=c.id",
-        )
-        .fetch_one(&state.db)
-        .await
-        .unwrap();
-        assert_eq!(stored, (Some("codex-thread".to_owned()), 0));
+        let calls: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_calls")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(calls, 0);
     }
 
     #[test]
@@ -1845,9 +1816,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_model_calls_batch_audit_without_sqlite_contention() {
-        let state = crate::test_state("http://token.invalid").await;
-        seed_proxy(&state, false).await;
+    async fn concurrent_proxy_calls_batch_audit_without_sqlite_contention() {
+        let (upstream, _) = spawn_mock(StatusCode::OK).await;
+        let state = crate::test_state_with_upstream("http://token.invalid", &upstream).await;
+        seed_proxy(&state, true).await;
         let app = crate::router(state.clone());
         let mut tasks = Vec::new();
         for _ in 0..200 {
@@ -1855,9 +1827,9 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 service
                     .oneshot(proxy_request(
-                        "/v1/models",
+                        "/v1/responses",
                         "application/json",
-                        Body::empty(),
+                        Body::from(r#"{"model":"gpt-5.4","input":"audit"}"#),
                     ))
                     .await
                     .unwrap()
@@ -1988,12 +1960,12 @@ mod tests {
         assert_eq!(records[2].body, audio);
         drop(records);
         wait_for_audits(&state, 4).await;
-        let method: String =
-            sqlx::query_scalar("SELECT method FROM api_calls WHERE path='/v1/models'")
+        let model_calls: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM api_calls WHERE path='/v1/models'")
                 .fetch_one(&state.db)
                 .await
                 .unwrap();
-        assert_eq!(method, "GET");
+        assert_eq!(model_calls, 0);
         let archive: (String, Vec<u8>, Vec<u8>, bool, bool) = sqlx::query_as(
             "SELECT a.request_headers_json,a.request_body,a.response_body,a.request_body_truncated,a.response_body_truncated FROM request_archives a JOIN api_calls c ON c.id=a.api_call_id WHERE c.path='/v1/responses'",
         )
@@ -2116,8 +2088,9 @@ mod tests {
 
     #[tokio::test]
     async fn temporary_archive_write_failure_does_not_change_response_and_retries() {
-        let state = crate::test_state("http://token.invalid").await;
-        seed_proxy(&state, false).await;
+        let (upstream, _) = spawn_mock(StatusCode::OK).await;
+        let state = crate::test_state_with_upstream("http://token.invalid", &upstream).await;
+        seed_proxy(&state, true).await;
         sqlx::query("DROP TABLE request_archives")
             .execute(&state.db)
             .await
@@ -2126,15 +2099,15 @@ mod tests {
 
         let response = crate::router(state.clone())
             .oneshot(proxy_request(
-                "/v1/models",
+                "/v1/responses",
                 "application/json",
-                Body::empty(),
+                Body::from(r#"{"model":"gpt-5.4","input":"archive"}"#),
             ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert!(std::str::from_utf8(&body).unwrap().contains("gpt-5.4"));
+        assert!(std::str::from_utf8(&body).unwrap().contains("resp"));
 
         for _ in 0..100 {
             if crate::audit::write_retries() > retries_before {
@@ -2160,8 +2133,9 @@ mod tests {
 
     #[tokio::test]
     async fn full_audit_queue_does_not_delay_proxy_or_capture_diagnostics() {
-        let state = crate::test_state("http://token.invalid").await;
-        seed_proxy(&state, false).await;
+        let (upstream, _) = spawn_mock(StatusCode::OK).await;
+        let state = crate::test_state_with_upstream("http://token.invalid", &upstream).await;
+        seed_proxy(&state, true).await;
         let mut reservations = Vec::new();
         while let Some(reservation) = state.audit.try_reserve() {
             reservations.push(reservation);
@@ -2191,9 +2165,9 @@ mod tests {
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             crate::router(state.clone()).oneshot(proxy_request(
-                "/v1/models",
+                "/v1/responses",
                 "application/json",
-                Body::empty(),
+                Body::from(r#"{"model":"gpt-5.4","input":"full queue"}"#),
             )),
         )
         .await
@@ -2212,8 +2186,9 @@ mod tests {
 
     #[tokio::test]
     async fn full_archive_budget_preserves_base_audit_without_diagnostics() {
-        let state = crate::test_state("http://token.invalid").await;
-        seed_proxy(&state, false).await;
+        let (upstream, _) = spawn_mock(StatusCode::OK).await;
+        let state = crate::test_state_with_upstream("http://token.invalid", &upstream).await;
+        seed_proxy(&state, true).await;
         let mut archive_budgets = Vec::new();
         while let Some(budget) = state.audit.try_reserve_archive() {
             archive_budgets.push(budget);
@@ -2222,9 +2197,9 @@ mod tests {
 
         let response = crate::router(state.clone())
             .oneshot(proxy_request(
-                "/v1/models",
+                "/v1/responses",
                 "application/json",
-                Body::empty(),
+                Body::from(r#"{"model":"gpt-5.4","input":"archive budget"}"#),
             ))
             .await
             .unwrap();

@@ -3340,7 +3340,7 @@ function UsagePage({
                 {table.getHeaderGroups().map((headerGroup) => (
                   <TableRow key={headerGroup.id}>
                     {headerGroup.headers.map((header) => (
-                      <TableHead key={header.id}>
+                      <TableHead key={header.id} colSpan={header.colSpan}>
                         {header.isPlaceholder ? null : header.column.getCanSort() ? (
                           <Button
                             variant="ghost"

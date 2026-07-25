@@ -204,7 +204,6 @@ type SystemResources = {
 }
 type ManagedUser = {
   id: string
-  email?: string
   display_name?: string
   role: Role
   provider_access: boolean
@@ -668,6 +667,8 @@ const copy = {
     noUsers: "暂无用户",
     noUsersDescription: "用户首次通过 Auth Mini 登录后会自动出现在这里。",
     displayName: "显示名称",
+    saveDisplayName: "保存",
+    displayNameUpdated: "显示名称已更新",
     roleUpdated: "用户角色已更新",
     providerAccess: "全局 Provider 访问",
     providerAccessUpdated: "全局 Provider 访问权限已更新",
@@ -1025,6 +1026,8 @@ const copy = {
     noUsersDescription:
       "Users appear here after their first Auth Mini sign-in.",
     displayName: "Display name",
+    saveDisplayName: "Save",
+    displayNameUpdated: "Display name updated",
     roleUpdated: "User role updated",
     providerAccess: "Global Provider access",
     providerAccessUpdated: "Global Provider access updated",
@@ -4219,6 +4222,9 @@ function UsersPage({
 }) {
   const t = copy[locale]
   const queryClient = useQueryClient()
+  const [displayNamePending, setDisplayNamePending] = useState<string | null>(
+    null
+  )
   const { data, error, loading } = useApiQuery<ManagedUser[]>(sdk, "/api/users")
   function refreshUsers() {
     void queryClient.invalidateQueries({ queryKey: ["/api/users"] })
@@ -4247,6 +4253,28 @@ function UsersPage({
       toast.error(message(cause, t))
     }
   }
+  async function updateDisplayName(
+    event: FormEvent<HTMLFormElement>,
+    id: string
+  ) {
+    event.preventDefault()
+    if (displayNamePending) return
+    const display_name = new FormData(event.currentTarget).get("display_name")
+    if (typeof display_name !== "string") return
+    setDisplayNamePending(id)
+    try {
+      await api(sdk, `/api/users/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ display_name }),
+      })
+      refreshUsers()
+      toast.success(t.displayNameUpdated)
+    } catch (cause) {
+      toast.error(message(cause, t))
+    } finally {
+      setDisplayNamePending(null)
+    }
+  }
   if (loading) return <LoadingTable />
   if (error) return <ErrorState message={error} />
   return (
@@ -4267,7 +4295,6 @@ function UsersPage({
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>{t.email}</TableHead>
                   <TableHead>{t.displayName}</TableHead>
                   <TableHead>{t.userId}</TableHead>
                   <TableHead>{t.createdAt}</TableHead>
@@ -4278,8 +4305,32 @@ function UsersPage({
               <TableBody>
                 {data.map((item) => (
                   <TableRow key={item.id}>
-                    <TableCell>{item.email || "—"}</TableCell>
-                    <TableCell>{item.display_name || "—"}</TableCell>
+                    <TableCell>
+                      <form
+                        className="flex min-w-52 items-center gap-2"
+                        onSubmit={(event) =>
+                          void updateDisplayName(event, item.id)
+                        }
+                      >
+                        <Input
+                          aria-label={`${t.displayName}: ${item.id}`}
+                          defaultValue={item.display_name ?? ""}
+                          maxLength={200}
+                          name="display_name"
+                          required
+                        />
+                        <Button
+                          size="sm"
+                          type="submit"
+                          disabled={displayNamePending === item.id}
+                        >
+                          {displayNamePending === item.id && (
+                            <Spinner data-icon="inline-start" />
+                          )}
+                          {t.saveDisplayName}
+                        </Button>
+                      </form>
+                    </TableCell>
                     <TableCell>
                       <code>{item.id}</code>
                     </TableCell>
@@ -4293,7 +4344,7 @@ function UsersPage({
                           }
                         >
                           <SelectTrigger
-                            aria-label={`${t.role}: ${item.email || item.id}`}
+                            aria-label={`${t.role}: ${item.display_name || item.id}`}
                           >
                             <SelectValue />
                           </SelectTrigger>
@@ -4315,7 +4366,7 @@ function UsersPage({
                     <TableCell>
                       {item.role === "user" ? (
                         <Switch
-                          aria-label={`${t.providerAccess}: ${item.email || item.id}`}
+                          aria-label={`${t.providerAccess}: ${item.display_name || item.id}`}
                           checked={item.provider_access}
                           onCheckedChange={(checked) =>
                             void updateProviderAccess(item.id, checked)
@@ -4324,7 +4375,7 @@ function UsersPage({
                       ) : (
                         <div className="flex items-center gap-2">
                           <Switch
-                            aria-label={`${t.providerAccess}: ${item.email || item.id}`}
+                            aria-label={`${t.providerAccess}: ${item.display_name || item.id}`}
                             checked
                             disabled
                           />

@@ -208,7 +208,7 @@ pub async fn browser_identity(
 
 async fn upsert_user(pool: &SqlitePool, claims: &Claims) -> Result<UserIdentity, AppError> {
     let now = chrono::Utc::now().timestamp();
-    sqlx::query("INSERT INTO users(id,email,display_name,role,created_at) VALUES(?,?,?,'user',?) ON CONFLICT(id) DO UPDATE SET email=excluded.email,display_name=excluded.display_name")
+    sqlx::query("INSERT INTO users(id,email,display_name,role,created_at) VALUES(?,?,?,'user',?) ON CONFLICT(id) DO UPDATE SET email=excluded.email,display_name=CASE WHEN users.display_name_overridden=0 THEN excluded.display_name ELSE users.display_name END")
         .bind(&claims.sub)
         .bind(&claims.email)
         .bind(&claims.name)
@@ -393,6 +393,25 @@ mod tests {
         let state = crate::test_state("http://token.invalid").await;
         let ordinary = upsert_user(&state.db, &claims("ordinary")).await.unwrap();
         assert_eq!(ordinary.role, "user");
+    }
+
+    #[tokio::test]
+    async fn administrator_display_name_override_survives_later_logins() {
+        let state = crate::test_state("http://token.invalid").await;
+        let mut identity = claims("ordinary");
+        identity.name = Some("Auth Mini name".to_owned());
+        upsert_user(&state.db, &identity).await.unwrap();
+        sqlx::query(
+            "UPDATE users SET display_name='Operations name', display_name_overridden=1 WHERE id='ordinary'",
+        )
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+        identity.name = Some("Changed in Auth Mini".to_owned());
+        let user = upsert_user(&state.db, &identity).await.unwrap();
+
+        assert_eq!(user.name.as_deref(), Some("Operations name"));
     }
 
     fn sign_token(key: &SigningKey, issuer: &str, typ: &str, exp: i64) -> String {

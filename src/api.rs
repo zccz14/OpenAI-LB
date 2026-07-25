@@ -1379,7 +1379,7 @@ pub async fn list_users(
     let root = browser_identity(&state, &headers).await?;
     require_admin(&root)?;
     let rows = sqlx::query(
-        "SELECT id,email,display_name,role,provider_access,created_at FROM users ORDER BY created_at,id",
+        "SELECT id,display_name,role,provider_access,created_at FROM users ORDER BY created_at,id",
     )
     .fetch_all(&state.db)
     .await?;
@@ -1388,11 +1388,10 @@ pub async fn list_users(
             .map(|row| {
                 json!({
                     "id":row.get::<String,_>(0),
-                    "email":row.get::<Option<String>,_>(1),
-                    "display_name":row.get::<Option<String>,_>(2),
-                    "role":row.get::<String,_>(3),
-                    "provider_access":row.get::<i64,_>(4) != 0,
-                    "created_at":row.get::<i64,_>(5)
+                    "display_name":row.get::<Option<String>,_>(1),
+                    "role":row.get::<String,_>(2),
+                    "provider_access":row.get::<i64,_>(3) != 0,
+                    "created_at":row.get::<i64,_>(4)
                 })
             })
             .collect(),
@@ -1401,6 +1400,8 @@ pub async fn list_users(
 
 #[derive(Deserialize)]
 pub struct UpdateUser {
+    #[serde(default)]
+    display_name: Option<String>,
     #[serde(default)]
     role: Option<String>,
     #[serde(default)]
@@ -1416,8 +1417,33 @@ pub async fn update_user(
 ) -> Result<Json<Value>, AppError> {
     let admin = browser_identity(&state, &headers).await?;
     require_admin(&admin)?;
-    if input.role.is_none() && input.provider_access.is_none() {
-        return Err(AppError::bad_request("role or provider_access is required"));
+    if input.display_name.is_none() && input.role.is_none() && input.provider_access.is_none() {
+        return Err(AppError::bad_request(
+            "display_name, role, or provider_access is required",
+        ));
+    }
+    let display_name = input
+        .display_name
+        .map(|value| required_setting("display name", &value))
+        .transpose()?;
+    if let Some(display_name) = display_name {
+        let result =
+            sqlx::query("UPDATE users SET display_name=?, display_name_overridden=1 WHERE id=?")
+                .bind(display_name)
+                .bind(&id)
+                .execute(&state.db)
+                .await?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::not_found("user not found"));
+        }
+        write_admin_audit(
+            &state,
+            &admin.id,
+            "user.display_name.update",
+            Some(&id),
+            &peer.ip().to_string(),
+        )
+        .await?;
     }
     if let Some(role) = input.role {
         require_root(&admin)?;
@@ -1982,6 +2008,13 @@ mod tests {
                 .and_then(|user| user["provider_access"].as_bool()),
             Some(false)
         );
+        assert!(
+            users
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|user| user.get("email").is_none())
+        );
         let vacuum = provider_request(
             &state,
             Method::POST,
@@ -2013,6 +2046,30 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(granted, 1);
+
+        let rename = provider_request(
+            &state,
+            Method::PATCH,
+            "/api/users/tenant-user",
+            &admin_browser_token,
+            Some(json!({"display_name":"Tenant operations"})),
+        )
+        .await;
+        assert_eq!(rename.status(), StatusCode::OK);
+        let renamed: (String, i64) = sqlx::query_as(
+            "SELECT display_name,display_name_overridden FROM users WHERE id='tenant-user'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(renamed, ("Tenant operations".to_owned(), 1));
+        let name_audits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM admin_audit WHERE action='user.display_name.update' AND target_id='tenant-user'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(name_audits, 1);
 
         for user_id in ["root-user", "admin-user"] {
             let provider_id = format!("provider-{user_id}");

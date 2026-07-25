@@ -3077,23 +3077,15 @@ function UsagePage({
   user: User
 }) {
   const t = copy[locale]
-  const [period, setPeriod] = useState<UsagePeriod>("24h")
+  const [period, setPeriod] = useState<UsagePeriod>("7d")
   const [userFilter, setUserFilter] = useState("all")
   const [consumerFilter, setConsumerFilter] = useState("all")
   const [modelFilter, setModelFilter] = useState("all")
-  const [rowDimensions, setRowDimensions] = useState<PivotDimension[]>([
-    "user",
-    "consumer",
-    "model",
-  ])
+  const [rowDimensions, setRowDimensions] = useState<PivotDimension[]>(["user"])
   const [columnDimensions, setColumnDimensions] = useState<PivotDimension[]>([
     "date",
   ])
-  const [dataFields, setDataFields] = useState<UsageMetric[]>([
-    "input_tokens",
-    "output_tokens",
-    "cached_tokens",
-  ])
+  const [dataFields, setDataFields] = useState<UsageMetric[]>(["input_tokens"])
   const [sorting, setSorting] = useState<SortingState>([])
   const { data, error, loading } = useApiQuery<UsageResponse>(
     sdk,

@@ -3163,7 +3163,7 @@ function UsagePage({
           accessorFn: (row) => row.cells[pivotColumn.id]?.[field] ?? 0,
           header: usageAggregateLabel(field, t),
           cell: (info) => (
-            <span className="tabular-nums">
+            <span className="block text-right tabular-nums">
               {Number(info.getValue()).toLocaleString(locale)}
             </span>
           ),

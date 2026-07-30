@@ -957,7 +957,7 @@ fn should_forward_request_header(path: &str, name: &HeaderName) -> bool {
     {
         return false;
     }
-    let common = matches!(lower.as_str(), "accept" | "user-agent")
+    let common = matches!(lower.as_str(), "accept" | "accept-encoding" | "user-agent")
         || lower.starts_with("x-openai-")
         || lower.starts_with("x-codex-");
     if path == "/v1/audio/transcriptions" {
@@ -979,7 +979,7 @@ async fn relay_response(
     audit.mark_first_byte();
     let status = upstream.status();
     audit.set_response_headers(upstream.headers());
-    let headers = filtered_response_headers(upstream.headers());
+    let mut headers = filtered_response_headers(upstream.headers());
     let is_stream = context.stream && status.is_success();
     if !is_stream {
         let bytes = upstream.bytes().await?;
@@ -993,6 +993,12 @@ async fn relay_response(
             error_from(status, &bytes).as_deref(),
         );
         return build_response(status, headers, Body::from(bytes));
+    }
+    if !headers.iter().any(|(name, _)| name == header::CONTENT_TYPE) {
+        headers.push((
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        ));
     }
     let completion = audit.take_stream(status, context.model.as_deref());
     let mut stream = upstream.bytes_stream();
@@ -1309,9 +1315,12 @@ fn models_response() -> Result<Response, AppError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        io::Read,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use axum::{
@@ -1561,6 +1570,75 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(calls, 0);
+    }
+
+    #[tokio::test]
+    async fn gzip_compresses_client_response() {
+        let state = crate::test_state("http://token.invalid").await;
+        seed_proxy(&state, false).await;
+        let mut request = proxy_request("/v1/models", "application/json", Body::empty());
+        request
+            .headers_mut()
+            .insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+
+        let response = crate::router(state).oneshot(request).await.unwrap();
+        assert_eq!(
+            response.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "gzip"
+        );
+        let compressed = response.into_body().collect().await.unwrap().to_bytes();
+        let mut decoded = String::new();
+        flate2::read::GzDecoder::new(compressed.as_ref())
+            .read_to_string(&mut decoded)
+            .unwrap();
+        assert!(decoded.contains("gpt-5.4"));
+    }
+
+    #[tokio::test]
+    async fn forwards_client_accept_encoding_upstream() {
+        let (upstream, records) = spawn_mock(StatusCode::OK).await;
+        let state = crate::test_state_with_upstream("http://token.invalid", &upstream).await;
+        seed_proxy(&state, true).await;
+        let mut request = proxy_request(
+            "/v1/responses",
+            "application/json",
+            Body::from(r#"{"model":"gpt-5.4","input":"compressed"}"#),
+        );
+        request
+            .headers_mut()
+            .insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+
+        let response = crate::router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            records.lock().await[0]
+                .headers
+                .get(header::ACCEPT_ENCODING)
+                .unwrap(),
+            "gzip"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_responses_are_not_compressed() {
+        let (upstream, _) = spawn_mock(StatusCode::OK).await;
+        let state = crate::test_state_with_upstream("http://token.invalid", &upstream).await;
+        seed_proxy(&state, true).await;
+        let mut request = proxy_request(
+            "/v1/responses",
+            "application/json",
+            Body::from(r#"{"model":"gpt-5.4","input":"stream","stream":true}"#),
+        );
+        request
+            .headers_mut()
+            .insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+
+        let response = crate::router(state).oneshot(request).await.unwrap();
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+        assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
     }
 
     #[test]

@@ -22,7 +22,7 @@ use dashmap::DashMap;
 use rust_embed::RustEmbed;
 use serde_json::json;
 use sqlx::SqlitePool;
-use tower_http::{limit::RequestBodyLimitLayer, trace::TraceLayer};
+use tower_http::{compression::CompressionLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
 
 use crate::audit::AuditWriter;
 use crate::{auth::AuthManager, balancer::Balancer, config::Config, resources::ResourceMonitor};
@@ -165,6 +165,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models", get(proxy::handle_models))
         .fallback(static_asset)
         .layer(axum::extract::DefaultBodyLimit::disable())
+        .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

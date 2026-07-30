@@ -56,6 +56,9 @@ struct CallContext {
     stream: bool,
 }
 
+#[derive(Clone)]
+pub(crate) struct AuditTransportId(pub String);
+
 struct AuditTracker {
     permit: Option<AuditReservation>,
     archive_budget: Option<OwnedSemaphorePermit>,
@@ -97,6 +100,8 @@ impl AuditTracker {
             first_byte_latency_ms: None,
             request_bytes: 0,
             response_bytes: 0,
+            request_transport_bytes: 0,
+            response_transport_bytes: 0,
             latency_ms: 0,
             input_tokens: 0,
             output_tokens: 0,
@@ -169,12 +174,14 @@ impl AuditTracker {
     fn set_request_size(&mut self, bytes: i64) {
         if let Some(event) = &mut self.event {
             event.request_bytes = bytes;
+            event.request_transport_bytes = bytes;
         }
     }
 
     fn set_response_size(&mut self, bytes: i64) {
         if let Some(event) = &mut self.event {
             event.response_bytes = bytes;
+            event.response_transport_bytes = bytes;
         }
     }
 
@@ -212,10 +219,8 @@ impl AuditTracker {
         model: Option<&str>,
         usage: Usage,
         error: Option<&str>,
-    ) {
-        let Some(mut event) = self.event.take() else {
-            return;
-        };
+    ) -> Option<String> {
+        let mut event = self.event.take()?;
         settle(
             &mut event,
             status.as_u16() as i64,
@@ -224,10 +229,12 @@ impl AuditTracker {
             error,
             self.started,
         );
+        let id = event.id.clone();
         self.permit
             .take()
             .expect("audit queue capacity is reserved once")
             .send(event, self.archive_budget.take());
+        Some(id)
     }
 
     fn take_stream(&mut self, status: StatusCode, model: Option<&str>) -> StreamCompletion {
@@ -986,13 +993,17 @@ async fn relay_response(
         audit.set_response_size(bytes.len() as i64);
         audit.set_response_body(&bytes, false);
         let usage = usage_from_bytes(&bytes);
-        audit.finish(
+        let audit_id = audit.finish(
             status,
             context.model.as_deref(),
             usage,
             error_from(status, &bytes).as_deref(),
         );
-        return build_response(status, headers, Body::from(bytes));
+        let mut response = build_response(status, headers, Body::from(bytes))?;
+        if let Some(id) = audit_id {
+            response.extensions_mut().insert(AuditTransportId(id));
+        }
+        return Ok(response);
     }
     if !headers.iter().any(|(name, _)| name == header::CONTENT_TYPE) {
         headers.push((
@@ -1000,6 +1011,7 @@ async fn relay_response(
             HeaderValue::from_static("text/event-stream"),
         ));
     }
+    let audit_id = audit.event.as_ref().map(|event| event.id.clone());
     let completion = audit.take_stream(status, context.model.as_deref());
     let mut stream = upstream.bytes_stream();
     let output = async_stream::stream! {
@@ -1022,7 +1034,11 @@ async fn relay_response(
         completion.finish(stream_failed);
         drop(lease);
     };
-    build_response(status, headers, Body::from_stream(output))
+    let mut response = build_response(status, headers, Body::from_stream(output))?;
+    if let Some(id) = audit_id {
+        response.extensions_mut().insert(AuditTransportId(id));
+    }
+    Ok(response)
 }
 
 async fn image_response(

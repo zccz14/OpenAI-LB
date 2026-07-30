@@ -55,6 +55,8 @@ pub struct AuditEvent {
     pub first_byte_latency_ms: Option<i64>,
     pub request_bytes: i64,
     pub response_bytes: i64,
+    pub request_transport_bytes: i64,
+    pub response_transport_bytes: i64,
     pub latency_ms: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
@@ -80,15 +82,21 @@ pub(crate) struct AuditReservation {
     permit: mpsc::OwnedPermit<QueuedAudit>,
 }
 
-struct QueuedAudit {
-    event: AuditEvent,
-    _archive_budget: Option<OwnedSemaphorePermit>,
+enum QueuedAudit {
+    Event {
+        event: Box<AuditEvent>,
+        _archive_budget: Option<OwnedSemaphorePermit>,
+    },
+    ResponseTransport {
+        id: String,
+        bytes: i64,
+    },
 }
 
 impl AuditReservation {
     pub(crate) fn send(self, event: AuditEvent, archive_budget: Option<OwnedSemaphorePermit>) {
-        self.permit.send(QueuedAudit {
-            event,
+        self.permit.send(QueuedAudit::Event {
+            event: Box::new(event),
             _archive_budget: archive_budget,
         });
     }
@@ -119,6 +127,16 @@ impl AuditWriter {
             .try_acquire_many_owned(ARCHIVE_RESERVATION_BYTES)
             .ok()
             .or_else(dropped_archive)
+    }
+
+    pub(crate) fn record_response_transport(&self, id: String, bytes: i64) {
+        if self
+            .sender
+            .try_send(QueuedAudit::ResponseTransport { id, bytes })
+            .is_err()
+        {
+            let _ = dropped::<()>();
+        }
     }
 }
 
@@ -175,8 +193,19 @@ async fn persist(pool: &SqlitePool, batch: &[QueuedAudit]) -> Result<(), sqlx::E
     let mut transaction = pool.begin().await?;
     let mut touched_keys = std::collections::HashSet::new();
     for queued in batch {
-        insert(&mut transaction, &queued.event).await?;
-        touched_keys.insert(queued.event.consumer_id.as_str());
+        match queued {
+            QueuedAudit::Event { event, .. } => {
+                insert(&mut transaction, event).await?;
+                touched_keys.insert(event.consumer_id.as_str());
+            }
+            QueuedAudit::ResponseTransport { id, bytes } => {
+                sqlx::query("UPDATE api_calls SET response_transport_bytes=? WHERE id=?")
+                    .bind(bytes)
+                    .bind(id)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+        }
     }
     let used_at = chrono::Utc::now().timestamp();
     for consumer_id in touched_keys {
@@ -193,7 +222,7 @@ async fn insert(
     transaction: &mut Transaction<'_, Sqlite>,
     event: &AuditEvent,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO api_calls(id,request_id,thread_id,consumer_id,user_id,provider_id,affinity_hash,affinity_source,method,path,model,reasoning_effort,status,first_byte_latency_ms,request_bytes,response_bytes,latency_ms,input_tokens,output_tokens,cached_tokens,error,client_ip,created_at) VALUES(?,?,?,?,?,(SELECT id FROM providers WHERE id=?),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO api_calls(id,request_id,thread_id,consumer_id,user_id,provider_id,affinity_hash,affinity_source,method,path,model,reasoning_effort,status,first_byte_latency_ms,request_bytes,response_bytes,request_transport_bytes,response_transport_bytes,latency_ms,input_tokens,output_tokens,cached_tokens,error,client_ip,created_at) VALUES(?,?,?,?,?,(SELECT id FROM providers WHERE id=?),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(&event.id)
         .bind(&event.request_id)
         .bind(&event.thread_id)
@@ -210,6 +239,8 @@ async fn insert(
         .bind(event.first_byte_latency_ms)
         .bind(event.request_bytes)
         .bind(event.response_bytes)
+        .bind(event.request_transport_bytes)
+        .bind(event.response_transport_bytes)
         .bind(event.latency_ms)
         .bind(event.input_tokens)
         .bind(event.output_tokens)

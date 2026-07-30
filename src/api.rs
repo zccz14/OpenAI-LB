@@ -943,7 +943,7 @@ async fn usage_rows(
     user: &crate::auth::UserIdentity,
     since: i64,
 ) -> Result<Vec<Value>, AppError> {
-    let sql = "SELECT c.user_id,u.email,u.display_name,k.id,k.name,k.prefix,COALESCE(NULLIF(c.model,''),'unknown'),date(c.created_at,'unixepoch'),COUNT(c.id),COALESCE(SUM(c.input_tokens),0),COALESCE(SUM(c.cached_tokens),0),COALESCE(SUM(c.output_tokens),0) FROM api_calls c JOIN users u ON u.id=c.user_id JOIN consumers k ON k.id=c.consumer_id WHERE c.created_at>=?";
+    let sql = "SELECT c.user_id,u.email,u.display_name,k.id,k.name,k.prefix,COALESCE(NULLIF(c.model,''),'unknown'),date(c.created_at,'unixepoch'),COUNT(c.id),COALESCE(SUM(c.input_tokens),0),COALESCE(SUM(c.cached_tokens),0),COALESCE(SUM(c.output_tokens),0),COALESCE(SUM(c.request_transport_bytes+c.response_transport_bytes),0) FROM api_calls c JOIN users u ON u.id=c.user_id JOIN consumers k ON k.id=c.consumer_id WHERE c.created_at>=?";
     let group = " GROUP BY c.user_id,u.email,u.display_name,k.id,k.name,k.prefix,COALESCE(NULLIF(c.model,''),'unknown'),date(c.created_at,'unixepoch') ORDER BY date(c.created_at,'unixepoch') ASC";
     let rows = if is_admin(user) {
         sqlx::query(&format!("{sql}{group}"))
@@ -972,7 +972,8 @@ async fn usage_rows(
                 "requests": row.get::<i64, _>(8),
                 "input_tokens": row.get::<i64, _>(9),
                 "cached_tokens": row.get::<i64, _>(10),
-                "output_tokens": row.get::<i64, _>(11)
+                "output_tokens": row.get::<i64, _>(11),
+                "network_transport_bytes": row.get::<i64, _>(12)
             })
         })
         .collect())
@@ -997,7 +998,7 @@ pub async fn audit(
         .await?;
 
     let mut rows_query = QueryBuilder::<Sqlite>::new(
-        "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.path,c.method,c.model,c.reasoning_effort,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at,c.first_byte_latency_ms,c.request_bytes,c.response_bytes FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id",
+        "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.path,c.method,c.model,c.reasoning_effort,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at,c.first_byte_latency_ms,c.request_bytes,c.response_bytes,c.request_transport_bytes,c.response_transport_bytes FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id",
     );
     append_audit_filters(&mut rows_query, &filters, &user);
     rows_query
@@ -1010,7 +1011,7 @@ pub async fn audit(
         "rows": rows.into_iter().map(|row| json!({
         "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"thread_id":row.get::<Option<String>,_>(2),"user_id":row.get::<String,_>(3),"consumer_name":row.get::<String,_>(4),"provider_id":row.get::<Option<String>,_>(5),"provider_name":row.get::<Option<String>,_>(6),
         "path":row.get::<String,_>(7),"method":row.get::<String,_>(8),"model":row.get::<Option<String>,_>(9),"reasoning_effort":row.get::<Option<String>,_>(10),"status":row.get::<i64,_>(11),"latency_ms":row.get::<i64,_>(12),
-        "input_tokens":row.get::<i64,_>(13),"output_tokens":row.get::<i64,_>(14),"cached_tokens":row.get::<i64,_>(15),"error":row.get::<Option<String>,_>(16),"client_ip":row.get::<Option<String>,_>(17),"created_at":row.get::<i64,_>(18),"first_byte_latency_ms":row.get::<Option<i64>,_>(19),"request_bytes":row.get::<i64,_>(20),"response_bytes":row.get::<i64,_>(21)
+        "input_tokens":row.get::<i64,_>(13),"output_tokens":row.get::<i64,_>(14),"cached_tokens":row.get::<i64,_>(15),"error":row.get::<Option<String>,_>(16),"client_ip":row.get::<Option<String>,_>(17),"created_at":row.get::<i64,_>(18),"first_byte_latency_ms":row.get::<Option<i64>,_>(19),"request_bytes":row.get::<i64,_>(20),"response_bytes":row.get::<i64,_>(21),"request_transport_bytes":row.get::<i64,_>(22),"response_transport_bytes":row.get::<i64,_>(23)
     })).collect::<Vec<_>>(),
         "total": total
     })))
@@ -1065,12 +1066,12 @@ pub async fn audit_detail(
     let user = browser_identity(&state, &headers).await?;
     let (sql, scope) = if is_admin(&user) {
         (
-            "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.method,c.path,c.model,c.reasoning_effort,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated,c.consumer_id,c.first_byte_latency_ms,c.request_bytes,c.response_bytes FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=?",
+            "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.method,c.path,c.model,c.reasoning_effort,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated,c.consumer_id,c.first_byte_latency_ms,c.request_bytes,c.response_bytes,c.request_transport_bytes,c.response_transport_bytes FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=?",
             None,
         )
     } else {
         (
-            "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.method,c.path,c.model,c.reasoning_effort,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated,c.consumer_id,c.first_byte_latency_ms,c.request_bytes,c.response_bytes FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=? AND c.user_id=?",
+            "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.method,c.path,c.model,c.reasoning_effort,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated,c.consumer_id,c.first_byte_latency_ms,c.request_bytes,c.response_bytes,c.request_transport_bytes,c.response_transport_bytes FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=? AND c.user_id=?",
             Some(user.id.clone()),
         )
     };
@@ -1124,7 +1125,7 @@ pub async fn audit_detail(
         "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"thread_id":thread_id,"user_id":row.get::<String,_>(3),"consumer_name":row.get::<String,_>(4),
         "provider_id":row.get::<Option<String>,_>(5),"provider_name":row.get::<Option<String>,_>(6),"method":row.get::<String,_>(7),"path":row.get::<String,_>(8),
         "model":row.get::<Option<String>,_>(9),"reasoning_effort":row.get::<Option<String>,_>(10),"status":row.get::<i64,_>(11),"latency_ms":row.get::<i64,_>(12),"input_tokens":row.get::<i64,_>(13),
-        "output_tokens":row.get::<i64,_>(14),"cached_tokens":row.get::<i64,_>(15),"error":row.get::<Option<String>,_>(16),"client_ip":row.get::<Option<String>,_>(17),"first_byte_latency_ms":row.get::<Option<i64>,_>(29),"request_bytes":row.get::<i64,_>(30),"response_bytes":row.get::<i64,_>(31),
+        "output_tokens":row.get::<i64,_>(14),"cached_tokens":row.get::<i64,_>(15),"error":row.get::<Option<String>,_>(16),"client_ip":row.get::<Option<String>,_>(17),"first_byte_latency_ms":row.get::<Option<i64>,_>(29),"request_bytes":row.get::<i64,_>(30),"response_bytes":row.get::<i64,_>(31),"request_transport_bytes":row.get::<i64,_>(32),"response_transport_bytes":row.get::<i64,_>(33),
         "affinity_hash":row.get::<Option<String>,_>(18),"affinity_source":row.get::<Option<String>,_>(19),"created_at":row.get::<i64,_>(20),
         "archive_available":row.get::<Option<String>,_>(21).is_some(),"request_headers":row.get::<Option<String>,_>(22),
         "request_body":row.get::<Option<Vec<u8>>,_>(23).map(|body| String::from_utf8_lossy(&body).into_owned()),"request_body_truncated":row.get::<Option<i64>,_>(24).unwrap_or_default() != 0,

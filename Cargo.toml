@@ -20,7 +20,7 @@ hex = "0.4"
 httpdate = "1"
 jsonwebtoken = "9"
 rand = "0.9"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["brotli", "deflate", "gzip", "json", "rustls-tls", "stream", "zstd"] }
 rust-embed = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -29,7 +29,7 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 sysinfo = { version = "0.38.4", default-features = false, features = ["disk", "network", "system"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
-tower-http = { version = "0.6", features = ["limit", "trace"] }
+tower-http = { version = "0.6", features = ["compression-full", "limit", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
@@ -37,6 +37,7 @@ uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
 ed25519-dalek = "2"
+flate2 = "1"
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 

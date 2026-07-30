@@ -276,11 +276,16 @@ type UsageRow = {
   input_tokens: number
   cached_tokens: number
   output_tokens: number
+  network_transport_bytes: number
 }
 type UsageResponse = { period: UsagePeriod; since: number; rows: UsageRow[] }
 type PivotCell = Pick<
   UsageRow,
-  "requests" | "input_tokens" | "cached_tokens" | "output_tokens"
+  | "requests"
+  | "input_tokens"
+  | "cached_tokens"
+  | "output_tokens"
+  | "network_transport_bytes"
 >
 type PivotTableRow = {
   id: string
@@ -303,6 +308,8 @@ type Audit = {
   first_byte_latency_ms?: number
   request_bytes: number
   response_bytes: number
+  request_transport_bytes: number
+  response_transport_bytes: number
   latency_ms: number
   input_tokens: number
   output_tokens: number
@@ -570,6 +577,9 @@ const copy = {
     totalLatency: "总耗时",
     requestSize: "请求大小",
     responseSize: "响应大小",
+    requestTransportSize: "请求传输量（压缩后）",
+    responseTransportSize: "响应传输量（压缩后）",
+    networkTransport: "网络传输量（压缩后）",
     reasoningEffort: "推理强度",
     cachedInput: "缓存输入",
     details: "详情",
@@ -924,6 +934,9 @@ const copy = {
     totalLatency: "Total",
     requestSize: "Request size",
     responseSize: "Response size",
+    requestTransportSize: "Request transport (compressed)",
+    responseTransportSize: "Response transport (compressed)",
+    networkTransport: "Network transport (compressed)",
     reasoningEffort: "Reasoning effort",
     cachedInput: "Cached input",
     details: "Details",
@@ -3837,6 +3850,17 @@ function AuditPage({
                               </span>
                               <span>{formatBytes(row.response_bytes, locale)}</span>
                             </div>
+                            <div className="flex flex-col gap-0.5">
+                              <span className="text-muted-foreground">
+                                {t.networkTransport}
+                              </span>
+                              <span>
+                                {formatBytes(
+                                  row.request_transport_bytes + row.response_transport_bytes,
+                                  locale
+                                )}
+                              </span>
+                            </div>
                           </div>
                         </TableCell>
                         <TableCell className="text-right">
@@ -3982,6 +4006,14 @@ function RequestDetailPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
               [t.status, data.status],
               [t.requestSize, formatBytes(data.request_bytes, locale)],
               [t.responseSize, formatBytes(data.response_bytes, locale)],
+              [
+                t.requestTransportSize,
+                formatBytes(data.request_transport_bytes, locale),
+              ],
+              [
+                t.responseTransportSize,
+                formatBytes(data.response_transport_bytes, locale),
+              ],
               [t.affinitySource, data.affinity_source || "—"],
               [t.affinityRequestId, affinityId || "—"],
               [t.affinityHash, data.affinity_hash || "—"],
@@ -4741,6 +4773,7 @@ const usageMetrics: UsageMetric[] = [
   "input_tokens",
   "output_tokens",
   "cached_tokens",
+  "network_transport_bytes",
 ]
 
 function usageUserLabel(row: UsageRow) {
@@ -4758,7 +4791,7 @@ function usageDimensionLabel(row: UsageRow, dimension: PivotDimension) {
 }
 function usageAggregateLabel(metric: UsageMetric, t: typeof copy.zh) {
   if (metric === "requests") return `COUNT(${t.requestCount})`
-  return `SUM(${metric === "input_tokens" ? t.inputTokens : metric === "cached_tokens" ? t.cachedInputTokens : t.outputTokens})`
+  return `SUM(${metric === "input_tokens" ? t.inputTokens : metric === "cached_tokens" ? t.cachedInputTokens : metric === "output_tokens" ? t.outputTokens : t.networkTransport})`
 }
 function uniqueUsageOptions(
   rows: UsageRow[],
@@ -4817,11 +4850,13 @@ function pivotUsageRows(
       input_tokens: 0,
       cached_tokens: 0,
       output_tokens: 0,
+      network_transport_bytes: 0,
     }
     cell.requests += row.requests
     cell.input_tokens += row.input_tokens
     cell.cached_tokens += row.cached_tokens
     cell.output_tokens += row.output_tokens
+    cell.network_transport_bytes += row.network_transport_bytes
     pivotRow.cells[columnId] = cell
     grouped.set(rowId, pivotRow)
   }

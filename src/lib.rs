@@ -14,7 +14,10 @@ use std::{sync::Arc, time::Duration};
 use arc_swap::ArcSwap;
 use axum::{
     Router,
+    body::Body,
+    extract::{Request, State},
     http::StatusCode,
+    middleware::{Next, from_fn_with_state},
     response::{IntoResponse, Response},
     routing::{get, patch, post},
 };
@@ -166,8 +169,36 @@ pub fn router(state: AppState) -> Router {
         .fallback(static_asset)
         .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(CompressionLayer::new())
+        .layer(from_fn_with_state(
+            state.audit.clone(),
+            record_response_transport,
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn record_response_transport(
+    State(audit): State<AuditWriter>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let response = next.run(request).await;
+    let (parts, body) = response.into_parts();
+    let Some(id) = parts.extensions.get::<proxy::AuditTransportId>().cloned() else {
+        return Response::from_parts(parts, body);
+    };
+    let stream = body.into_data_stream();
+    let output = async_stream::stream! {
+        let mut bytes = 0i64;
+        for await item in stream {
+            if let Ok(chunk) = &item {
+                bytes += chunk.len() as i64;
+            }
+            yield item;
+        }
+        audit.record_response_transport(id.0, bytes);
+    };
+    Response::from_parts(parts, Body::from_stream(output))
 }
 
 #[derive(RustEmbed)]

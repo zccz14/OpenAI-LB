@@ -44,10 +44,8 @@ const PROXY_ONLY_HEADERS: &[&str] = &[
     "x-lb-affinity-key",
     "x-session-id",
     "session_id",
-    "session-id",
     "x-codex-session-id",
     "x-codex-conversation-id",
-    "thread-id",
 ];
 
 struct CallContext {
@@ -984,8 +982,7 @@ async fn send_upstream(
     if path != "/v1/audio/transcriptions" {
         request = request
             .header(header::CONTENT_TYPE, "application/json")
-            .header("OpenAI-Beta", "responses=experimental")
-            .header("originator", "codex_cli_rs");
+            .header("OpenAI-Beta", "responses=experimental");
     }
     let request = request.body(body).build()?;
     audit.set_upstream_request_headers(request.headers());
@@ -1007,8 +1004,16 @@ fn should_forward_request_header(path: &str, name: &HeaderName) -> bool {
     {
         return false;
     }
-    let common = matches!(lower.as_str(), "accept" | "accept-encoding" | "user-agent")
-        || lower.starts_with("x-openai-")
+    let common = matches!(
+        lower.as_str(),
+        "accept"
+            | "accept-encoding"
+            | "user-agent"
+            | "originator"
+            | "session-id"
+            | "thread-id"
+            | "x-client-request-id"
+    ) || lower.starts_with("x-openai-")
         || lower.starts_with("x-codex-");
     if path == "/v1/audio/transcriptions" {
         return common || lower == "content-type";
@@ -2009,20 +2014,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routes_strip_proxy_headers_and_preserve_binary_audio() {
+    async fn routes_forward_requested_headers_and_preserve_binary_audio() {
         let (upstream, records) = spawn_mock(StatusCode::OK).await;
         let state = crate::test_state_with_upstream("http://token.invalid", &upstream).await;
         seed_proxy(&state, true).await;
         let app = crate::router(state.clone());
-        let response = app
-            .clone()
-            .oneshot(proxy_request(
-                "/v1/responses",
-                "application/vnd.client+json",
-                Body::from(r#"{"model":"gpt-5.4","input":"hello"}"#),
-            ))
-            .await
-            .unwrap();
+        let mut request = proxy_request(
+            "/v1/responses",
+            "application/vnd.client+json",
+            Body::from(r#"{"model":"gpt-5.4","input":"hello"}"#),
+        );
+        let headers = request.headers_mut();
+        headers.insert("originator", HeaderValue::from_static("client-originator"));
+        headers.insert("session-id", HeaderValue::from_static("client-session"));
+        headers.insert("thread-id", HeaderValue::from_static("client-thread"));
+        headers.insert(
+            "x-client-request-id",
+            HeaderValue::from_static("client-request"),
+        );
+        let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let response = app
             .clone()
@@ -2098,6 +2108,18 @@ mod tests {
                 "Bearer access-token"
             );
         }
+        let first = &records[0];
+        assert_eq!(
+            first.headers.get("originator").unwrap(),
+            "client-originator"
+        );
+        assert_eq!(first.headers.get("session-id").unwrap(), "client-session");
+        assert_eq!(first.headers.get("thread-id").unwrap(), "client-thread");
+        assert_eq!(
+            first.headers.get("x-client-request-id").unwrap(),
+            "client-request"
+        );
+        assert!(records[1].headers.get("originator").is_none());
         let response_body: Value = serde_json::from_slice(&records[0].body).unwrap();
         assert_eq!(response_body.get("store"), Some(&Value::Bool(false)));
         assert!(response_body.get("instructions").is_some());

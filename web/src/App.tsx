@@ -320,6 +320,10 @@ type Audit = {
 type AuditPageResponse = { rows: Audit[]; total: number }
 type AuditNavigation = { id: string; request_id: string; created_at: number }
 type AuditDetail = Audit & {
+  downstream_accept_encoding?: string
+  downstream_content_encoding?: string
+  upstream_accept_encoding?: string
+  upstream_content_encoding?: string
   method: string
   client_ip?: string
   affinity_hash?: string
@@ -579,6 +583,11 @@ const copy = {
     responseSize: "响应大小",
     requestTransportSize: "请求传输量（压缩后）",
     responseTransportSize: "响应传输量（压缩后）",
+    compressionRatio: "压缩率",
+    downstreamAcceptEncoding: "下游接受压缩",
+    downstreamContentEncoding: "下游响应压缩",
+    upstreamAcceptEncoding: "上游请求压缩",
+    upstreamContentEncoding: "上游响应压缩",
     networkTransport: "网络传输量（压缩后）",
     reasoningEffort: "推理强度",
     cachedInput: "缓存输入",
@@ -936,6 +945,11 @@ const copy = {
     responseSize: "Response size",
     requestTransportSize: "Request transport (compressed)",
     responseTransportSize: "Response transport (compressed)",
+    compressionRatio: "Compression ratio",
+    downstreamAcceptEncoding: "Downstream accepts",
+    downstreamContentEncoding: "Downstream response encoding",
+    upstreamAcceptEncoding: "Upstream request encoding",
+    upstreamContentEncoding: "Upstream response encoding",
     networkTransport: "Network transport (compressed)",
     reasoningEffort: "Reasoning effort",
     cachedInput: "Cached input",
@@ -4014,6 +4028,11 @@ function RequestDetailPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                 t.responseTransportSize,
                 formatBytes(data.response_transport_bytes, locale),
               ],
+              [t.compressionRatio, compressionRatio(data.response_bytes, data.response_transport_bytes)],
+              [t.downstreamAcceptEncoding, data.downstream_accept_encoding || "identity"],
+              [t.downstreamContentEncoding, data.downstream_content_encoding || "identity"],
+              [t.upstreamAcceptEncoding, data.upstream_accept_encoding || "identity"],
+              [t.upstreamContentEncoding, data.upstream_content_encoding || "identity"],
               [t.affinitySource, data.affinity_source || "—"],
               [t.affinityRequestId, affinityId || "—"],
               [t.affinityHash, data.affinity_hash || "—"],
@@ -5054,6 +5073,11 @@ function formatLatency(milliseconds: number | undefined) {
 }
 function formatBytes(bytes: number, locale: Locale) {
   return `${bytes.toLocaleString(locale)} B`
+}
+
+function compressionRatio(contentBytes: number, transportBytes: number) {
+  if (contentBytes <= 0) return "—"
+  return `${((1 - transportBytes / contentBytes) * 100).toFixed(1)}%`
 }
 function usageEmail(usage: ProviderUsage | undefined) {
   return usage?.email ?? usage?.account_email ?? usage?.account?.email

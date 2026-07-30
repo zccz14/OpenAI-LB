@@ -1058,13 +1058,56 @@ fn append_audit_text_filter(
         .push("))>0");
 }
 
+fn visible_archive_headers(headers: Option<String>, admin: bool) -> Option<String> {
+    if admin {
+        return headers;
+    }
+    headers.map(|headers| {
+        serde_json::from_str::<Vec<(String, String)>>(&headers)
+            .map(|headers| {
+                headers
+                    .into_iter()
+                    .filter(|(name, _)| !sensitive_header(name))
+                    .collect::<Vec<_>>()
+            })
+            .and_then(|headers| serde_json::to_string(&headers))
+            .unwrap_or_else(|_| "[]".to_owned())
+    })
+}
+
+fn sensitive_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "api-key"
+            | "x-api-key"
+            | "x-openai-api-key"
+            | "x-goog-api-key"
+            | "x-auth"
+            | "x-credential"
+            | "access-key"
+            | "x-amz-security-token"
+            | "x-session-id"
+            | "x-codex-session-id"
+            | "session-id"
+            | "session_id"
+    ) || name.ends_with("-api-key")
+        || name.ends_with("-token")
+        || name.contains("secret")
+}
+
 pub async fn audit_detail(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
-    let (sql, scope) = if is_admin(&user) {
+    let admin = is_admin(&user);
+    let (sql, scope) = if admin {
         (
             "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.method,c.path,c.model,c.reasoning_effort,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated,c.consumer_id,c.first_byte_latency_ms,c.request_bytes,c.response_bytes,c.request_transport_bytes,c.response_transport_bytes,c.downstream_accept_encoding,c.downstream_content_encoding,c.upstream_accept_encoding,c.upstream_content_encoding,a.upstream_request_headers_json,a.downstream_response_headers_json FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=?",
             None,
@@ -1086,7 +1129,7 @@ pub async fn audit_detail(
     let thread_id = row.get::<Option<String>, _>(2);
     let consumer_id = row.get::<String, _>(28);
     let navigation_rows = if let Some(thread_id) = &thread_id {
-        let (sql, scope) = if is_admin(&user) {
+        let (sql, scope) = if admin {
             (
                 "SELECT id,request_id,created_at FROM api_calls WHERE thread_id=? AND consumer_id=? ORDER BY created_at,id",
                 None,
@@ -1121,15 +1164,20 @@ pub async fn audit_detail(
         .and_then(|index| index.checked_sub(1))
         .and_then(|index| navigation_rows.get(index));
     let next = position.and_then(|index| navigation_rows.get(index + 1));
+    let request_headers = visible_archive_headers(row.get::<Option<String>, _>(22), admin);
+    let upstream_request_headers = visible_archive_headers(row.get::<Option<String>, _>(38), admin);
+    let response_headers = visible_archive_headers(row.get::<Option<String>, _>(25), admin);
+    let downstream_response_headers =
+        visible_archive_headers(row.get::<Option<String>, _>(39), admin);
     Ok(Json(json!({
         "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"thread_id":thread_id,"user_id":row.get::<String,_>(3),"consumer_name":row.get::<String,_>(4),
         "provider_id":row.get::<Option<String>,_>(5),"provider_name":row.get::<Option<String>,_>(6),"method":row.get::<String,_>(7),"path":row.get::<String,_>(8),
         "model":row.get::<Option<String>,_>(9),"reasoning_effort":row.get::<Option<String>,_>(10),"status":row.get::<i64,_>(11),"latency_ms":row.get::<i64,_>(12),"input_tokens":row.get::<i64,_>(13),
         "output_tokens":row.get::<i64,_>(14),"cached_tokens":row.get::<i64,_>(15),"error":row.get::<Option<String>,_>(16),"client_ip":row.get::<Option<String>,_>(17),"first_byte_latency_ms":row.get::<Option<i64>,_>(29),"request_bytes":row.get::<i64,_>(30),"response_bytes":row.get::<i64,_>(31),"request_transport_bytes":row.get::<i64,_>(32),"response_transport_bytes":row.get::<i64,_>(33),"downstream_accept_encoding":row.get::<Option<String>,_>(34),"downstream_content_encoding":row.get::<Option<String>,_>(35),"upstream_accept_encoding":row.get::<Option<String>,_>(36),"upstream_content_encoding":row.get::<Option<String>,_>(37),
         "affinity_hash":row.get::<Option<String>,_>(18),"affinity_source":row.get::<Option<String>,_>(19),"created_at":row.get::<i64,_>(20),
-        "archive_available":row.get::<Option<String>,_>(21).is_some(),"request_headers":row.get::<Option<String>,_>(22),"upstream_request_headers":row.get::<Option<String>,_>(38),
+        "archive_available":row.get::<Option<String>,_>(21).is_some(),"request_headers":request_headers,"upstream_request_headers":upstream_request_headers,
         "request_body":row.get::<Option<Vec<u8>>,_>(23).map(|body| String::from_utf8_lossy(&body).into_owned()),"request_body_truncated":row.get::<Option<i64>,_>(24).unwrap_or_default() != 0,
-        "response_headers":row.get::<Option<String>,_>(25),"downstream_response_headers":row.get::<Option<String>,_>(39),"response_body":row.get::<Option<Vec<u8>>,_>(26).map(|body| String::from_utf8_lossy(&body).into_owned()),
+        "response_headers":response_headers,"downstream_response_headers":downstream_response_headers,"response_body":row.get::<Option<Vec<u8>>,_>(26).map(|body| String::from_utf8_lossy(&body).into_owned()),
         "response_body_truncated":row.get::<Option<i64>,_>(27).unwrap_or_default() != 0,
         "previous":navigation(previous),"next":navigation(next)
     })))
@@ -1689,6 +1737,102 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(duplicated_request_ids, 2);
+    }
+
+    #[tokio::test]
+    async fn audit_detail_shows_sensitive_headers_only_to_admins() {
+        let signing = SigningKey::from_bytes(&[37_u8; 32]);
+        let x = URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes());
+        let jwks = Router::new().route(
+            "/jwks",
+            get(move || {
+                let x = x.clone();
+                async move {
+                    Json(json!({"keys":[{"kid":"setup","kty":"OKP","crv":"Ed25519","alg":"EdDSA","use":"sig","x":x}]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, jwks).await.unwrap() });
+        let issuer = format!("http://{address}");
+        let state = crate::test_state("http://token.invalid").await;
+        state.auth.configure(issuer.clone(), None).await;
+        let now = chrono::Utc::now().timestamp();
+        for (id, role) in [("admin", "admin"), ("tenant", "user")] {
+            sqlx::query("INSERT INTO users(id,role,created_at) VALUES(?,?,?)")
+                .bind(id)
+                .bind(role)
+                .bind(now)
+                .execute(&state.db)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO consumers(id,user_id,name,prefix,secret_hash,created_at) VALUES('tenant-key','tenant','tenant','sk-tenant','hash-tenant',?)")
+            .bind(now)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO api_calls(id,request_id,consumer_id,user_id,method,path,status,latency_ms,created_at) VALUES('tenant-call','tenant-request','tenant-key','tenant','POST','/v1/responses',200,1,?)")
+            .bind(now)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        let downstream = r#"[["authorization","Bearer consumer-secret"],["x-api-key","consumer-api-key"],["content-type","application/json"]]"#;
+        let upstream = r#"[["authorization","Bearer upstream-secret"],["x-session-id","session-secret"],["content-type","application/json"]]"#;
+        sqlx::query("INSERT INTO request_archives(api_call_id,request_headers_json,upstream_request_headers_json,request_body,request_body_truncated,response_headers_json,downstream_response_headers_json,response_body,response_body_truncated,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
+            .bind("tenant-call")
+            .bind(downstream)
+            .bind(upstream)
+            .bind(b"{}".as_slice())
+            .bind(0)
+            .bind(downstream)
+            .bind(upstream)
+            .bind(b"{}".as_slice())
+            .bind(0)
+            .bind(now)
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        let admin = provider_request(
+            &state,
+            Method::GET,
+            "/api/audit/tenant-call",
+            &setup_token(&signing, &issuer, "admin"),
+            None,
+        )
+        .await;
+        assert_eq!(admin.status(), StatusCode::OK);
+        let admin: Value =
+            serde_json::from_slice(&admin.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(admin["request_headers"], downstream);
+        assert_eq!(admin["upstream_request_headers"], upstream);
+
+        let tenant = provider_request(
+            &state,
+            Method::GET,
+            "/api/audit/tenant-call",
+            &setup_token(&signing, &issuer, "tenant"),
+            None,
+        )
+        .await;
+        assert_eq!(tenant.status(), StatusCode::OK);
+        let tenant: Value =
+            serde_json::from_slice(&tenant.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        for field in [
+            "request_headers",
+            "upstream_request_headers",
+            "response_headers",
+            "downstream_response_headers",
+        ] {
+            let headers = tenant[field].as_str().unwrap();
+            assert!(headers.contains("content-type"));
+            assert!(!headers.contains("secret"));
+            assert!(!headers.contains("api-key"));
+            assert!(!headers.contains("session-id"));
+        }
     }
 
     #[tokio::test]

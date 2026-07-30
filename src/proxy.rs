@@ -437,7 +437,6 @@ fn body_preview(body: &[u8]) -> (Vec<u8>, bool) {
 pub(crate) fn archive_headers(headers: &HeaderMap) -> String {
     let values = headers
         .iter()
-        .filter(|(name, _)| archive_header_allowed(name))
         .map(|(name, value)| {
             (
                 name.as_str(),
@@ -446,27 +445,6 @@ pub(crate) fn archive_headers(headers: &HeaderMap) -> String {
         })
         .collect::<Vec<_>>();
     serde_json::to_string(&values).expect("HTTP headers are serializable")
-}
-
-fn archive_header_allowed(name: &HeaderName) -> bool {
-    let name = name.as_str();
-    matches!(
-        name,
-        "accept"
-            | "accept-encoding"
-            | "content-encoding"
-            | "content-length"
-            | "content-type"
-            | "cache-control"
-            | "date"
-            | "openai-beta"
-            | "originator"
-            | "retry-after"
-            | "server"
-            | "user-agent"
-            | "vary"
-            | "x-request-id"
-    ) || name.starts_with("x-ratelimit-")
 }
 
 #[derive(Default)]
@@ -1743,7 +1721,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_preview_uses_a_safe_header_allowlist() {
+    fn diagnostic_preview_archives_all_headers() {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
@@ -1761,7 +1739,21 @@ mod tests {
             HeaderValue::from_static("application/json"),
         );
         let archived = archive_headers(&headers);
-        assert_eq!(archived, r#"[["content-type","application/json"]]"#);
+        let archived: Vec<(String, String)> = serde_json::from_str(&archived).unwrap();
+        assert_eq!(
+            archived,
+            vec![
+                ("authorization".to_owned(), "Bearer secret".to_owned()),
+                ("x-api-key".to_owned(), "secret".to_owned()),
+                ("x-openai-api-key".to_owned(), "secret".to_owned()),
+                ("x-auth".to_owned(), "secret".to_owned()),
+                ("x-credential".to_owned(), "secret".to_owned()),
+                ("access-key".to_owned(), "secret".to_owned()),
+                ("x-session-id".to_owned(), "session-secret".to_owned()),
+                ("x-arbitrary".to_owned(), "private".to_owned()),
+                ("content-type".to_owned(), "application/json".to_owned()),
+            ]
+        );
 
         let (preview, truncated) = body_preview(&vec![7; ARCHIVE_BODY_LIMIT + 1]);
         assert_eq!(preview.len(), ARCHIVE_BODY_LIMIT);
@@ -2140,9 +2132,9 @@ mod tests {
         .fetch_one(&state.db)
         .await
         .unwrap();
-        assert!(!archive.0.contains("authorization"));
-        assert!(!archive.0.contains("sk-test-secret"));
-        assert!(!archive.0.contains("session-secret"));
+        assert!(archive.0.contains("authorization"));
+        assert!(archive.0.contains("sk-test-secret"));
+        assert!(archive.0.contains("session-secret"));
         assert!(std::str::from_utf8(&archive.1).unwrap().contains("hello"));
         assert!(std::str::from_utf8(&archive.2).unwrap().contains("resp"));
         assert!(!archive.3);

@@ -193,6 +193,9 @@ async fn record_response_transport(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
         .or_else(|| Some("identity".to_owned()));
+    let downstream_response_headers_json = id
+        .diagnostics_enabled
+        .then(|| proxy::archive_headers(&parts.headers));
     let stream = body.into_data_stream();
     let output = async_stream::stream! {
         let mut bytes = 0i64;
@@ -202,7 +205,12 @@ async fn record_response_transport(
             }
             yield item;
         }
-        audit.record_response_transport(id.0, bytes, encoding);
+        audit.record_response_transport(
+            id.id,
+            bytes,
+            encoding,
+            downstream_response_headers_json,
+        );
     };
     Response::from_parts(parts, Body::from_stream(output))
 }

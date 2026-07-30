@@ -139,6 +139,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { api, type AuthSdk } from "@/lib/api"
@@ -330,9 +331,11 @@ type AuditDetail = Audit & {
   affinity_source?: string
   archive_available: boolean
   request_headers?: string
+  upstream_request_headers?: string
   request_body?: string
   request_body_truncated: boolean
   response_headers?: string
+  downstream_response_headers?: string
   response_body?: string
   response_body_truncated: boolean
   previous?: AuditNavigation
@@ -612,6 +615,15 @@ const copy = {
     requestBody: "请求正文",
     responseHeaders: "响应头",
     responseBody: "响应正文",
+    diagnosticData: "传输诊断",
+    diagnosticDataDescription:
+      "仅在该 Consumer 开启诊断入库时保存；不同值会明确标记。",
+    headerName: "头字段",
+    downstreamToLb: "下游 → LB",
+    lbToUpstream: "LB → 上游",
+    upstreamToLb: "上游 → LB",
+    lbToDownstream: "LB → 下游",
+    different: "不同",
     previewTruncated: "预览已截断",
     auditArchiveUnavailable: "此请求的诊断记录已过期或不可用。",
     affinitySource: "亲和来源",
@@ -974,6 +986,15 @@ const copy = {
     requestBody: "Request body",
     responseHeaders: "Response headers",
     responseBody: "Response body",
+    diagnosticData: "Transport diagnostics",
+    diagnosticDataDescription:
+      "Saved only when diagnostics are enabled for this Consumer. Different values are explicitly marked.",
+    headerName: "Header",
+    downstreamToLb: "Downstream → LB",
+    lbToUpstream: "LB → Upstream",
+    upstreamToLb: "Upstream → LB",
+    lbToDownstream: "LB → Downstream",
+    different: "Different",
     previewTruncated: "Preview truncated",
     auditArchiveUnavailable:
       "The diagnostic record for this request has expired or is unavailable.",
@@ -4040,56 +4061,130 @@ function RequestDetailPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
           />
         </CardContent>
       </Card>
-      {data.path === "/v1/responses" && data.archive_available ? (
-        <ResponsesRequest request={request} locale={locale} />
-      ) : (
-        <Card>
-          <CardHeader>
-            <CardTitle>{t.requestBody}</CardTitle>
-            <CardDescription>{t.auditDetailDescription}</CardDescription>
-          </CardHeader>
-          <CardContent>
-            {data.archive_available ? (
-              <DiagnosticPreview
-                title={t.rawRequest}
-                value={data.request_body}
-                truncated={data.request_body_truncated}
-              />
-            ) : (
-              <EmptyState
-                icon={<ScrollTextIcon />}
-                title={t.auditArchiveUnavailable}
-                description={t.auditDetailDescription}
-              />
-            )}
-          </CardContent>
-        </Card>
-      )}
       {data.archive_available && (
-        <Card>
-          <CardHeader>
-            <CardTitle>{t.responseBody}</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="flex flex-col gap-5">
-              <DiagnosticPreview
-                title={t.requestHeaders}
-                value={data.request_headers}
-              />
-              <DiagnosticPreview
-                title={t.responseHeaders}
-                value={data.response_headers}
-              />
-              <DiagnosticPreview
-                title={t.responseBody}
-                value={data.response_body}
-                truncated={data.response_body_truncated}
-              />
-            </div>
-          </CardContent>
-        </Card>
+        <DiagnosticTabs data={data} labels={t} />
+      )}
+      {data.path === "/v1/responses" && data.archive_available && (
+        <ResponsesRequest request={request} locale={locale} />
       )}
     </div>
+  )
+}
+
+function DiagnosticTabs({
+  data,
+  labels,
+}: {
+  data: AuditDetail
+  labels: (typeof copy)[Locale]
+}) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{labels.diagnosticData}</CardTitle>
+        <CardDescription>{labels.diagnosticDataDescription}</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <Tabs defaultValue="request-headers">
+          <TabsList className="w-full justify-start overflow-x-auto" aria-label={labels.diagnosticData}>
+            <TabsTrigger value="request-headers">{labels.requestHeaders}</TabsTrigger>
+            <TabsTrigger value="request-body">{labels.requestBody}</TabsTrigger>
+            <TabsTrigger value="response-headers">{labels.responseHeaders}</TabsTrigger>
+            <TabsTrigger value="response-body">{labels.responseBody}</TabsTrigger>
+          </TabsList>
+          <TabsContent value="request-headers" className="pt-4">
+            <HeaderComparison
+              left={data.request_headers}
+              right={data.upstream_request_headers}
+              leftLabel={labels.downstreamToLb}
+              rightLabel={labels.lbToUpstream}
+              labels={labels}
+            />
+          </TabsContent>
+          <TabsContent value="request-body" className="pt-4">
+            <DiagnosticPreview
+              title={labels.requestBody}
+              value={data.request_body}
+              truncated={data.request_body_truncated}
+            />
+          </TabsContent>
+          <TabsContent value="response-headers" className="pt-4">
+            <HeaderComparison
+              left={data.response_headers}
+              right={data.downstream_response_headers}
+              leftLabel={labels.upstreamToLb}
+              rightLabel={labels.lbToDownstream}
+              labels={labels}
+            />
+          </TabsContent>
+          <TabsContent value="response-body" className="pt-4">
+            <DiagnosticPreview
+              title={labels.responseBody}
+              value={data.response_body}
+              truncated={data.response_body_truncated}
+            />
+          </TabsContent>
+        </Tabs>
+      </CardContent>
+    </Card>
+  )
+}
+
+type HeaderComparisonRow = {
+  name: string
+  left?: string
+  right?: string
+  differs: boolean
+}
+
+function HeaderComparison({
+  left,
+  right,
+  leftLabel,
+  rightLabel,
+  labels,
+}: {
+  left?: string
+  right?: string
+  leftLabel: string
+  rightLabel: string
+  labels: (typeof copy)[Locale]
+}) {
+  const rows = compareHeaderSnapshots(left, right)
+  return (
+    <ScrollArea className="w-full rounded-md border">
+      <Table className="min-w-[720px]">
+        <TableHeader>
+          <TableRow>
+            <TableHead className="w-48">{labels.headerName}</TableHead>
+            <TableHead>{leftLabel}</TableHead>
+            <TableHead>{rightLabel}</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {rows.length === 0 ? (
+            <TableRow>
+              <TableCell colSpan={3} className="py-8 text-center text-muted-foreground">
+                —
+              </TableCell>
+            </TableRow>
+          ) : (
+            rows.map((row) => (
+              <TableRow key={row.name} className={row.differs ? "bg-amber-500/10" : undefined}>
+                <TableCell className="font-mono text-xs">
+                  <div className="flex items-center gap-2">
+                    <span>{row.name}</span>
+                    {row.differs && <Badge variant="secondary">{labels.different}</Badge>}
+                  </div>
+                </TableCell>
+                <TableCell className="font-mono text-xs break-all whitespace-pre-wrap">{row.left || "—"}</TableCell>
+                <TableCell className="font-mono text-xs break-all whitespace-pre-wrap">{row.right || "—"}</TableCell>
+              </TableRow>
+            ))
+          )}
+        </TableBody>
+      </Table>
+    </ScrollArea>
   )
 }
 
@@ -4900,6 +4995,35 @@ function parseJson(value?: string): unknown {
   } catch {
     return value
   }
+}
+
+function compareHeaderSnapshots(
+  left?: string,
+  right?: string
+): HeaderComparisonRow[] {
+  const snapshots = [left, right].map((value) => {
+    const headers = new Map<string, { name: string; value: string }>()
+    const parsed = parseJson(value)
+    if (!Array.isArray(parsed)) return headers
+    for (const entry of parsed) {
+      if (!Array.isArray(entry) || typeof entry[0] !== "string" || typeof entry[1] !== "string") continue
+      headers.set(entry[0].toLowerCase(), { name: entry[0], value: entry[1] })
+    }
+    return headers
+  })
+  const names = new Set([...snapshots[0].keys(), ...snapshots[1].keys()])
+  return [...names]
+    .map((name) => {
+      const leftValue = snapshots[0].get(name)
+      const rightValue = snapshots[1].get(name)
+      return {
+        name: leftValue?.name || rightValue?.name || name,
+        left: leftValue?.value,
+        right: rightValue?.value,
+        differs: leftValue?.value !== rightValue?.value,
+      }
+    })
+    .sort((a, b) => a.name.localeCompare(b.name))
 }
 function recordValue(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)

@@ -367,6 +367,7 @@ pub(crate) async fn test_state_with_upstream(
         auth_issuer: Some("http://auth.invalid".to_owned()),
         auth_audience: None,
         upstream_base: upstream_base.to_owned(),
+        upstream_openai_beta: None,
         image_host_model: "gpt-5.4".to_owned(),
         oauth_authorize_url: "http://auth.invalid/oauth/authorize".to_owned(),
         oauth_token_url: oauth_token_url.to_owned(),

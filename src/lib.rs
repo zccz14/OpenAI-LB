@@ -187,6 +187,12 @@ async fn record_response_transport(
     let Some(id) = parts.extensions.get::<proxy::AuditTransportId>().cloned() else {
         return Response::from_parts(parts, body);
     };
+    let encoding = parts
+        .headers
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| Some("identity".to_owned()));
     let stream = body.into_data_stream();
     let output = async_stream::stream! {
         let mut bytes = 0i64;
@@ -196,7 +202,7 @@ async fn record_response_transport(
             }
             yield item;
         }
-        audit.record_response_transport(id.0, bytes);
+        audit.record_response_transport(id.0, bytes, encoding);
     };
     Response::from_parts(parts, Body::from_stream(output))
 }

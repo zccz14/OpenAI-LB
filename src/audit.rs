@@ -57,6 +57,10 @@ pub struct AuditEvent {
     pub response_bytes: i64,
     pub request_transport_bytes: i64,
     pub response_transport_bytes: i64,
+    pub downstream_accept_encoding: Option<String>,
+    pub downstream_content_encoding: Option<String>,
+    pub upstream_accept_encoding: Option<String>,
+    pub upstream_content_encoding: Option<String>,
     pub latency_ms: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
@@ -90,6 +94,7 @@ enum QueuedAudit {
     ResponseTransport {
         id: String,
         bytes: i64,
+        encoding: Option<String>,
     },
 }
 
@@ -129,10 +134,19 @@ impl AuditWriter {
             .or_else(dropped_archive)
     }
 
-    pub(crate) fn record_response_transport(&self, id: String, bytes: i64) {
+    pub(crate) fn record_response_transport(
+        &self,
+        id: String,
+        bytes: i64,
+        encoding: Option<String>,
+    ) {
         if self
             .sender
-            .try_send(QueuedAudit::ResponseTransport { id, bytes })
+            .try_send(QueuedAudit::ResponseTransport {
+                id,
+                bytes,
+                encoding,
+            })
             .is_err()
         {
             let _ = dropped::<()>();
@@ -198,9 +212,14 @@ async fn persist(pool: &SqlitePool, batch: &[QueuedAudit]) -> Result<(), sqlx::E
                 insert(&mut transaction, event).await?;
                 touched_keys.insert(event.consumer_id.as_str());
             }
-            QueuedAudit::ResponseTransport { id, bytes } => {
-                sqlx::query("UPDATE api_calls SET response_transport_bytes=? WHERE id=?")
+            QueuedAudit::ResponseTransport {
+                id,
+                bytes,
+                encoding,
+            } => {
+                sqlx::query("UPDATE api_calls SET response_transport_bytes=?,downstream_content_encoding=? WHERE id=?")
                     .bind(bytes)
+                    .bind(encoding)
                     .bind(id)
                     .execute(&mut *transaction)
                     .await?;
@@ -222,7 +241,7 @@ async fn insert(
     transaction: &mut Transaction<'_, Sqlite>,
     event: &AuditEvent,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO api_calls(id,request_id,thread_id,consumer_id,user_id,provider_id,affinity_hash,affinity_source,method,path,model,reasoning_effort,status,first_byte_latency_ms,request_bytes,response_bytes,request_transport_bytes,response_transport_bytes,latency_ms,input_tokens,output_tokens,cached_tokens,error,client_ip,created_at) VALUES(?,?,?,?,?,(SELECT id FROM providers WHERE id=?),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO api_calls(id,request_id,thread_id,consumer_id,user_id,provider_id,affinity_hash,affinity_source,method,path,model,reasoning_effort,status,first_byte_latency_ms,request_bytes,response_bytes,request_transport_bytes,response_transport_bytes,downstream_accept_encoding,downstream_content_encoding,upstream_accept_encoding,upstream_content_encoding,latency_ms,input_tokens,output_tokens,cached_tokens,error,client_ip,created_at) VALUES(?,?,?,?,?,(SELECT id FROM providers WHERE id=?),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(&event.id)
         .bind(&event.request_id)
         .bind(&event.thread_id)
@@ -241,6 +260,10 @@ async fn insert(
         .bind(event.response_bytes)
         .bind(event.request_transport_bytes)
         .bind(event.response_transport_bytes)
+        .bind(&event.downstream_accept_encoding)
+        .bind(&event.downstream_content_encoding)
+        .bind(&event.upstream_accept_encoding)
+        .bind(&event.upstream_content_encoding)
         .bind(event.latency_ms)
         .bind(event.input_tokens)
         .bind(event.output_tokens)

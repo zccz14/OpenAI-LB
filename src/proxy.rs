@@ -102,6 +102,10 @@ impl AuditTracker {
             response_bytes: 0,
             request_transport_bytes: 0,
             response_transport_bytes: 0,
+            downstream_accept_encoding: None,
+            downstream_content_encoding: None,
+            upstream_accept_encoding: None,
+            upstream_content_encoding: None,
             latency_ms: 0,
             input_tokens: 0,
             output_tokens: 0,
@@ -152,6 +156,25 @@ impl AuditTracker {
             let (body, limit_truncated) = body_preview(body);
             event.request_body = body;
             event.request_body_truncated = truncated || limit_truncated;
+        }
+    }
+
+    fn set_compression_headers(&mut self, downstream: &HeaderMap, upstream: Option<&HeaderMap>) {
+        if let Some(event) = &mut self.event {
+            if !downstream.is_empty() {
+                event.downstream_accept_encoding =
+                    header_value(downstream, header::ACCEPT_ENCODING);
+            }
+            if let Some(upstream) = upstream {
+                event.upstream_content_encoding = header_value(upstream, header::CONTENT_ENCODING);
+            }
+        }
+    }
+
+    fn set_upstream_accept_encoding(&mut self, headers: &HeaderMap) {
+        if let Some(event) = &mut self.event {
+            event.upstream_accept_encoding = header_value(headers, header::ACCEPT_ENCODING)
+                .or_else(|| Some("auto (gzip, br, zstd, deflate)".to_owned()));
         }
     }
 
@@ -310,6 +333,7 @@ pub async fn handle_json(
         &client_ip,
     );
     audit.set_request(&headers, &body, false);
+    audit.set_compression_headers(&headers, None);
     audit.set_request_size(body.len() as i64);
     let result = dispatch(
         state,
@@ -356,6 +380,7 @@ pub async fn handle_audio(
         &peer.ip().to_string(),
     );
     audit.set_request(&headers, &[], true);
+    audit.set_compression_headers(&headers, None);
     let result = dispatch_audio(
         state,
         identity,
@@ -503,6 +528,7 @@ async fn dispatch(
         headers,
         &request_id,
         payload.clone().into(),
+        audit,
     )
     .await?;
     track_response(&state, &first_id, response.status(), response.headers()).await?;
@@ -538,9 +564,16 @@ async fn dispatch(
                 audit.set_provider(&second.provider.id);
                 payload =
                     transform_request(path, serde_json::from_slice::<Value>(body).ok(), &state)?;
-                let second_response =
-                    send_upstream(&state, &second, path, headers, &request_id, payload.into())
-                        .await?;
+                let second_response = send_upstream(
+                    &state,
+                    &second,
+                    path,
+                    headers,
+                    &request_id,
+                    payload.into(),
+                    audit,
+                )
+                .await?;
                 track_response(
                     &state,
                     &second.provider.id,
@@ -616,6 +649,7 @@ async fn dispatch_audio(
         headers,
         &request_id,
         reqwest::Body::wrap_stream(stream),
+        audit,
     )
     .await;
     let (body, truncated, bytes) = {
@@ -926,6 +960,7 @@ async fn send_upstream(
     inbound: &HeaderMap,
     request_id: &str,
     body: reqwest::Body,
+    audit: &mut AuditTracker,
 ) -> Result<reqwest::Response, AppError> {
     let suffix = match path {
         "/v1/audio/transcriptions" => "/transcribe",
@@ -940,6 +975,7 @@ async fn send_upstream(
             request = request.header(name, value);
         }
     }
+    audit.set_upstream_accept_encoding(inbound);
     request = request
         .header(
             header::AUTHORIZATION,
@@ -954,6 +990,13 @@ async fn send_upstream(
             .header("originator", "codex_cli_rs");
     }
     Ok(request.body(body).send().await?)
+}
+
+fn header_value(headers: &HeaderMap, name: HeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 fn should_forward_request_header(path: &str, name: &HeaderName) -> bool {
@@ -985,6 +1028,7 @@ async fn relay_response(
 ) -> Result<Response, AppError> {
     audit.mark_first_byte();
     let status = upstream.status();
+    audit.set_compression_headers(&HeaderMap::new(), Some(upstream.headers()));
     audit.set_response_headers(upstream.headers());
     let mut headers = filtered_response_headers(upstream.headers());
     let is_stream = context.stream && status.is_success();

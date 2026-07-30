@@ -57,7 +57,10 @@ struct CallContext {
 }
 
 #[derive(Clone)]
-pub(crate) struct AuditTransportId(pub String);
+pub(crate) struct AuditTransportId {
+    pub id: String,
+    pub diagnostics_enabled: bool,
+}
 
 struct AuditTracker {
     permit: Option<AuditReservation>,
@@ -117,6 +120,7 @@ impl AuditTracker {
             request_body: Vec::new(),
             request_body_truncated: false,
             response_headers_json: None,
+            upstream_request_headers_json: None,
             response_body: None,
             response_body_truncated: false,
         });
@@ -187,6 +191,15 @@ impl AuditTracker {
         }
     }
 
+    fn set_upstream_request_headers(&mut self, headers: &HeaderMap) {
+        if let Some(event) = &mut self.event {
+            if !event.request_archive {
+                return;
+            }
+            event.upstream_request_headers_json = Some(archive_headers(headers));
+        }
+    }
+
     fn mark_first_byte(&mut self) {
         let elapsed = self.started.elapsed().as_millis().max(1) as i64;
         if let Some(event) = &mut self.event {
@@ -242,7 +255,7 @@ impl AuditTracker {
         model: Option<&str>,
         usage: Usage,
         error: Option<&str>,
-    ) -> Option<String> {
+    ) -> Option<AuditTransportId> {
         let mut event = self.event.take()?;
         settle(
             &mut event,
@@ -252,12 +265,15 @@ impl AuditTracker {
             error,
             self.started,
         );
-        let id = event.id.clone();
+        let transport = AuditTransportId {
+            id: event.id.clone(),
+            diagnostics_enabled: event.request_archive,
+        };
         self.permit
             .take()
             .expect("audit queue capacity is reserved once")
             .send(event, self.archive_budget.take());
-        Some(id)
+        Some(transport)
     }
 
     fn take_stream(&mut self, status: StatusCode, model: Option<&str>) -> StreamCompletion {
@@ -418,7 +434,7 @@ fn body_preview(body: &[u8]) -> (Vec<u8>, bool) {
     (body[..end].to_vec(), body.len() > end)
 }
 
-fn archive_headers(headers: &HeaderMap) -> String {
+pub(crate) fn archive_headers(headers: &HeaderMap) -> String {
     let values = headers
         .iter()
         .filter(|(name, _)| archive_header_allowed(name))
@@ -441,10 +457,14 @@ fn archive_header_allowed(name: &HeaderName) -> bool {
             | "content-encoding"
             | "content-length"
             | "content-type"
+            | "cache-control"
             | "date"
+            | "openai-beta"
+            | "originator"
             | "retry-after"
             | "server"
             | "user-agent"
+            | "vary"
             | "x-request-id"
     ) || name.starts_with("x-ratelimit-")
 }
@@ -989,7 +1009,9 @@ async fn send_upstream(
             .header("OpenAI-Beta", "responses=experimental")
             .header("originator", "codex_cli_rs");
     }
-    Ok(request.body(body).send().await?)
+    let request = request.body(body).build()?;
+    audit.set_upstream_request_headers(request.headers());
+    Ok(state.client.execute(request).await?)
 }
 
 fn header_value(headers: &HeaderMap, name: HeaderName) -> Option<String> {
@@ -1045,7 +1067,7 @@ async fn relay_response(
         );
         let mut response = build_response(status, headers, Body::from(bytes))?;
         if let Some(id) = audit_id {
-            response.extensions_mut().insert(AuditTransportId(id));
+            response.extensions_mut().insert(id);
         }
         return Ok(response);
     }
@@ -1055,7 +1077,10 @@ async fn relay_response(
             HeaderValue::from_static("text/event-stream"),
         ));
     }
-    let audit_id = audit.event.as_ref().map(|event| event.id.clone());
+    let audit_id = audit.event.as_ref().map(|event| AuditTransportId {
+        id: event.id.clone(),
+        diagnostics_enabled: event.request_archive,
+    });
     let completion = audit.take_stream(status, context.model.as_deref());
     let mut stream = upstream.bytes_stream();
     let output = async_stream::stream! {
@@ -1080,7 +1105,7 @@ async fn relay_response(
     };
     let mut response = build_response(status, headers, Body::from_stream(output))?;
     if let Some(id) = audit_id {
-        response.extensions_mut().insert(AuditTransportId(id));
+        response.extensions_mut().insert(id);
     }
     Ok(response)
 }
@@ -1096,6 +1121,7 @@ async fn image_response(
     if !status.is_success() {
         return relay_response(context, lease, upstream, audit).await;
     }
+    audit.set_response_headers(upstream.headers());
     let bytes = upstream.bytes().await?;
     let (images, usage) = images_from_sse(&bytes)?;
     let envelope = serde_json::to_vec(
@@ -1109,15 +1135,19 @@ async fn image_response(
     );
     audit.set_response_headers(&headers);
     audit.set_response_body(&envelope, false);
-    audit.finish(status, context.model.as_deref(), usage, None);
-    build_response(
+    let audit_id = audit.finish(status, context.model.as_deref(), usage, None);
+    let mut response = build_response(
         StatusCode::OK,
         vec![(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         )],
         Body::from(envelope),
-    )
+    )?;
+    if let Some(id) = audit_id {
+        response.extensions_mut().insert(id);
+    }
+    Ok(response)
 }
 
 fn images_from_sse(bytes: &[u8]) -> Result<(Vec<Value>, Usage), AppError> {
@@ -2255,7 +2285,7 @@ mod tests {
         }
         assert!(crate::audit::write_retries() > retries_before);
         sqlx::query(
-            "CREATE TABLE request_archives (api_call_id TEXT PRIMARY KEY REFERENCES api_calls(id) ON DELETE CASCADE,request_headers_json TEXT NOT NULL,request_body BLOB NOT NULL,request_body_truncated INTEGER NOT NULL CHECK(request_body_truncated IN (0,1)),response_headers_json TEXT,response_body BLOB,response_body_truncated INTEGER NOT NULL CHECK(response_body_truncated IN (0,1)),created_at INTEGER NOT NULL)",
+            "CREATE TABLE request_archives (api_call_id TEXT PRIMARY KEY REFERENCES api_calls(id) ON DELETE CASCADE,request_headers_json TEXT NOT NULL,upstream_request_headers_json TEXT,request_body BLOB NOT NULL,request_body_truncated INTEGER NOT NULL CHECK(request_body_truncated IN (0,1)),response_headers_json TEXT,downstream_response_headers_json TEXT,response_body BLOB,response_body_truncated INTEGER NOT NULL CHECK(response_body_truncated IN (0,1)),created_at INTEGER NOT NULL)",
         )
         .execute(&state.db)
         .await

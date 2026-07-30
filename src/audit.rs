@@ -71,6 +71,7 @@ pub struct AuditEvent {
     pub request_headers_json: String,
     pub request_body: Vec<u8>,
     pub request_body_truncated: bool,
+    pub upstream_request_headers_json: Option<String>,
     pub response_headers_json: Option<String>,
     pub response_body: Option<Vec<u8>>,
     pub response_body_truncated: bool,
@@ -95,6 +96,7 @@ enum QueuedAudit {
         id: String,
         bytes: i64,
         encoding: Option<String>,
+        downstream_response_headers_json: Option<String>,
     },
 }
 
@@ -139,6 +141,7 @@ impl AuditWriter {
         id: String,
         bytes: i64,
         encoding: Option<String>,
+        downstream_response_headers_json: Option<String>,
     ) {
         if self
             .sender
@@ -146,6 +149,7 @@ impl AuditWriter {
                 id,
                 bytes,
                 encoding,
+                downstream_response_headers_json,
             })
             .is_err()
         {
@@ -216,6 +220,7 @@ async fn persist(pool: &SqlitePool, batch: &[QueuedAudit]) -> Result<(), sqlx::E
                 id,
                 bytes,
                 encoding,
+                downstream_response_headers_json,
             } => {
                 sqlx::query("UPDATE api_calls SET response_transport_bytes=?,downstream_content_encoding=? WHERE id=?")
                     .bind(bytes)
@@ -223,6 +228,13 @@ async fn persist(pool: &SqlitePool, batch: &[QueuedAudit]) -> Result<(), sqlx::E
                     .bind(id)
                     .execute(&mut *transaction)
                     .await?;
+                if let Some(headers) = downstream_response_headers_json {
+                    sqlx::query("UPDATE request_archives SET downstream_response_headers_json=? WHERE api_call_id=?")
+                        .bind(headers)
+                        .bind(id)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
             }
         }
     }
@@ -274,12 +286,14 @@ async fn insert(
         .execute(&mut **transaction)
         .await?;
     if event.request_archive {
-        sqlx::query("INSERT INTO request_archives(api_call_id,request_headers_json,request_body,request_body_truncated,response_headers_json,response_body,response_body_truncated,created_at) VALUES(?,?,?,?,?,?,?,?)")
+        sqlx::query("INSERT INTO request_archives(api_call_id,request_headers_json,upstream_request_headers_json,request_body,request_body_truncated,response_headers_json,downstream_response_headers_json,response_body,response_body_truncated,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
             .bind(&event.id)
             .bind(&event.request_headers_json)
+            .bind(&event.upstream_request_headers_json)
             .bind(&event.request_body)
             .bind(event.request_body_truncated)
             .bind(&event.response_headers_json)
+            .bind(Option::<String>::None)
             .bind(&event.response_body)
             .bind(event.response_body_truncated)
             .bind(event.created_at)

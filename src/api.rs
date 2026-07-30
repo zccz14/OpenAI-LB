@@ -1066,12 +1066,12 @@ pub async fn audit_detail(
     let user = browser_identity(&state, &headers).await?;
     let (sql, scope) = if is_admin(&user) {
         (
-            "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.method,c.path,c.model,c.reasoning_effort,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated,c.consumer_id,c.first_byte_latency_ms,c.request_bytes,c.response_bytes,c.request_transport_bytes,c.response_transport_bytes,c.downstream_accept_encoding,c.downstream_content_encoding,c.upstream_accept_encoding,c.upstream_content_encoding FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=?",
+            "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.method,c.path,c.model,c.reasoning_effort,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated,c.consumer_id,c.first_byte_latency_ms,c.request_bytes,c.response_bytes,c.request_transport_bytes,c.response_transport_bytes,c.downstream_accept_encoding,c.downstream_content_encoding,c.upstream_accept_encoding,c.upstream_content_encoding,a.upstream_request_headers_json,a.downstream_response_headers_json FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=?",
             None,
         )
     } else {
         (
-            "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.method,c.path,c.model,c.reasoning_effort,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated,c.consumer_id,c.first_byte_latency_ms,c.request_bytes,c.response_bytes,c.request_transport_bytes,c.response_transport_bytes,c.downstream_accept_encoding,c.downstream_content_encoding,c.upstream_accept_encoding,c.upstream_content_encoding FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=? AND c.user_id=?",
+            "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.method,c.path,c.model,c.reasoning_effort,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated,c.consumer_id,c.first_byte_latency_ms,c.request_bytes,c.response_bytes,c.request_transport_bytes,c.response_transport_bytes,c.downstream_accept_encoding,c.downstream_content_encoding,c.upstream_accept_encoding,c.upstream_content_encoding,a.upstream_request_headers_json,a.downstream_response_headers_json FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=? AND c.user_id=?",
             Some(user.id.clone()),
         )
     };
@@ -1127,9 +1127,9 @@ pub async fn audit_detail(
         "model":row.get::<Option<String>,_>(9),"reasoning_effort":row.get::<Option<String>,_>(10),"status":row.get::<i64,_>(11),"latency_ms":row.get::<i64,_>(12),"input_tokens":row.get::<i64,_>(13),
         "output_tokens":row.get::<i64,_>(14),"cached_tokens":row.get::<i64,_>(15),"error":row.get::<Option<String>,_>(16),"client_ip":row.get::<Option<String>,_>(17),"first_byte_latency_ms":row.get::<Option<i64>,_>(29),"request_bytes":row.get::<i64,_>(30),"response_bytes":row.get::<i64,_>(31),"request_transport_bytes":row.get::<i64,_>(32),"response_transport_bytes":row.get::<i64,_>(33),"downstream_accept_encoding":row.get::<Option<String>,_>(34),"downstream_content_encoding":row.get::<Option<String>,_>(35),"upstream_accept_encoding":row.get::<Option<String>,_>(36),"upstream_content_encoding":row.get::<Option<String>,_>(37),
         "affinity_hash":row.get::<Option<String>,_>(18),"affinity_source":row.get::<Option<String>,_>(19),"created_at":row.get::<i64,_>(20),
-        "archive_available":row.get::<Option<String>,_>(21).is_some(),"request_headers":row.get::<Option<String>,_>(22),
+        "archive_available":row.get::<Option<String>,_>(21).is_some(),"request_headers":row.get::<Option<String>,_>(22),"upstream_request_headers":row.get::<Option<String>,_>(38),
         "request_body":row.get::<Option<Vec<u8>>,_>(23).map(|body| String::from_utf8_lossy(&body).into_owned()),"request_body_truncated":row.get::<Option<i64>,_>(24).unwrap_or_default() != 0,
-        "response_headers":row.get::<Option<String>,_>(25),"response_body":row.get::<Option<Vec<u8>>,_>(26).map(|body| String::from_utf8_lossy(&body).into_owned()),
+        "response_headers":row.get::<Option<String>,_>(25),"downstream_response_headers":row.get::<Option<String>,_>(39),"response_body":row.get::<Option<Vec<u8>>,_>(26).map(|body| String::from_utf8_lossy(&body).into_owned()),
         "response_body_truncated":row.get::<Option<i64>,_>(27).unwrap_or_default() != 0,
         "previous":navigation(previous),"next":navigation(next)
     })))
@@ -2109,12 +2109,14 @@ mod tests {
             )
             .await;
             assert_eq!(update.status(), StatusCode::OK);
-            sqlx::query("INSERT INTO request_archives(api_call_id,request_headers_json,request_body,request_body_truncated,response_headers_json,response_body,response_body_truncated,created_at) VALUES(?,?,?,?,?,?,?,?)")
+            sqlx::query("INSERT INTO request_archives(api_call_id,request_headers_json,upstream_request_headers_json,request_body,request_body_truncated,response_headers_json,downstream_response_headers_json,response_body,response_body_truncated,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)")
                 .bind(&call_id)
                 .bind(r#"[["content-type","application/json"]]"#)
+                .bind(r#"[["content-type","application/json"],["originator","codex_cli_rs"]]"#)
                 .bind(br#"{"input":"audit detail"}"#.as_slice())
                 .bind(0)
                 .bind(r#"[["content-type","application/json"]]"#)
+                .bind(r#"[["content-type","application/json"],["content-encoding","gzip"]]"#)
                 .bind(br#"{"output":"diagnostic"}"#.as_slice())
                 .bind(0)
                 .bind(now)
@@ -2225,6 +2227,14 @@ mod tests {
                 serde_json::from_slice(&detail.into_body().collect().await.unwrap().to_bytes())
                     .unwrap();
             assert_eq!(detail["archive_available"], true);
+            assert_eq!(
+                detail["upstream_request_headers"],
+                json!(r#"[["content-type","application/json"],["originator","codex_cli_rs"]]"#)
+            );
+            assert_eq!(
+                detail["downstream_response_headers"],
+                json!(r#"[["content-type","application/json"],["content-encoding","gzip"]]"#)
+            );
             assert_eq!(detail["request_body"], json!(r#"{"input":"audit detail"}"#));
             assert_eq!(detail["response_body"], json!(r#"{"output":"diagnostic"}"#));
             assert_eq!(detail["consumer_name"], "history");

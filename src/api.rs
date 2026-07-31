@@ -1293,6 +1293,7 @@ pub async fn settings(
         "role":user.role,
         "auth_issuer":config.auth_issuer,
         "upstream_base":config.upstream_base,
+        "upstream_openai_beta":config.upstream_openai_beta,
         "image_host_model":config.image_host_model,
         "oauth_authorize_url":config.oauth_authorize_url,
         "oauth_token_url":config.oauth_token_url,
@@ -1309,6 +1310,7 @@ pub async fn settings(
 #[derive(Deserialize)]
 pub struct UpdateSettings {
     upstream_base: String,
+    upstream_openai_beta: String,
     image_host_model: String,
     oauth_authorize_url: String,
     oauth_token_url: String,
@@ -1330,6 +1332,8 @@ pub async fn update_settings(
     let root = browser_identity(&state, &headers).await?;
     require_root(&root)?;
     let upstream_base = validate_http_url("upstream base", &input.upstream_base)?;
+    let upstream_openai_beta =
+        optional_header_value("upstream OpenAI-Beta", &input.upstream_openai_beta)?;
     let oauth_authorize_url = validate_http_url("OAuth authorize URL", &input.oauth_authorize_url)?;
     let oauth_token_url = validate_http_url("OAuth token URL", &input.oauth_token_url)?;
     let oauth_redirect_uri = validate_http_url("OAuth redirect URI", &input.oauth_redirect_uri)?;
@@ -1347,6 +1351,10 @@ pub async fn update_settings(
     }
     let values = [
         ("upstream_base", upstream_base.clone()),
+        (
+            "upstream_openai_beta",
+            upstream_openai_beta.clone().unwrap_or_default(),
+        ),
         ("image_host_model", image_host_model.clone()),
         ("oauth_authorize_url", oauth_authorize_url.clone()),
         ("oauth_token_url", oauth_token_url.clone()),
@@ -1377,6 +1385,7 @@ pub async fn update_settings(
     transaction.commit().await?;
     let mut config = (**state.config.load()).clone();
     config.upstream_base = upstream_base;
+    config.upstream_openai_beta = upstream_openai_beta;
     config.image_host_model = image_host_model;
     config.oauth_authorize_url = oauth_authorize_url;
     config.oauth_token_url = oauth_token_url;
@@ -1419,6 +1428,19 @@ fn required_setting(name: &str, value: &str) -> Result<String, AppError> {
         )));
     }
     Ok(value.to_owned())
+}
+
+fn optional_header_value(name: &str, value: &str) -> Result<Option<String>, AppError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > 1_024 || HeaderValue::from_bytes(value.as_bytes()).is_err() {
+        return Err(AppError::bad_request(format!(
+            "{name} must be a valid HTTP header value up to 1024 characters"
+        )));
+    }
+    Ok(Some(value.to_owned()))
 }
 
 pub async fn list_users(

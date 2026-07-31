@@ -980,9 +980,10 @@ async fn send_upstream(
         .header("chatgpt-account-id", &lease.provider.account_id)
         .header("x-request-id", request_id);
     if path != "/v1/audio/transcriptions" {
-        request = request
-            .header(header::CONTENT_TYPE, "application/json")
-            .header("OpenAI-Beta", "responses=experimental");
+        request = request.header(header::CONTENT_TYPE, "application/json");
+        if let Some(openai_beta) = state.config.load().upstream_openai_beta.clone() {
+            request = request.header("OpenAI-Beta", openai_beta);
+        }
     }
     let request = request.body(body).build()?;
     audit.set_upstream_request_headers(request.headers());
@@ -1689,6 +1690,41 @@ mod tests {
                 .get(header::ACCEPT_ENCODING)
                 .unwrap(),
             "gzip"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_injects_configured_openai_beta_header() {
+        let (upstream, records) = spawn_mock(StatusCode::OK).await;
+        let state = crate::test_state_with_upstream("http://token.invalid", &upstream).await;
+        seed_proxy(&state, true).await;
+
+        let response = crate::router(state.clone())
+            .oneshot(proxy_request(
+                "/v1/responses",
+                "application/json",
+                Body::from(r#"{"model":"gpt-5.4","input":"configured"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(records.lock().await[0].headers.get("openai-beta").is_none());
+
+        let mut config = (**state.config.load()).clone();
+        config.upstream_openai_beta = Some("responses=experimental".to_owned());
+        state.config.store(Arc::new(config));
+        let response = crate::router(state)
+            .oneshot(proxy_request(
+                "/v1/responses",
+                "application/json",
+                Body::from(r#"{"model":"gpt-5.4","input":"configured"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            records.lock().await[1].headers.get("openai-beta").unwrap(),
+            "responses=experimental"
         );
     }
 

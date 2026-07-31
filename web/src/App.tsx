@@ -353,6 +353,7 @@ type AdminAudit = {
 type SettingsData = {
   auth_issuer?: string
   upstream_base: string
+  upstream_openai_beta?: string
   image_host_model: string
   oauth_authorize_url: string
   oauth_token_url: string
@@ -653,6 +654,9 @@ const copy = {
     role: "角色",
     authIssuer: "认证签发方",
     upstream: "上游",
+    upstreamOpenaiBeta: "上游 OpenAI-Beta",
+    upstreamOpenaiBetaHint:
+      "留空时 LB 不注入此请求头；客户端自行携带的同名头仍按透传规则处理。",
     bodyLimit: "请求体限制",
     affinityTtl: "亲和 TTL",
     statusActive: "可用",
@@ -1027,6 +1031,9 @@ const copy = {
     role: "Role",
     authIssuer: "Auth issuer",
     upstream: "Upstream",
+    upstreamOpenaiBeta: "Upstream OpenAI-Beta",
+    upstreamOpenaiBetaHint:
+      "When empty, LB does not inject this header. A same-named client header still follows the transparent forwarding policy.",
     bodyLimit: "Body limit",
     affinityTtl: "Affinity TTL",
     statusActive: "Available",
@@ -4578,6 +4585,7 @@ function SettingsPage({
           <Definition
             rows={[
               [t.upstream, data.upstream_base],
+              [t.upstreamOpenaiBeta, data.upstream_openai_beta || "—"],
               [
                 t.bodyLimit,
                 `${data.response_body_limit} / ${data.image_body_limit} / ${data.audio_body_limit} bytes`,
@@ -4647,6 +4655,26 @@ function RuntimeSettings({
                 }
                 required
               />
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="settings-upstream-openai-beta">
+                {t.upstreamOpenaiBeta}
+              </FieldLabel>
+              <Input
+                id="settings-upstream-openai-beta"
+                value={settings.upstream_openai_beta || ""}
+                onChange={(event) =>
+                  update("upstream_openai_beta", event.target.value)
+                }
+                placeholder="responses=experimental"
+                aria-describedby="settings-upstream-openai-beta-hint"
+              />
+              <p
+                id="settings-upstream-openai-beta-hint"
+                className="text-sm text-muted-foreground"
+              >
+                {t.upstreamOpenaiBetaHint}
+              </p>
             </Field>
             <Field>
               <FieldLabel htmlFor="settings-image-model">

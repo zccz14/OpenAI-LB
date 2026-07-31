@@ -48,6 +48,7 @@ pub struct Config {
     pub auth_issuer: Option<String>,
     pub auth_audience: Option<String>,
     pub upstream_base: String,
+    pub upstream_openai_beta: Option<String>,
     pub image_host_model: String,
     pub oauth_authorize_url: String,
     pub oauth_token_url: String,
@@ -89,6 +90,10 @@ impl Config {
             auth_issuer: optional("auth_issuer")?,
             auth_audience: optional("auth_audience")?,
             upstream_base: value("upstream_base")?.trim_end_matches('/').to_owned(),
+            upstream_openai_beta: match value("upstream_openai_beta")?.trim() {
+                "" => None,
+                value => Some(value.to_owned()),
+            },
             image_host_model: value("image_host_model")?.to_owned(),
             oauth_authorize_url: value("oauth_authorize_url")?.to_owned(),
             oauth_token_url: value("oauth_token_url")?.to_owned(),

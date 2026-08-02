@@ -35,12 +35,14 @@ import {
   ClipboardIcon,
   CpuIcon,
   DatabaseIcon,
+  FileAudioIcon,
   HardDriveIcon,
   KeyRoundIcon,
   LanguagesIcon,
   LogInIcon,
   LogOutIcon,
   MemoryStickIcon,
+  MicIcon,
   NetworkIcon,
   PencilIcon,
   PlusIcon,
@@ -50,9 +52,11 @@ import {
   ShieldAlertIcon,
   ShieldCheckIcon,
   SlidersHorizontalIcon,
+  SquareIcon,
   Trash2Icon,
   UserPlusIcon,
   UserRoundCogIcon,
+  UploadIcon,
   XCircleIcon,
   type LucideIcon,
 } from "lucide-react"
@@ -142,7 +146,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
-import { api, type AuthSdk } from "@/lib/api"
+import { api, apiForm, type AuthSdk } from "@/lib/api"
 import {
   clearAuthMiniSetupDraft,
   normalizeAuthMiniIssuer,
@@ -156,6 +160,7 @@ type Page =
   | "dashboard"
   | "providers"
   | "consumers"
+  | "transcriptions"
   | "usage"
   | "audit"
   | "request-detail"
@@ -371,6 +376,7 @@ const copy = {
     dashboard: "总览",
     providers: "上游提供商",
     consumers: "下游消费者",
+    transcriptions: "语音转文字",
     usage: "用量",
     audit: "审计",
     users: "用户",
@@ -391,6 +397,7 @@ const copy = {
     pageDashboard: "查看上游提供商容量与当前租户的 24 小时运行摘要。",
     pageProviders: "管理自己拥有的 CodeX OAuth Provider、运行状态与用户授权。",
     pageConsumers: "按 AI App 隔离下游消费者，分别跟踪调用量并独立吊销凭据。",
+    pageTranscriptions: "录制或上传音频，使用当前用户可访问的 CodeX OAuth Provider 转写为文字。",
     pageUsage: "按消费者核算请求、Token、错误和延迟。",
     pageAudit: "逐次追踪请求、上游提供商、结果与用量；诊断内容按配置期限保留。",
     pageRequestDetail: "查看调用上下文、消息结构与同一 Thread ID 的相邻请求。",
@@ -721,11 +728,30 @@ const copy = {
     responseLimit: "Responses 限制",
     imageLimit: "图像请求限制",
     audioLimit: "音频请求限制",
+    transcriptionInput: "音频输入",
+    transcriptionInputHelp: "上传音频文件，或直接使用浏览器麦克风录音。",
+    selectAudio: "选择音频",
+    startRecording: "开始录音",
+    stopRecording: "停止录音",
+    recording: "正在录音",
+    languageHint: "语言提示",
+    languageAuto: "自动检测",
+    languageChinese: "中文",
+    languageEnglish: "英文",
+    transcribe: "转写为文字",
+    transcribing: "正在转写",
+    transcript: "转写结果",
+    transcriptEmpty: "选择或录制音频后，转写文本会显示在这里。",
+    copyTranscript: "复制转写结果",
+    microphoneUnavailable: "当前浏览器不支持麦克风录音，请上传音频文件。",
+    microphoneDenied: "无法访问麦克风，请检查浏览器权限后重试。",
+    noAudioSelected: "请先选择或录制音频。",
   },
   en: {
     dashboard: "Overview",
     providers: "Providers",
     consumers: "Consumers",
+    transcriptions: "Speech to text",
     usage: "Usage",
     audit: "Audit",
     users: "Users",
@@ -749,6 +775,8 @@ const copy = {
       "Manage CodeX OAuth Providers you own, their runtime state, and user access.",
     pageConsumers:
       "Give each AI app its own downstream Consumer so usage, errors, and revocation stay isolated.",
+    pageTranscriptions:
+      "Record or upload audio, then transcribe it through a CodeX OAuth Provider available to the current user.",
     pageUsage:
       "Attribute requests, tokens, errors, and latency to each Consumer.",
     pageAudit:
@@ -1100,6 +1128,24 @@ const copy = {
     responseLimit: "Responses limit",
     imageLimit: "Image request limit",
     audioLimit: "Audio request limit",
+    transcriptionInput: "Audio input",
+    transcriptionInputHelp: "Upload an audio file or record directly with the browser microphone.",
+    selectAudio: "Choose audio",
+    startRecording: "Start recording",
+    stopRecording: "Stop recording",
+    recording: "Recording",
+    languageHint: "Language hint",
+    languageAuto: "Auto-detect",
+    languageChinese: "Chinese",
+    languageEnglish: "English",
+    transcribe: "Transcribe",
+    transcribing: "Transcribing",
+    transcript: "Transcript",
+    transcriptEmpty: "Choose or record audio to see the transcript here.",
+    copyTranscript: "Copy transcript",
+    microphoneUnavailable: "This browser cannot record audio. Upload an audio file instead.",
+    microphoneDenied: "Microphone access failed. Check browser permissions and try again.",
+    noAudioSelected: "Choose or record audio first.",
   },
 } satisfies Record<Locale, Record<string, string>>
 
@@ -1494,6 +1540,7 @@ function Console({
         ["dashboard", CircleGaugeIcon],
         ["providers", BoxesIcon],
         ["consumers", KeyRoundIcon],
+        ["transcriptions", FileAudioIcon],
         ["usage", ActivityIcon],
         ["audit", ScrollTextIcon],
         ...(user?.role === "root" || user?.role === "admin"
@@ -1588,6 +1635,10 @@ function Console({
               <Route
                 path="/consumers"
                 element={<Consumers sdk={sdk} locale={locale} />}
+              />
+              <Route
+                path="/transcriptions"
+                element={<TranscriptionsPage sdk={sdk} locale={locale} />}
               />
               <Route
                 path="/usage"
@@ -1900,6 +1951,182 @@ function SystemResourcesLoading({ locale }: { locale: Locale }) {
         ))}
       </CardContent>
     </Card>
+  )
+}
+
+function TranscriptionsPage({
+  sdk,
+  locale,
+}: {
+  sdk: AuthSdk
+  locale: Locale
+}) {
+  const t = copy[locale]
+  const [audio, setAudio] = useState<File | null>(null)
+  const [language, setLanguage] = useState("auto")
+  const [transcript, setTranscript] = useState("")
+  const [pending, setPending] = useState(false)
+  const [recording, setRecording] = useState(false)
+  const recorder = useRef<MediaRecorder | null>(null)
+  const stream = useRef<MediaStream | null>(null)
+  const chunks = useRef<Blob[]>([])
+
+  useEffect(
+    () => () => {
+      if (recorder.current?.state !== "inactive") recorder.current?.stop()
+      stream.current?.getTracks().forEach((track) => track.stop())
+    },
+    []
+  )
+
+  function selectAudio(file: File | null) {
+    setAudio(file)
+    setTranscript("")
+  }
+
+  async function startRecording() {
+    if (!navigator.mediaDevices || !window.MediaRecorder) {
+      toast.error(t.microphoneUnavailable)
+      return
+    }
+    try {
+      const mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      stream.current = mediaStream
+      chunks.current = []
+      const next = new MediaRecorder(mediaStream)
+      next.ondataavailable = (event) => {
+        if (event.data.size > 0) chunks.current.push(event.data)
+      }
+      next.onstop = () => {
+        const type = next.mimeType || "audio/webm"
+        selectAudio(new File(chunks.current, "recording.webm", { type }))
+        mediaStream.getTracks().forEach((track) => track.stop())
+        stream.current = null
+        recorder.current = null
+        setRecording(false)
+      }
+      recorder.current = next
+      next.start()
+      setRecording(true)
+    } catch {
+      toast.error(t.microphoneDenied)
+    }
+  }
+
+  function stopRecording() {
+    recorder.current?.stop()
+  }
+
+  async function transcribe() {
+    if (!audio) {
+      toast.error(t.noAudioSelected)
+      return
+    }
+    setPending(true)
+    try {
+      const form = new FormData()
+      form.set("file", audio)
+      if (language !== "auto") form.set("language", language)
+      const response = await apiForm<{ text: string }>(sdk, "/api/transcriptions", form)
+      setTranscript(response.text)
+    } catch (error) {
+      toast.error(message(error, t))
+    } finally {
+      setPending(false)
+    }
+  }
+
+  return (
+    <div className="grid max-w-5xl gap-5">
+      <Card>
+        <CardHeader>
+          <CardTitle>{t.transcriptionInput}</CardTitle>
+          <CardDescription>{t.transcriptionInputHelp}</CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_15rem]">
+          <FieldGroup>
+            <Field>
+              <FieldLabel htmlFor="transcription-file">{t.selectAudio}</FieldLabel>
+              <Input
+                id="transcription-file"
+                type="file"
+                accept="audio/*,.m4a,.webm,.wav,.mp3,.ogg,.flac"
+                onChange={(event) => selectAudio(event.target.files?.[0] ?? null)}
+              />
+              <FieldDescription>
+                {audio
+                  ? `${audio.name} · ${formatStorageBytes(audio.size, locale)}`
+                  : t.transcriptEmpty}
+              </FieldDescription>
+            </Field>
+            <div className="flex flex-wrap items-center gap-2">
+              {recording ? (
+                <Button variant="destructive" onClick={stopRecording}>
+                  <SquareIcon data-icon="inline-start" />
+                  {t.stopRecording}
+                </Button>
+              ) : (
+                <Button variant="secondary" onClick={() => void startRecording()}>
+                  <MicIcon data-icon="inline-start" />
+                  {t.startRecording}
+                </Button>
+              )}
+              {recording && <Badge variant="outline">{t.recording}</Badge>}
+            </div>
+          </FieldGroup>
+          <Field>
+            <FieldLabel htmlFor="transcription-language">{t.languageHint}</FieldLabel>
+            <Select value={language} onValueChange={(value) => value && setLanguage(value)}>
+              <SelectTrigger id="transcription-language">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value="auto">{t.languageAuto}</SelectItem>
+                  <SelectItem value="zh">{t.languageChinese}</SelectItem>
+                  <SelectItem value="en">{t.languageEnglish}</SelectItem>
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+          </Field>
+        </CardContent>
+        <CardContent className="border-t pt-5">
+          <Button disabled={!audio || recording || pending} onClick={() => void transcribe()}>
+            {pending ? <Spinner data-icon="inline-start" /> : <UploadIcon data-icon="inline-start" />}
+            {pending ? t.transcribing : t.transcribe}
+          </Button>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className="flex-row items-center justify-between gap-4">
+          <div className="grid gap-1">
+            <CardTitle>{t.transcript}</CardTitle>
+            <CardDescription>{t.transcriptEmpty}</CardDescription>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={!transcript}
+            onClick={() =>
+              void navigator.clipboard.writeText(transcript).then(() => toast.success(t.copied))
+            }
+          >
+            <ClipboardIcon data-icon="inline-start" />
+            {t.copyTranscript}
+          </Button>
+        </CardHeader>
+        <CardContent>
+          <textarea
+            aria-label={t.transcript}
+            className="min-h-48 w-full resize-y rounded-md border bg-background px-3 py-2 text-sm leading-6 outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+            placeholder={t.transcriptEmpty}
+            readOnly
+            value={transcript}
+          />
+        </CardContent>
+      </Card>
+    </div>
   )
 }
 
@@ -5309,6 +5536,7 @@ function pageForPath(pathname: string): Page {
         "/dashboard": "dashboard",
         "/providers": "providers",
         "/consumers": "consumers",
+        "/transcriptions": "transcriptions",
         "/usage": "usage",
         "/audit": "audit",
         "/users": "users",
@@ -5327,6 +5555,7 @@ function pageDescription(page: Page, locale: Locale) {
     dashboard: t.pageDashboard,
     providers: t.pageProviders,
     consumers: t.pageConsumers,
+    transcriptions: t.pageTranscriptions,
     usage: t.pageUsage,
     audit: t.pageAudit,
     "request-detail": t.pageRequestDetail,

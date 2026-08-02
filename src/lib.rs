@@ -95,6 +95,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/setup", get(api::setup_status).post(api::setup))
         .route("/api/me", get(api::me))
         .route(
+            "/api/transcriptions",
+            post(proxy::handle_console_transcription)
+                .layer(RequestBodyLimitLayer::new(audio_limit)),
+        )
+        .route(
             "/api/consumers",
             get(api::list_consumers).post(api::create_consumer),
         )

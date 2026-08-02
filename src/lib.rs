@@ -100,6 +100,11 @@ pub fn router(state: AppState) -> Router {
                 .layer(RequestBodyLimitLayer::new(audio_limit)),
         )
         .route(
+            "/api/images/generations",
+            post(proxy::handle_console_image_generation)
+                .layer(RequestBodyLimitLayer::new(image_limit)),
+        )
+        .route(
             "/api/consumers",
             get(api::list_consumers).post(api::create_consumer),
         )

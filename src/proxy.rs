@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::{
     AppError, AppState,
     audit::{ARCHIVE_BODY_LIMIT, AuditEvent, AuditReservation},
-    auth::{ApiIdentity, api_identity},
+    auth::{ApiIdentity, api_identity, browser_identity, is_admin},
     balancer::{Lease, affinity_hash, track_response},
     oauth,
 };
@@ -47,6 +47,12 @@ const PROXY_ONLY_HEADERS: &[&str] = &[
     "x-codex-session-id",
     "x-codex-conversation-id",
 ];
+
+const TRANSCRIPTION_ORIGINATOR: &str = "Codex Desktop";
+// COMPATIBILITY: ChatGPT's desktop-only transcription endpoint requires a desktop
+// request identity. OpenAI-LB maintainers should remove this when a supported
+// server-to-server transcription upstream replaces this endpoint.
+const TRANSCRIPTION_USER_AGENT: &str = "Codex Desktop/26.519.81530 (macos; aarch64)";
 
 struct CallContext {
     request_id: String,
@@ -419,6 +425,57 @@ pub async fn handle_audio(
     result
 }
 
+pub async fn handle_console_transcription(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<axum::Json<Value>, AppError> {
+    let user = browser_identity(&state, &headers).await?;
+    let all_providers = if is_admin(&user) {
+        true
+    } else {
+        sqlx::query_scalar::<_, i64>("SELECT provider_access FROM users WHERE id=?")
+            .bind(&user.id)
+            .fetch_one(&state.db)
+            .await?
+            != 0
+    };
+    let lease = select_ready_provider(&state, &user.id, all_providers, None).await?;
+    let request_id = request_id(&headers);
+    let upstream = send_transcription_upstream(
+        &state,
+        &lease,
+        &headers,
+        &request_id,
+        reqwest::Body::wrap_stream(body.into_data_stream()),
+    )
+    .await?;
+    track_response(
+        &state,
+        &lease.provider.id,
+        upstream.status(),
+        upstream.headers(),
+    )
+    .await?;
+    let status = upstream.status();
+    let body = upstream.bytes().await?;
+    if !status.is_success() {
+        return Err(AppError::upstream(
+            status.as_u16(),
+            error_from(status, &body).unwrap_or_else(|| "transcription failed".to_owned()),
+        ));
+    }
+    let response = serde_json::from_slice::<Value>(&body)?;
+    let text = response
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| {
+            AppError::upstream(status.as_u16(), "transcription response is missing text")
+        })?;
+    Ok(axum::Json(json!({ "text": text })))
+}
+
 pub async fn handle_models(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -435,6 +492,7 @@ fn body_preview(body: &[u8]) -> (Vec<u8>, bool) {
 pub(crate) fn archive_headers(headers: &HeaderMap) -> String {
     let values = headers
         .iter()
+        .filter(|(name, _)| archive_header_allowed(name))
         .map(|(name, value)| {
             (
                 name.as_str(),
@@ -443,6 +501,23 @@ pub(crate) fn archive_headers(headers: &HeaderMap) -> String {
         })
         .collect::<Vec<_>>();
     serde_json::to_string(&values).expect("HTTP headers are serializable")
+}
+
+fn archive_header_allowed(name: &HeaderName) -> bool {
+    let name = name.as_str();
+    matches!(
+        name,
+        "accept"
+            | "accept-encoding"
+            | "content-encoding"
+            | "content-length"
+            | "content-type"
+            | "date"
+            | "retry-after"
+            | "server"
+            | "user-agent"
+            | "x-request-id"
+    ) || name.starts_with("x-ratelimit-")
 }
 
 #[derive(Default)]
@@ -514,7 +589,13 @@ async fn dispatch(
         affinity_key.as_ref().map(|key| key.source),
     );
     let mut payload = transform_request(path, parsed, &state)?;
-    let first = select_ready_provider(&state, &identity, affinity.as_deref()).await?;
+    let first = select_ready_provider(
+        &state,
+        &identity.user_id,
+        identity.all_providers,
+        affinity.as_deref(),
+    )
+    .await?;
     audit.set_provider(&first.provider.id);
     let first_id = first.provider.id.clone();
     let response = send_upstream(
@@ -625,7 +706,13 @@ async fn dispatch_audio(
         affinity.as_deref(),
         affinity_key.as_ref().map(|key| key.source),
     );
-    let lease = select_ready_provider(&state, &identity, affinity.as_deref()).await?;
+    let lease = select_ready_provider(
+        &state,
+        &identity.user_id,
+        identity.all_providers,
+        affinity.as_deref(),
+    )
+    .await?;
     audit.set_provider(&lease.provider.id);
     let preview = Arc::new(Mutex::new(StreamingPreview::default()));
     let capture = preview.clone();
@@ -677,18 +764,13 @@ async fn dispatch_audio(
 
 async fn select_ready_provider(
     state: &AppState,
-    identity: &ApiIdentity,
+    user_id: &str,
+    all_providers: bool,
     affinity: Option<&str>,
 ) -> Result<Lease, AppError> {
     let mut first = state
         .balancer
-        .select(
-            state,
-            &identity.user_id,
-            identity.all_providers,
-            affinity,
-            None,
-        )
+        .select(state, user_id, all_providers, affinity, None)
         .await?;
     if refresh_if_needed(state, &mut first).await.is_ok() {
         return Ok(first);
@@ -697,13 +779,7 @@ async fn select_ready_provider(
     drop(first);
     let mut second = state
         .balancer
-        .select(
-            state,
-            &identity.user_id,
-            identity.all_providers,
-            affinity,
-            Some(&failed_id),
-        )
+        .select(state, user_id, all_providers, affinity, Some(&failed_id))
         .await?;
     refresh_if_needed(state, &mut second).await?;
     Ok(second)
@@ -958,8 +1034,14 @@ async fn send_upstream(
     body: reqwest::Body,
     audit: &mut AuditTracker,
 ) -> Result<reqwest::Response, AppError> {
+    if path == "/v1/audio/transcriptions" {
+        let request = transcription_request(state, lease, inbound, request_id)
+            .body(body)
+            .build()?;
+        audit.set_upstream_request_headers(request.headers());
+        return Ok(state.client.execute(request).await?);
+    }
     let suffix = match path {
-        "/v1/audio/transcriptions" => "/transcribe",
         "/v1/responses/compact" | "/backend-api/codex/responses/compact" => "/responses/compact",
         _ => "/responses",
     };
@@ -979,15 +1061,59 @@ async fn send_upstream(
         )
         .header("chatgpt-account-id", &lease.provider.account_id)
         .header("x-request-id", request_id);
-    if path != "/v1/audio/transcriptions" {
-        request = request.header(header::CONTENT_TYPE, "application/json");
-        if let Some(openai_beta) = state.config.load().upstream_openai_beta.clone() {
-            request = request.header("OpenAI-Beta", openai_beta);
-        }
+    request = request.header(header::CONTENT_TYPE, "application/json");
+    if let Some(openai_beta) = state.config.load().upstream_openai_beta.clone() {
+        request = request.header("OpenAI-Beta", openai_beta);
     }
     let request = request.body(body).build()?;
     audit.set_upstream_request_headers(request.headers());
     Ok(state.client.execute(request).await?)
+}
+
+async fn send_transcription_upstream(
+    state: &AppState,
+    lease: &Lease,
+    inbound: &HeaderMap,
+    request_id: &str,
+    body: reqwest::Body,
+) -> Result<reqwest::Response, AppError> {
+    Ok(state
+        .client
+        .execute(
+            transcription_request(state, lease, inbound, request_id)
+                .body(body)
+                .build()?,
+        )
+        .await?)
+}
+
+fn transcription_request(
+    state: &AppState,
+    lease: &Lease,
+    inbound: &HeaderMap,
+    request_id: &str,
+) -> reqwest::RequestBuilder {
+    let upstream = state.config.load();
+    let endpoint = format!(
+        "{}/transcribe",
+        upstream.upstream_base.trim_end_matches("/codex")
+    );
+    drop(upstream);
+    let mut request = state.client.post(endpoint);
+    for (name, value) in inbound {
+        if should_forward_request_header("/v1/audio/transcriptions", name) {
+            request = request.header(name, value);
+        }
+    }
+    request
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", lease.access_token),
+        )
+        .header("chatgpt-account-id", &lease.provider.account_id)
+        .header("originator", TRANSCRIPTION_ORIGINATOR)
+        .header(header::USER_AGENT, TRANSCRIPTION_USER_AGENT)
+        .header("x-request-id", request_id)
 }
 
 fn header_value(headers: &HeaderMap, name: HeaderName) -> Option<String> {
@@ -1610,6 +1736,39 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn transcription_request_uses_backend_root_and_desktop_identity() {
+        let state = crate::test_state_with_upstream(
+            "http://token.invalid",
+            "http://upstream.invalid/backend-api/codex",
+        )
+        .await;
+        seed_proxy(&state, true).await;
+        let lease = select_ready_provider(&state, "user-1", true, None)
+            .await
+            .unwrap();
+        let request = transcription_request(&state, &lease, &HeaderMap::new(), "request-1")
+            .body(reqwest::Body::from("audio"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.url().as_str(),
+            "http://upstream.invalid/backend-api/transcribe"
+        );
+        assert_eq!(
+            request.headers().get("originator").unwrap(),
+            TRANSCRIPTION_ORIGINATOR
+        );
+        assert_eq!(
+            request.headers().get(header::USER_AGENT).unwrap(),
+            TRANSCRIPTION_USER_AGENT
+        );
+        assert_eq!(
+            request.headers().get("chatgpt-account-id").unwrap(),
+            "account-1"
+        );
+    }
+
     #[test]
     fn thread_id_extracts_existing_downstream_headers() {
         let mut headers = HeaderMap::new();
@@ -1762,7 +1921,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_preview_archives_all_headers() {
+    fn diagnostic_preview_excludes_credentials_and_private_headers() {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
@@ -1783,17 +1942,7 @@ mod tests {
         let archived: Vec<(String, String)> = serde_json::from_str(&archived).unwrap();
         assert_eq!(
             archived,
-            vec![
-                ("authorization".to_owned(), "Bearer secret".to_owned()),
-                ("x-api-key".to_owned(), "secret".to_owned()),
-                ("x-openai-api-key".to_owned(), "secret".to_owned()),
-                ("x-auth".to_owned(), "secret".to_owned()),
-                ("x-credential".to_owned(), "secret".to_owned()),
-                ("access-key".to_owned(), "secret".to_owned()),
-                ("x-session-id".to_owned(), "session-secret".to_owned()),
-                ("x-arbitrary".to_owned(), "private".to_owned()),
-                ("content-type".to_owned(), "application/json".to_owned()),
-            ]
+            vec![("content-type".to_owned(), "application/json".to_owned())]
         );
 
         let (preview, truncated) = body_preview(&vec![7; ARCHIVE_BODY_LIMIT + 1]);
@@ -2175,6 +2324,14 @@ mod tests {
             records[2].headers.get(header::CONTENT_TYPE).unwrap(),
             "multipart/form-data; boundary=test"
         );
+        assert_eq!(
+            records[2].headers.get("originator").unwrap(),
+            TRANSCRIPTION_ORIGINATOR
+        );
+        assert_eq!(
+            records[2].headers.get(header::USER_AGENT).unwrap(),
+            TRANSCRIPTION_USER_AGENT
+        );
         assert_eq!(records[2].body, audio);
         drop(records);
         wait_for_audits(&state, 4).await;
@@ -2190,9 +2347,9 @@ mod tests {
         .fetch_one(&state.db)
         .await
         .unwrap();
-        assert!(archive.0.contains("authorization"));
-        assert!(archive.0.contains("sk-test-secret"));
-        assert!(archive.0.contains("session-secret"));
+        assert!(!archive.0.contains("authorization"));
+        assert!(!archive.0.contains("sk-test-secret"));
+        assert!(!archive.0.contains("session-secret"));
         assert!(std::str::from_utf8(&archive.1).unwrap().contains("hello"));
         assert!(std::str::from_utf8(&archive.2).unwrap().contains("resp"));
         assert!(!archive.3);

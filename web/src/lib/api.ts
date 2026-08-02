@@ -11,12 +11,25 @@ async function accessToken(sdk: AuthSdk, forceRefresh = false) {
 }
 
 export async function api<T>(sdk: AuthSdk, path: string, init?: RequestInit): Promise<T> {
+  return requestJson<T>(sdk, path, init, true)
+}
+
+export async function apiForm<T>(sdk: AuthSdk, path: string, form: FormData): Promise<T> {
+  return requestJson<T>(sdk, path, { method: "POST", body: form }, false)
+}
+
+async function requestJson<T>(
+  sdk: AuthSdk,
+  path: string,
+  init: RequestInit | undefined,
+  jsonBody: boolean
+): Promise<T> {
   async function request(forceRefresh: boolean) {
     return fetch(path, {
       ...init,
       headers: {
         accept: "application/json",
-        ...(init?.body ? { "content-type": "application/json" } : {}),
+        ...(jsonBody && init?.body ? { "content-type": "application/json" } : {}),
         ...init?.headers,
         authorization: `Bearer ${await accessToken(sdk, forceRefresh)}`,
       },

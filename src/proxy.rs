@@ -948,7 +948,7 @@ fn validate_image_request(object: &serde_json::Map<String, Value>) -> Result<(),
 }
 
 fn validate_image_size(size: &str, model: Option<&str>) -> Result<(), AppError> {
-    if size == "auto" {
+    if matches!(size, "auto" | "1024x1024" | "1536x1024" | "1024x1536") {
         return Ok(());
     }
     if model != Some("gpt-image-2") {
@@ -2835,6 +2835,16 @@ mod tests {
                 transform_request(
                     "/v1/images/generations",
                     Some(json!({"prompt":"x","model":"gpt-image-2","size":size})),
+                    &state,
+                )
+                .is_ok()
+            );
+        }
+        for size in ["1024x1024", "1536x1024", "1024x1536"] {
+            assert!(
+                transform_request(
+                    "/v1/images/generations",
+                    Some(json!({"prompt":"x","model":"gpt-image-1.5","size":size})),
                     &state,
                 )
                 .is_ok()

@@ -35,8 +35,10 @@ import {
   ClipboardIcon,
   CpuIcon,
   DatabaseIcon,
+  DownloadIcon,
   FileAudioIcon,
   HardDriveIcon,
+  ImageIcon,
   KeyRoundIcon,
   LanguagesIcon,
   LogInIcon,
@@ -107,6 +109,7 @@ import {
   FieldLabel,
 } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
+import { Textarea } from "@/components/ui/textarea"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Separator } from "@/components/ui/separator"
 import {
@@ -161,6 +164,7 @@ type Page =
   | "providers"
   | "consumers"
   | "transcriptions"
+  | "images"
   | "usage"
   | "audit"
   | "request-detail"
@@ -377,6 +381,7 @@ const copy = {
     providers: "上游提供商",
     consumers: "下游消费者",
     transcriptions: "语音转文字",
+    images: "图片生成",
     usage: "用量",
     audit: "审计",
     users: "用户",
@@ -398,6 +403,7 @@ const copy = {
     pageProviders: "管理自己拥有的 CodeX OAuth Provider、运行状态与用户授权。",
     pageConsumers: "按 AI App 隔离下游消费者，分别跟踪调用量并独立吊销凭据。",
     pageTranscriptions: "录制或上传音频，使用当前用户可访问的 CodeX OAuth Provider 转写为文字。",
+    pageImages: "通过文字提示生成单张图像，使用当前用户可访问的 CodeX OAuth Provider。",
     pageUsage: "按消费者核算请求、Token、错误和延迟。",
     pageAudit: "逐次追踪请求、上游提供商、结果与用量；诊断内容按配置期限保留。",
     pageRequestDetail: "查看调用上下文、消息结构与同一 Thread ID 的相邻请求。",
@@ -746,12 +752,30 @@ const copy = {
     microphoneUnavailable: "当前浏览器不支持麦克风录音，请上传音频文件。",
     microphoneDenied: "无法访问麦克风，请检查浏览器权限后重试。",
     noAudioSelected: "请先选择或录制音频。",
+    imagePrompt: "图像提示词",
+    imagePromptPlaceholder: "描述你想生成的图像，包括主体、构图、风格和需要呈现的文字。",
+    imageSize: "画面比例",
+    imageQuality: "生成质量",
+    imageSquare: "正方形",
+    imageLandscape: "横向",
+    imagePortrait: "纵向",
+    imageAuto: "自动",
+    imageDraft: "草稿",
+    imageStandard: "标准",
+    imageHigh: "高",
+    generateImage: "生成图片",
+    generatingImage: "正在生成",
+    generatedImage: "生成结果",
+    imageEmpty: "填写图像提示词后，生成的图片会显示在这里。",
+    downloadImage: "下载图片",
+    noImagePrompt: "请先填写图像提示词。",
   },
   en: {
     dashboard: "Overview",
     providers: "Providers",
     consumers: "Consumers",
     transcriptions: "Speech to text",
+    images: "Image Generation",
     usage: "Usage",
     audit: "Audit",
     users: "Users",
@@ -777,6 +801,8 @@ const copy = {
       "Give each AI app its own downstream Consumer so usage, errors, and revocation stay isolated.",
     pageTranscriptions:
       "Record or upload audio, then transcribe it through a CodeX OAuth Provider available to the current user.",
+    pageImages:
+      "Generate one image from a text prompt through a CodeX OAuth Provider available to the current user.",
     pageUsage:
       "Attribute requests, tokens, errors, and latency to each Consumer.",
     pageAudit:
@@ -1146,6 +1172,24 @@ const copy = {
     microphoneUnavailable: "This browser cannot record audio. Upload an audio file instead.",
     microphoneDenied: "Microphone access failed. Check browser permissions and try again.",
     noAudioSelected: "Choose or record audio first.",
+    imagePrompt: "Image prompt",
+    imagePromptPlaceholder:
+      "Describe the subject, composition, style, and any text that should appear in the image.",
+    imageSize: "Aspect ratio",
+    imageQuality: "Generation quality",
+    imageSquare: "Square",
+    imageLandscape: "Landscape",
+    imagePortrait: "Portrait",
+    imageAuto: "Auto",
+    imageDraft: "Draft",
+    imageStandard: "Standard",
+    imageHigh: "High",
+    generateImage: "Generate image",
+    generatingImage: "Generating image",
+    generatedImage: "Generated image",
+    imageEmpty: "The generated image will appear here after you submit a prompt.",
+    downloadImage: "Download image",
+    noImagePrompt: "Enter an image prompt first.",
   },
 } satisfies Record<Locale, Record<string, string>>
 
@@ -1541,6 +1585,7 @@ function Console({
         ["providers", BoxesIcon],
         ["consumers", KeyRoundIcon],
         ["transcriptions", FileAudioIcon],
+        ["images", ImageIcon],
         ["usage", ActivityIcon],
         ["audit", ScrollTextIcon],
         ...(user?.role === "root" || user?.role === "admin"
@@ -1639,6 +1684,10 @@ function Console({
               <Route
                 path="/transcriptions"
                 element={<TranscriptionsPage sdk={sdk} locale={locale} />}
+              />
+              <Route
+                path="/images"
+                element={<ImageGenerationPage sdk={sdk} locale={locale} />}
               />
               <Route
                 path="/usage"
@@ -2124,6 +2173,146 @@ function TranscriptionsPage({
             readOnly
             value={transcript}
           />
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
+function ImageGenerationPage({
+  sdk,
+  locale,
+}: {
+  sdk: AuthSdk
+  locale: Locale
+}) {
+  const t = copy[locale]
+  const [prompt, setPrompt] = useState("")
+  const [size, setSize] = useState("1024x1024")
+  const [quality, setQuality] = useState("auto")
+  const [image, setImage] = useState("")
+  const [pending, setPending] = useState(false)
+
+  async function generate() {
+    if (!prompt.trim()) {
+      toast.error(t.noImagePrompt)
+      return
+    }
+    setPending(true)
+    try {
+      const response = await api<{ data: Array<{ b64_json: string }> }>(
+        sdk,
+        "/api/images/generations",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            model: "gpt-image-1",
+            prompt: prompt.trim(),
+            n: 1,
+            size,
+            quality,
+            output_format: "png",
+          }),
+        }
+      )
+      const result = response.data[0]?.b64_json
+      if (!result) throw new Error("image generation response is missing image data")
+      setImage(`data:image/png;base64,${result}`)
+    } catch (error) {
+      toast.error(message(error, t))
+    } finally {
+      setPending(false)
+    }
+  }
+
+  function download() {
+    const link = document.createElement("a")
+    link.download = "generated-image.png"
+    link.href = image
+    link.click()
+  }
+
+  return (
+    <div className="grid max-w-5xl gap-5">
+      <Card>
+        <CardHeader>
+          <CardTitle>{t.imagePrompt}</CardTitle>
+          <CardDescription>{t.pageImages}</CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-5">
+          <Field>
+            <FieldLabel htmlFor="image-prompt">{t.imagePrompt}</FieldLabel>
+            <Textarea
+              id="image-prompt"
+              className="min-h-36 resize-y leading-6"
+              onChange={(event) => setPrompt(event.target.value)}
+              placeholder={t.imagePromptPlaceholder}
+              value={prompt}
+            />
+          </Field>
+          <div className="grid gap-5 sm:grid-cols-2">
+            <Field>
+              <FieldLabel htmlFor="image-size">{t.imageSize}</FieldLabel>
+              <Select value={size} onValueChange={(value) => value && setSize(value)}>
+                <SelectTrigger id="image-size">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value="1024x1024">{t.imageSquare} · 1024 × 1024</SelectItem>
+                    <SelectItem value="1536x1024">{t.imageLandscape} · 1536 × 1024</SelectItem>
+                    <SelectItem value="1024x1536">{t.imagePortrait} · 1024 × 1536</SelectItem>
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="image-quality">{t.imageQuality}</FieldLabel>
+              <Select value={quality} onValueChange={(value) => value && setQuality(value)}>
+                <SelectTrigger id="image-quality">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value="auto">{t.imageAuto}</SelectItem>
+                    <SelectItem value="low">{t.imageDraft}</SelectItem>
+                    <SelectItem value="medium">{t.imageStandard}</SelectItem>
+                    <SelectItem value="high">{t.imageHigh}</SelectItem>
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            </Field>
+          </div>
+        </CardContent>
+        <CardContent className="border-t pt-5">
+          <Button disabled={!prompt.trim() || pending} onClick={() => void generate()}>
+            {pending ? <Spinner data-icon="inline-start" /> : <ImageIcon data-icon="inline-start" />}
+            {pending ? t.generatingImage : t.generateImage}
+          </Button>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className="flex-row items-center justify-between gap-4">
+          <div className="grid gap-1">
+            <CardTitle>{t.generatedImage}</CardTitle>
+            <CardDescription>{t.imageEmpty}</CardDescription>
+          </div>
+          <Button disabled={!image} onClick={download} size="sm" variant="outline">
+            <DownloadIcon data-icon="inline-start" />
+            {t.downloadImage}
+          </Button>
+        </CardHeader>
+        <CardContent>
+          {image ? (
+            <div className="flex min-h-72 items-center justify-center overflow-hidden rounded-lg border bg-muted/30 p-3">
+              <img alt={prompt} className="max-h-[42rem] max-w-full object-contain" src={image} />
+            </div>
+          ) : (
+            <div className="flex min-h-72 items-center justify-center rounded-lg border border-dashed px-6 text-center text-sm text-muted-foreground">
+              {t.imageEmpty}
+            </div>
+          )}
         </CardContent>
       </Card>
     </div>
@@ -5537,6 +5726,7 @@ function pageForPath(pathname: string): Page {
         "/providers": "providers",
         "/consumers": "consumers",
         "/transcriptions": "transcriptions",
+        "/images": "images",
         "/usage": "usage",
         "/audit": "audit",
         "/users": "users",
@@ -5556,6 +5746,7 @@ function pageDescription(page: Page, locale: Locale) {
     providers: t.pageProviders,
     consumers: t.pageConsumers,
     transcriptions: t.pageTranscriptions,
+    images: t.pageImages,
     usage: t.pageUsage,
     audit: t.pageAudit,
     "request-detail": t.pageRequestDetail,

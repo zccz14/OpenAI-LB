@@ -476,6 +476,47 @@ pub async fn handle_console_transcription(
     Ok(axum::Json(json!({ "text": text })))
 }
 
+pub async fn handle_console_image_generation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<axum::Json<Value>, AppError> {
+    let user = browser_identity(&state, &headers).await?;
+    let all_providers = if is_admin(&user) {
+        true
+    } else {
+        sqlx::query_scalar::<_, i64>("SELECT provider_access FROM users WHERE id=?")
+            .bind(&user.id)
+            .fetch_one(&state.db)
+            .await?
+            != 0
+    };
+    let payload = serde_json::from_slice(&body)
+        .map_err(|_| AppError::bad_request("JSON request body required"))?;
+    let request = transform_request("/v1/images/generations", Some(payload), &state)?;
+    let lease = select_ready_provider(&state, &user.id, all_providers, None).await?;
+    let upstream =
+        send_console_image_upstream(&state, &lease, &headers, &request_id(&headers), request)
+            .await?;
+    track_response(
+        &state,
+        &lease.provider.id,
+        upstream.status(),
+        upstream.headers(),
+    )
+    .await?;
+    let status = upstream.status();
+    let body = upstream.bytes().await?;
+    if !status.is_success() {
+        return Err(AppError::upstream(
+            status.as_u16(),
+            error_from(status, &body).unwrap_or_else(|| "image generation failed".to_owned()),
+        ));
+    }
+    let (data, _) = images_from_sse(&body)?;
+    Ok(axum::Json(json!({ "data": data })))
+}
+
 pub async fn handle_models(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1085,6 +1126,35 @@ async fn send_transcription_upstream(
                 .build()?,
         )
         .await?)
+}
+
+async fn send_console_image_upstream(
+    state: &AppState,
+    lease: &Lease,
+    inbound: &HeaderMap,
+    request_id: &str,
+    body: Bytes,
+) -> Result<reqwest::Response, AppError> {
+    let mut request = state
+        .client
+        .post(format!("{}/responses", state.config.load().upstream_base));
+    for (name, value) in inbound {
+        if should_forward_request_header("/v1/images/generations", name) {
+            request = request.header(name, value);
+        }
+    }
+    request = request
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", lease.access_token),
+        )
+        .header("chatgpt-account-id", &lease.provider.account_id)
+        .header("x-request-id", request_id)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(openai_beta) = state.config.load().upstream_openai_beta.clone() {
+        request = request.header("OpenAI-Beta", openai_beta);
+    }
+    Ok(state.client.execute(request.body(body).build()?).await?)
 }
 
 fn transcription_request(
@@ -1767,6 +1837,33 @@ mod tests {
             request.headers().get("chatgpt-account-id").unwrap(),
             "account-1"
         );
+    }
+
+    #[tokio::test]
+    async fn console_image_request_uses_provider_credentials_and_returns_image_data() {
+        let (upstream, records) = spawn_mock(StatusCode::OK).await;
+        let state = crate::test_state_with_upstream("http://token.invalid", &upstream).await;
+        seed_proxy(&state, true).await;
+        let lease = select_ready_provider(&state, "user-1", true, None)
+            .await
+            .unwrap();
+        let payload = transform_request(
+            "/v1/images/generations",
+            Some(json!({"prompt":"a diagram","n":1})),
+            &state,
+        )
+        .unwrap();
+        let upstream =
+            send_console_image_upstream(&state, &lease, &HeaderMap::new(), "request-1", payload)
+                .await
+                .unwrap();
+        let (images, _) = images_from_sse(&upstream.bytes().await.unwrap()).unwrap();
+        assert_eq!(images[0]["b64_json"], "aW1hZ2U=");
+        let record = records.lock().await.pop().unwrap();
+        assert_eq!(record.path, "/responses");
+        assert_eq!(record.headers[header::AUTHORIZATION], "Bearer access-token");
+        assert_eq!(record.headers["chatgpt-account-id"], "account-1");
+        assert_eq!(record.headers["x-request-id"], "request-1");
     }
 
     #[test]

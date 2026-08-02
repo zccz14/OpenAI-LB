@@ -759,6 +759,15 @@ const copy = {
     imageSquare: "正方形",
     imageLandscape: "横向",
     imagePortrait: "纵向",
+    image2kSquare: "2K 正方形",
+    image2kLandscape: "2K 横向",
+    image4kLandscape: "4K 横向",
+    image4kPortrait: "4K 纵向",
+    imageCustom: "自定义尺寸",
+    imageWidth: "宽度（px）",
+    imageHeight: "高度（px）",
+    imageSizeHelp: "支持 gpt-image-2：宽高均为 16 的倍数、最大 3840px、比例不超过 3:1，总像素 655,360–8,294,400；超过 2560 × 1440 的输出为实验性。",
+    imageSizeInvalid: "请输入符合上述限制的宽度和高度。",
     imageAuto: "自动",
     imageDraft: "草稿",
     imageStandard: "标准",
@@ -1180,6 +1189,16 @@ const copy = {
     imageSquare: "Square",
     imageLandscape: "Landscape",
     imagePortrait: "Portrait",
+    image2kSquare: "2K square",
+    image2kLandscape: "2K landscape",
+    image4kLandscape: "4K landscape",
+    image4kPortrait: "4K portrait",
+    imageCustom: "Custom size",
+    imageWidth: "Width (px)",
+    imageHeight: "Height (px)",
+    imageSizeHelp:
+      "gpt-image-2 accepts dimensions in multiples of 16, up to 3840px, with an aspect ratio up to 3:1 and 655,360–8,294,400 total pixels. Outputs above 2560 × 1440 are experimental.",
+    imageSizeInvalid: "Enter a width and height that meet these limits.",
     imageAuto: "Auto",
     imageDraft: "Draft",
     imageStandard: "Standard",
@@ -2179,6 +2198,27 @@ function TranscriptionsPage({
   )
 }
 
+function isSupportedImageSize(width: string, height: string) {
+  const parsedWidth = Number(width)
+  const parsedHeight = Number(height)
+  if (
+    !Number.isInteger(parsedWidth) ||
+    !Number.isInteger(parsedHeight) ||
+    parsedWidth > 3840 ||
+    parsedHeight > 3840 ||
+    parsedWidth % 16 !== 0 ||
+    parsedHeight % 16 !== 0
+  ) {
+    return false
+  }
+  const pixels = parsedWidth * parsedHeight
+  return (
+    pixels >= 655360 &&
+    pixels <= 8294400 &&
+    Math.max(parsedWidth, parsedHeight) <= 3 * Math.min(parsedWidth, parsedHeight)
+  )
+}
+
 function ImageGenerationPage({
   sdk,
   locale,
@@ -2188,10 +2228,15 @@ function ImageGenerationPage({
 }) {
   const t = copy[locale]
   const [prompt, setPrompt] = useState("")
-  const [size, setSize] = useState("1024x1024")
+  const [sizePreset, setSizePreset] = useState("1024x1024")
+  const [width, setWidth] = useState("1024")
+  const [height, setHeight] = useState("1024")
   const [quality, setQuality] = useState("auto")
   const [image, setImage] = useState("")
   const [pending, setPending] = useState(false)
+  const isCustomSize = sizePreset === "custom"
+  const customSizeValid = isSupportedImageSize(width, height)
+  const size = isCustomSize ? `${width}x${height}` : sizePreset
 
   async function generate() {
     if (!prompt.trim()) {
@@ -2206,7 +2251,7 @@ function ImageGenerationPage({
         {
           method: "POST",
           body: JSON.stringify({
-            model: "gpt-image-1",
+            model: "gpt-image-2",
             prompt: prompt.trim(),
             n: 1,
             size,
@@ -2253,18 +2298,28 @@ function ImageGenerationPage({
           <div className="grid gap-5 sm:grid-cols-2">
             <Field>
               <FieldLabel htmlFor="image-size">{t.imageSize}</FieldLabel>
-              <Select value={size} onValueChange={(value) => value && setSize(value)}>
+              <Select
+                value={sizePreset}
+                onValueChange={(value) => value && setSizePreset(value)}
+              >
                 <SelectTrigger id="image-size">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
                   <SelectGroup>
+                    <SelectItem value="auto">{t.imageAuto}</SelectItem>
                     <SelectItem value="1024x1024">{t.imageSquare} · 1024 × 1024</SelectItem>
                     <SelectItem value="1536x1024">{t.imageLandscape} · 1536 × 1024</SelectItem>
                     <SelectItem value="1024x1536">{t.imagePortrait} · 1024 × 1536</SelectItem>
+                    <SelectItem value="2048x2048">{t.image2kSquare} · 2048 × 2048</SelectItem>
+                    <SelectItem value="2048x1152">{t.image2kLandscape} · 2048 × 1152</SelectItem>
+                    <SelectItem value="3840x2160">{t.image4kLandscape} · 3840 × 2160</SelectItem>
+                    <SelectItem value="2160x3840">{t.image4kPortrait} · 2160 × 3840</SelectItem>
+                    <SelectItem value="custom">{t.imageCustom}</SelectItem>
                   </SelectGroup>
                 </SelectContent>
               </Select>
+              <FieldDescription>{t.imageSizeHelp}</FieldDescription>
             </Field>
             <Field>
               <FieldLabel htmlFor="image-quality">{t.imageQuality}</FieldLabel>
@@ -2283,9 +2338,48 @@ function ImageGenerationPage({
               </Select>
             </Field>
           </div>
+          {isCustomSize && (
+            <Field data-invalid={!customSizeValid}>
+              <FieldLabel>{t.imageCustom}</FieldLabel>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="grid gap-2">
+                  <FieldLabel htmlFor="image-width">{t.imageWidth}</FieldLabel>
+                  <Input
+                    aria-invalid={!customSizeValid}
+                    id="image-width"
+                    inputMode="numeric"
+                    max={3840}
+                    min={16}
+                    onChange={(event) => setWidth(event.target.value)}
+                    step={16}
+                    type="number"
+                    value={width}
+                  />
+                </div>
+                <div className="grid gap-2">
+                  <FieldLabel htmlFor="image-height">{t.imageHeight}</FieldLabel>
+                  <Input
+                    aria-invalid={!customSizeValid}
+                    id="image-height"
+                    inputMode="numeric"
+                    max={3840}
+                    min={16}
+                    onChange={(event) => setHeight(event.target.value)}
+                    step={16}
+                    type="number"
+                    value={height}
+                  />
+                </div>
+              </div>
+              {!customSizeValid && <FieldError>{t.imageSizeInvalid}</FieldError>}
+            </Field>
+          )}
         </CardContent>
         <CardContent className="border-t pt-5">
-          <Button disabled={!prompt.trim() || pending} onClick={() => void generate()}>
+          <Button
+            disabled={!prompt.trim() || pending || (isCustomSize && !customSizeValid)}
+            onClick={() => void generate()}
+          >
             {pending ? <Spinner data-icon="inline-start" /> : <ImageIcon data-icon="inline-start" />}
             {pending ? t.generatingImage : t.generateImage}
           </Button>

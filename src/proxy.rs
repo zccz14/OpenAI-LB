@@ -926,11 +926,12 @@ fn validate_image_request(object: &serde_json::Map<String, Value>) -> Result<(),
     {
         return Err(AppError::bad_request("model must be a non-empty string"));
     }
-    validate_enum(
-        object,
-        "size",
-        &["auto", "1024x1024", "1536x1024", "1024x1536"],
-    )?;
+    if let Some(value) = object.get("size") {
+        let size = value
+            .as_str()
+            .ok_or_else(|| AppError::bad_request("size must be a string"))?;
+        validate_image_size(size, object.get("model").and_then(Value::as_str))?;
+    }
     validate_enum(object, "quality", &["auto", "low", "medium", "high"])?;
     validate_enum(object, "background", &["auto", "opaque", "transparent"])?;
     validate_enum(object, "output_format", &["png", "jpeg", "webp"])?;
@@ -942,6 +943,38 @@ fn validate_image_request(object: &serde_json::Map<String, Value>) -> Result<(),
         if !(0..=100).contains(&compression) {
             return Err(AppError::bad_request("output_compression must be 0-100"));
         }
+    }
+    Ok(())
+}
+
+fn validate_image_size(size: &str, model: Option<&str>) -> Result<(), AppError> {
+    if size == "auto" {
+        return Ok(());
+    }
+    if model != Some("gpt-image-2") {
+        return Err(AppError::bad_request(
+            "custom image sizes require model gpt-image-2",
+        ));
+    }
+    let (width, height) = size
+        .split_once('x')
+        .ok_or_else(|| AppError::bad_request("size must use WIDTHxHEIGHT"))?;
+    let width = width
+        .parse::<u64>()
+        .map_err(|_| AppError::bad_request("size must use WIDTHxHEIGHT"))?;
+    let height = height
+        .parse::<u64>()
+        .map_err(|_| AppError::bad_request("size must use WIDTHxHEIGHT"))?;
+    if width > 3_840 || height > 3_840 || width % 16 != 0 || height % 16 != 0 {
+        return Err(AppError::bad_request(
+            "size dimensions must be multiples of 16 and no larger than 3840",
+        ));
+    }
+    let pixels = width * height;
+    if !(655_360..=8_294_400).contains(&pixels) || width.max(height) > 3 * width.min(height) {
+        return Err(AppError::bad_request(
+            "size must contain 655360-8294400 pixels with an aspect ratio no wider than 3:1",
+        ));
     }
     Ok(())
 }
@@ -1564,6 +1597,7 @@ fn models_response() -> Result<Response, AppError> {
         "gpt-4o-transcribe",
         "gpt-image-1",
         "gpt-image-1.5",
+        "gpt-image-2",
     ];
     let body = serde_json::to_vec(
         &json!({"object":"list","data":models.map(|id| json!({"id":id,"object":"model","owned_by":"openai"}))}),
@@ -2350,11 +2384,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let models: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(
+            models
+                .pointer("/data")
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .any(|model| model.get("id").and_then(Value::as_str) == Some("gpt-image-2"))
+        );
         let response = app
             .oneshot(proxy_request(
                 "/v1/images/generations",
                 "application/json",
-                Body::from(r#"{"model":"gpt-image-1","prompt":"diagram","n":1}"#),
+                Body::from(
+                    r#"{"model":"gpt-image-2","prompt":"diagram","n":1,"size":"2048x1152"}"#,
+                ),
             ))
             .await
             .unwrap();
@@ -2390,6 +2437,13 @@ mod tests {
                 "Bearer access-token"
             );
         }
+        let image_request: Value = serde_json::from_slice(&records[3].body).unwrap();
+        assert_eq!(
+            image_request
+                .pointer("/tools/0/size")
+                .and_then(Value::as_str),
+            Some("2048x1152")
+        );
         let first = &records[0];
         assert_eq!(
             first.headers.get("originator").unwrap(),
@@ -2769,8 +2823,22 @@ mod tests {
             json!({"prompt":"x","output_compression":"90"}),
             json!({"prompt":"x","output_compression":-1}),
             json!({"prompt":"x","model":4}),
+            json!({"prompt":"x","model":"gpt-image-1","size":"2048x2048"}),
+            json!({"prompt":"x","model":"gpt-image-2","size":"2047x2048"}),
+            json!({"prompt":"x","model":"gpt-image-2","size":"2048x8192"}),
+            json!({"prompt":"x","model":"gpt-image-2","size":"1024x1024x1024"}),
         ] {
             assert!(transform_request("/v1/images/generations", Some(payload), &state,).is_err());
+        }
+        for size in ["2048x2048", "2048x1152", "3840x2160", "2160x3840"] {
+            assert!(
+                transform_request(
+                    "/v1/images/generations",
+                    Some(json!({"prompt":"x","model":"gpt-image-2","size":size})),
+                    &state,
+                )
+                .is_ok()
+            );
         }
         let mut headers = HeaderMap::new();
         headers.insert("x-lb-affinity-key", HeaderValue::from_static("secret"));

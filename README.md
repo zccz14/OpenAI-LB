@@ -70,8 +70,10 @@ curl http://localhost:8080/v1/audio/transcriptions \
 curl http://localhost:8080/v1/images/generations \
   -H 'Authorization: Bearer sk-REPLACE_ME' \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-image-1.5","prompt":"A precise exploded diagram","size":"1024x1024"}'
+  -d '{"model":"gpt-image-2","prompt":"A precise exploded diagram","size":"2048x1152"}'
 ```
+
+`gpt-image-2` accepts custom `WIDTHxHEIGHT` image sizes. Both dimensions must be multiples of 16 and no larger than 3840; the aspect ratio cannot exceed 3:1, and the total pixel count must be 655,360–8,294,400. Set `size` to `auto` to let the upstream choose.
 
 ## 数据与并发模型
 

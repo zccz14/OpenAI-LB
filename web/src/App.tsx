@@ -649,6 +649,14 @@ const copy = {
     requestSettings: "请求参数",
     instructions: "Instructions",
     tools: "工具",
+    toolsDescription: "以列表查看工具定义，或切换到原始 JSON 检查完整 schema。",
+    toolsList: "工具列表",
+    rawJson: "原始 JSON",
+    toolParameters: "参数",
+    toolRequired: "必填",
+    toolOptional: "可选",
+    noTools: "未配置工具",
+    unnamedTool: "未命名工具",
     rawRequest: "原始请求",
     identityPermissions: "身份与权限",
     identityDescription: "浏览器会话由 Auth Mini 管理；后端只验证 access JWT。",
@@ -1074,6 +1082,15 @@ const copy = {
     requestSettings: "Request settings",
     instructions: "Instructions",
     tools: "Tools",
+    toolsDescription:
+      "Review tool definitions as a list, or switch to raw JSON to inspect the complete schema.",
+    toolsList: "Tool list",
+    rawJson: "Raw JSON",
+    toolParameters: "Parameters",
+    toolRequired: "Required",
+    toolOptional: "Optional",
+    noTools: "No tools configured",
+    unnamedTool: "Unnamed tool",
     rawRequest: "Raw request",
     identityPermissions: "Identity and permissions",
     identityDescription:
@@ -4734,7 +4751,6 @@ function ResponsesRequest({
     ["stream", record.stream],
     ["store", record.store],
     [t.instructions, record.instructions],
-    [t.tools, record.tools],
   ]
   return (
     <div className="flex flex-col gap-5">
@@ -4750,6 +4766,9 @@ function ResponsesRequest({
           />
         </CardContent>
       </Card>
+      {record.tools !== undefined && (
+        <ResponseTools tools={record.tools} locale={locale} />
+      )}
       <Card>
         <CardHeader>
           <CardTitle>{t.messages}</CardTitle>
@@ -4770,6 +4789,141 @@ function ResponsesRequest({
         </CardContent>
       </Card>
     </div>
+  )
+}
+
+function ResponseTools({
+  tools,
+  locale,
+}: {
+  tools: unknown
+  locale: Locale
+}) {
+  const t = copy[locale]
+  const toolList = Array.isArray(tools) ? tools : []
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{t.tools}</CardTitle>
+        <CardDescription>{t.toolsDescription}</CardDescription>
+      </CardHeader>
+      <CardContent>
+        <Tabs defaultValue="list">
+          <TabsList aria-label={t.tools}>
+            <TabsTrigger value="list">{t.toolsList}</TabsTrigger>
+            <TabsTrigger value="raw-json">{t.rawJson}</TabsTrigger>
+          </TabsList>
+          <TabsContent value="list" className="pt-4">
+            {toolList.length === 0 ? (
+              <p className="text-sm text-muted-foreground">{t.noTools}</p>
+            ) : (
+              <ul className="flex flex-col gap-3">
+                {toolList.map((tool, index) => (
+                  <ResponseToolItem
+                    key={index}
+                    tool={tool}
+                    index={index}
+                    labels={t}
+                  />
+                ))}
+              </ul>
+            )}
+          </TabsContent>
+          <TabsContent value="raw-json" className="pt-4">
+            <DiagnosticPreview
+              title={t.rawJson}
+              value={structuredValue(tools)}
+            />
+          </TabsContent>
+        </Tabs>
+      </CardContent>
+    </Card>
+  )
+}
+
+function ResponseToolItem({
+  tool,
+  index,
+  labels,
+}: {
+  tool: unknown
+  index: number
+  labels: (typeof copy)[Locale]
+}) {
+  const definition = recordValue(tool)
+  const name =
+    typeof definition?.name === "string"
+      ? definition.name
+      : `${labels.unnamedTool} #${index + 1}`
+  const type = typeof definition?.type === "string" ? definition.type : "—"
+  const description =
+    typeof definition?.description === "string"
+      ? definition.description
+      : undefined
+  const parameters = recordValue(definition?.parameters)
+  const properties = recordValue(parameters?.properties)
+  const required = new Set(
+    Array.isArray(parameters?.required)
+      ? parameters.required.filter(
+          (value): value is string => typeof value === "string"
+        )
+      : []
+  )
+  const parameterEntries = properties ? Object.entries(properties) : []
+  return (
+    <li className="rounded-md border">
+      <div className="flex flex-wrap items-center gap-2 border-b bg-muted px-3 py-2">
+        <code className="text-sm font-medium">{name}</code>
+        <Badge variant="secondary">{type}</Badge>
+      </div>
+      <div className="flex flex-col gap-4 p-3">
+        {description && <p className="text-sm leading-6">{description}</p>}
+        {parameterEntries.length > 0 && (
+          <div className="flex flex-col gap-2">
+            <h4 className="text-sm font-medium">{labels.toolParameters}</h4>
+            <ul className="divide-y rounded-md border">
+              {parameterEntries.map(([parameterName, schema]) => {
+                const parameter = recordValue(schema)
+                const parameterType =
+                  typeof parameter?.type === "string" ? parameter.type : "—"
+                const parameterDescription =
+                  typeof parameter?.description === "string"
+                    ? parameter.description
+                    : undefined
+                const isRequired = required.has(parameterName)
+                return (
+                  <li
+                    key={parameterName}
+                    className="flex flex-col gap-1 px-3 py-2.5 sm:flex-row sm:items-start sm:gap-3"
+                  >
+                    <code className="shrink-0 text-xs font-medium">
+                      {parameterName}
+                    </code>
+                    <div className="flex min-w-0 flex-1 flex-col gap-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-mono text-xs text-muted-foreground">
+                          {parameterType}
+                        </span>
+                        <Badge variant="outline">
+                          {isRequired
+                            ? labels.toolRequired
+                            : labels.toolOptional}
+                        </Badge>
+                      </div>
+                      {parameterDescription && (
+                        <p className="text-sm text-muted-foreground">
+                          {parameterDescription}
+                        </p>
+                      )}
+                    </div>
+                  </li>
+                )
+              })}
+            </ul>
+          </div>
+        )}
+      </div>
+    </li>
   )
 }
 

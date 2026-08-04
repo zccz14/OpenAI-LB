@@ -150,6 +150,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { api, apiForm, type AuthSdk } from "@/lib/api"
+import { responseOutputText } from "@/lib/response-output"
 import {
   clearAuthMiniSetupDraft,
   normalizeAuthMiniIssuer,
@@ -330,6 +331,7 @@ type Audit = {
 type AuditPageResponse = { rows: Audit[]; total: number }
 type AuditNavigation = { id: string; request_id: string; created_at: number }
 type AuditDetail = Audit & {
+  upstream_http_version?: string
   downstream_accept_encoding?: string
   downstream_content_encoding?: string
   upstream_accept_encoding?: string
@@ -622,6 +624,7 @@ const copy = {
     previousPage: "上一页",
     nextPage: "下一页",
     requestDetail: "请求详情",
+    requestSummary: "请求概要",
     backToAudit: "返回审计",
     auditDetailDescription:
       "展示已保留的请求与响应诊断预览；敏感凭据不会记录。",
@@ -629,9 +632,15 @@ const copy = {
     requestBody: "请求正文",
     responseHeaders: "响应头",
     responseBody: "响应正文",
-    diagnosticData: "传输诊断",
+    tokenUsage: "Token 用量",
+    cacheHitRate: "缓存命中率",
+    upstreamHttpProtocol: "上游 HTTP 协议",
+    httpStatusCode: "HTTP 状态码",
+    finalResponse: "最终回复",
+    finalResponseUnavailable: "响应正文中未找到 response.output。",
+    diagnosticData: "请求与响应正文",
     diagnosticDataDescription:
-      "仅在该 Consumer 开启诊断入库时保存；不同值会明确标记。",
+      "仅在该 Consumer 开启诊断入库时保存；敏感凭据不会记录。",
     headerName: "头字段",
     downstreamToLb: "下游 → LB",
     lbToUpstream: "LB → 上游",
@@ -1054,6 +1063,7 @@ const copy = {
     previousPage: "Previous",
     nextPage: "Next",
     requestDetail: "Request details",
+    requestSummary: "Request summary",
     backToAudit: "Back to audit",
     auditDetailDescription:
       "Shows retained request and response diagnostic previews; sensitive credentials are excluded.",
@@ -1061,9 +1071,16 @@ const copy = {
     requestBody: "Request body",
     responseHeaders: "Response headers",
     responseBody: "Response body",
-    diagnosticData: "Transport diagnostics",
+    tokenUsage: "Token usage",
+    cacheHitRate: "Cache hit rate",
+    upstreamHttpProtocol: "Upstream HTTP protocol",
+    httpStatusCode: "HTTP status code",
+    finalResponse: "Final response",
+    finalResponseUnavailable:
+      "No response.output was found in the response body.",
+    diagnosticData: "Request and response bodies",
     diagnosticDataDescription:
-      "Saved only when diagnostics are enabled for this Consumer. Different values are explicitly marked.",
+      "Saved only when diagnostics are enabled for this Consumer; sensitive credentials are excluded.",
     headerName: "Header",
     downstreamToLb: "Downstream → LB",
     lbToUpstream: "LB → Upstream",
@@ -4553,59 +4570,145 @@ function RequestDetailPage({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
           </Button>
         </div>
       </div>
-      <Card>
-        <CardHeader>
-          <CardTitle>{data.path}</CardTitle>
-          <CardDescription>
-            {formatTime(data.created_at, locale)} · {t.firstByteLatency}{" "}
-            {formatLatency(data.first_byte_latency_ms)} · {t.totalLatency}{" "}
-            {formatLatency(data.latency_ms)}
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <Definition
-            rows={[
-              [t.requestId, data.request_id],
-              [t.threadId, data.thread_id || "—"],
-              [t.consumer, data.consumer_name],
-              [t.userId, data.user_id],
-              [t.provider, data.provider_name || data.provider_id || "—"],
-              [t.model, data.model || "—"],
-              [t.reasoningEffort, data.reasoning_effort || "—"],
-              [t.status, data.status],
-              [t.requestSize, formatBytes(data.request_bytes, locale)],
-              [t.responseSize, formatBytes(data.response_bytes, locale)],
-              [
-                t.requestTransportSize,
-                formatBytes(data.request_transport_bytes, locale),
-              ],
-              [
-                t.responseTransportSize,
-                formatBytes(data.response_transport_bytes, locale),
-              ],
-              [t.compressionRatio, compressionRatio(data.response_bytes, data.response_transport_bytes)],
-              [t.downstreamAcceptEncoding, data.downstream_accept_encoding || "identity"],
-              [t.downstreamContentEncoding, data.downstream_content_encoding || "identity"],
-              [t.upstreamAcceptEncoding, data.upstream_accept_encoding || "identity"],
-              [t.upstreamContentEncoding, data.upstream_content_encoding || "identity"],
-              [t.affinitySource, data.affinity_source || "—"],
-              [t.affinityRequestId, affinityId || "—"],
-              [t.affinityHash, data.affinity_hash || "—"],
-            ]}
-          />
-        </CardContent>
-      </Card>
-      {data.archive_available && (
-        <DiagnosticTabs data={data} labels={t} />
-      )}
+      <RequestSummary
+        data={data}
+        affinityId={affinityId}
+        labels={t}
+        locale={locale}
+      />
       {data.path === "/v1/responses" && data.archive_available && (
-        <ResponsesRequest request={request} locale={locale} />
+        <>
+          <FinalResponse
+            responseBody={data.response_body}
+            truncated={data.response_body_truncated}
+            labels={t}
+          />
+          <ResponsesRequest request={request} locale={locale} />
+        </>
       )}
+      {data.archive_available && <DiagnosticBodies data={data} labels={t} />}
     </div>
   )
 }
 
-function DiagnosticTabs({
+function RequestSummary({
+  data,
+  affinityId,
+  labels,
+  locale,
+}: {
+  data: AuditDetail
+  affinityId?: string
+  labels: (typeof copy)[Locale]
+  locale: Locale
+}) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{labels.requestSummary}</CardTitle>
+        <CardDescription>
+          {data.method} {data.path} · {formatTime(data.created_at, locale)} ·{" "}
+          {labels.firstByteLatency} {formatLatency(data.first_byte_latency_ms)}{" "}
+          · {labels.totalLatency} {formatLatency(data.latency_ms)}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-6">
+        <Definition
+          rows={[
+            [labels.requestId, data.request_id],
+            [labels.threadId, data.thread_id || "—"],
+            [labels.consumer, data.consumer_name],
+            [labels.userId, data.user_id],
+            [labels.provider, data.provider_name || data.provider_id || "—"],
+            [labels.model, data.model || "—"],
+            [labels.reasoningEffort, data.reasoning_effort || "—"],
+            [labels.upstreamHttpProtocol, data.upstream_http_version || "—"],
+            [labels.httpStatusCode, data.status],
+            [labels.requestSize, formatBytes(data.request_bytes, locale)],
+            [labels.responseSize, formatBytes(data.response_bytes, locale)],
+            [
+              labels.requestTransportSize,
+              formatBytes(data.request_transport_bytes, locale),
+            ],
+            [
+              labels.responseTransportSize,
+              formatBytes(data.response_transport_bytes, locale),
+            ],
+            [
+              labels.compressionRatio,
+              compressionRatio(
+                data.response_bytes,
+                data.response_transport_bytes
+              ),
+            ],
+            [
+              labels.downstreamAcceptEncoding,
+              data.downstream_accept_encoding || "identity",
+            ],
+            [
+              labels.downstreamContentEncoding,
+              data.downstream_content_encoding || "identity",
+            ],
+            [
+              labels.upstreamAcceptEncoding,
+              data.upstream_accept_encoding || "identity",
+            ],
+            [
+              labels.upstreamContentEncoding,
+              data.upstream_content_encoding || "identity",
+            ],
+            [labels.affinitySource, data.affinity_source || "—"],
+            [labels.affinityRequestId, affinityId || "—"],
+            [labels.affinityHash, data.affinity_hash || "—"],
+          ]}
+        />
+        <section className="flex flex-col gap-3">
+          <h3 className="text-sm font-medium">{labels.tokenUsage}</h3>
+          <Definition
+            rows={[
+              [labels.inputTokens, data.input_tokens.toLocaleString(locale)],
+              [
+                labels.cachedInputTokens,
+                data.cached_tokens.toLocaleString(locale),
+              ],
+              [labels.outputTokens, data.output_tokens.toLocaleString(locale)],
+              [
+                labels.cacheHitRate,
+                cacheHitRate(data.cached_tokens, data.input_tokens, locale),
+              ],
+            ]}
+          />
+        </section>
+        {data.archive_available && (
+          <>
+            <section className="flex flex-col gap-3">
+              <h3 className="text-sm font-medium">{labels.requestHeaders}</h3>
+              <HeaderComparison
+                left={data.request_headers}
+                right={data.upstream_request_headers}
+                leftLabel={labels.downstreamToLb}
+                rightLabel={labels.lbToUpstream}
+                labels={labels}
+              />
+            </section>
+            <section className="flex flex-col gap-3">
+              <h3 className="text-sm font-medium">{labels.responseHeaders}</h3>
+              <HeaderComparison
+                left={data.response_headers}
+                right={data.downstream_response_headers}
+                leftLabel={labels.upstreamToLb}
+                rightLabel={labels.lbToDownstream}
+                labels={labels}
+              />
+            </section>
+          </>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+function DiagnosticBodies({
   data,
   labels,
 }: {
@@ -4618,47 +4721,50 @@ function DiagnosticTabs({
         <CardTitle>{labels.diagnosticData}</CardTitle>
         <CardDescription>{labels.diagnosticDataDescription}</CardDescription>
       </CardHeader>
+      <CardContent className="flex flex-col gap-5">
+        <DiagnosticPreview
+          title={labels.requestBody}
+          value={data.request_body}
+          truncated={data.request_body_truncated}
+        />
+        <DiagnosticPreview
+          title={labels.responseBody}
+          value={data.response_body}
+          truncated={data.response_body_truncated}
+        />
+      </CardContent>
+    </Card>
+  )
+}
+
+function FinalResponse({
+  responseBody,
+  truncated,
+  labels,
+}: {
+  responseBody?: string
+  truncated: boolean
+  labels: (typeof copy)[Locale]
+}) {
+  const output = responseOutputText(responseBody)
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{labels.finalResponse}</CardTitle>
+        {truncated && (
+          <CardDescription>{labels.previewTruncated}</CardDescription>
+        )}
+      </CardHeader>
       <CardContent>
-        <Tabs defaultValue="request-headers">
-          <TabsList className="w-full justify-start overflow-x-auto" aria-label={labels.diagnosticData}>
-            <TabsTrigger value="request-headers">{labels.requestHeaders}</TabsTrigger>
-            <TabsTrigger value="request-body">{labels.requestBody}</TabsTrigger>
-            <TabsTrigger value="response-headers">{labels.responseHeaders}</TabsTrigger>
-            <TabsTrigger value="response-body">{labels.responseBody}</TabsTrigger>
-          </TabsList>
-          <TabsContent value="request-headers" className="pt-4">
-            <HeaderComparison
-              left={data.request_headers}
-              right={data.upstream_request_headers}
-              leftLabel={labels.downstreamToLb}
-              rightLabel={labels.lbToUpstream}
-              labels={labels}
-            />
-          </TabsContent>
-          <TabsContent value="request-body" className="pt-4">
-            <DiagnosticPreview
-              title={labels.requestBody}
-              value={data.request_body}
-              truncated={data.request_body_truncated}
-            />
-          </TabsContent>
-          <TabsContent value="response-headers" className="pt-4">
-            <HeaderComparison
-              left={data.response_headers}
-              right={data.downstream_response_headers}
-              leftLabel={labels.upstreamToLb}
-              rightLabel={labels.lbToDownstream}
-              labels={labels}
-            />
-          </TabsContent>
-          <TabsContent value="response-body" className="pt-4">
-            <DiagnosticPreview
-              title={labels.responseBody}
-              value={data.response_body}
-              truncated={data.response_body_truncated}
-            />
-          </TabsContent>
-        </Tabs>
+        {output ? (
+          <div className="max-h-80 overflow-auto rounded-md border bg-muted p-3 text-sm leading-6 break-words whitespace-pre-wrap">
+            {output}
+          </div>
+        ) : (
+          <p className="text-sm text-muted-foreground">
+            {labels.finalResponseUnavailable}
+          </p>
+        )}
       </CardContent>
     </Card>
   )
@@ -5895,6 +6001,19 @@ function compressionRatio(contentBytes: number, transportBytes: number) {
   if (contentBytes <= 0) return "—"
   return `${((1 - transportBytes / contentBytes) * 100).toFixed(1)}%`
 }
+
+function cacheHitRate(
+  cachedTokens: number,
+  inputTokens: number,
+  locale: Locale
+) {
+  if (inputTokens <= 0) return "—"
+  return (cachedTokens / inputTokens).toLocaleString(locale, {
+    style: "percent",
+    maximumFractionDigits: 1,
+  })
+}
+
 function usageEmail(usage: ProviderUsage | undefined) {
   return usage?.email ?? usage?.account_email ?? usage?.account?.email
 }

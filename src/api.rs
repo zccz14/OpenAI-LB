@@ -1109,12 +1109,12 @@ pub async fn audit_detail(
     let admin = is_admin(&user);
     let (sql, scope) = if admin {
         (
-            "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.method,c.path,c.model,c.reasoning_effort,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated,c.consumer_id,c.first_byte_latency_ms,c.request_bytes,c.response_bytes,c.request_transport_bytes,c.response_transport_bytes,c.downstream_accept_encoding,c.downstream_content_encoding,c.upstream_accept_encoding,c.upstream_content_encoding,a.upstream_request_headers_json,a.downstream_response_headers_json FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=?",
+            "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.method,c.path,c.model,c.reasoning_effort,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated,c.consumer_id,c.first_byte_latency_ms,c.request_bytes,c.response_bytes,c.request_transport_bytes,c.response_transport_bytes,c.downstream_accept_encoding,c.downstream_content_encoding,c.upstream_accept_encoding,c.upstream_content_encoding,a.upstream_request_headers_json,a.downstream_response_headers_json,c.upstream_http_version FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=?",
             None,
         )
     } else {
         (
-            "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.method,c.path,c.model,c.reasoning_effort,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated,c.consumer_id,c.first_byte_latency_ms,c.request_bytes,c.response_bytes,c.request_transport_bytes,c.response_transport_bytes,c.downstream_accept_encoding,c.downstream_content_encoding,c.upstream_accept_encoding,c.upstream_content_encoding,a.upstream_request_headers_json,a.downstream_response_headers_json FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=? AND c.user_id=?",
+            "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.method,c.path,c.model,c.reasoning_effort,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.affinity_hash,c.affinity_source,c.created_at,a.api_call_id,a.request_headers_json,a.request_body,a.request_body_truncated,a.response_headers_json,a.response_body,a.response_body_truncated,c.consumer_id,c.first_byte_latency_ms,c.request_bytes,c.response_bytes,c.request_transport_bytes,c.response_transport_bytes,c.downstream_accept_encoding,c.downstream_content_encoding,c.upstream_accept_encoding,c.upstream_content_encoding,a.upstream_request_headers_json,a.downstream_response_headers_json,c.upstream_http_version FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN request_archives a ON a.api_call_id=c.id WHERE c.id=? AND c.user_id=?",
             Some(user.id.clone()),
         )
     };
@@ -1169,7 +1169,8 @@ pub async fn audit_detail(
     let response_headers = visible_archive_headers(row.get::<Option<String>, _>(25), admin);
     let downstream_response_headers =
         visible_archive_headers(row.get::<Option<String>, _>(39), admin);
-    Ok(Json(json!({
+    let upstream_http_version = row.get::<Option<String>, _>(40);
+    let mut detail = json!({
         "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"thread_id":thread_id,"user_id":row.get::<String,_>(3),"consumer_name":row.get::<String,_>(4),
         "provider_id":row.get::<Option<String>,_>(5),"provider_name":row.get::<Option<String>,_>(6),"method":row.get::<String,_>(7),"path":row.get::<String,_>(8),
         "model":row.get::<Option<String>,_>(9),"reasoning_effort":row.get::<Option<String>,_>(10),"status":row.get::<i64,_>(11),"latency_ms":row.get::<i64,_>(12),"input_tokens":row.get::<i64,_>(13),
@@ -1180,7 +1181,11 @@ pub async fn audit_detail(
         "response_headers":response_headers,"downstream_response_headers":downstream_response_headers,"response_body":row.get::<Option<Vec<u8>>,_>(26).map(|body| String::from_utf8_lossy(&body).into_owned()),
         "response_body_truncated":row.get::<Option<i64>,_>(27).unwrap_or_default() != 0,
         "previous":navigation(previous),"next":navigation(next)
-    })))
+    });
+    detail["upstream_http_version"] = upstream_http_version
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+    Ok(Json(detail))
 }
 
 pub async fn list_admin_audit(
@@ -2246,7 +2251,7 @@ mod tests {
             sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES(?,?,?,?,?,?,?)")
                 .bind(&provider_id).bind(user_id).bind(format!("account-{user_id}"))
                 .bind(access).bind("refresh").bind(now).bind(now).execute(&state.db).await.unwrap();
-            sqlx::query("INSERT INTO api_calls(id,request_id,thread_id,consumer_id,user_id,provider_id,method,path,status,latency_ms,created_at) VALUES(?,?,?,'history-key','root-user',?,'POST','/v1/responses',200,1,?)")
+            sqlx::query("INSERT INTO api_calls(id,request_id,thread_id,consumer_id,user_id,provider_id,method,path,status,upstream_http_version,latency_ms,created_at) VALUES(?,?,?,'history-key','root-user',?,'POST','/v1/responses',200,'HTTP/2',1,?)")
                 .bind(&call_id).bind(&call_id).bind(&thread_id).bind(&provider_id).bind(now).execute(&state.db).await.unwrap();
             let browser_token = setup_token(&signing, &issuer, user_id);
 
@@ -2409,6 +2414,7 @@ mod tests {
             assert_eq!(detail["request_bytes"], 256);
             assert_eq!(detail["response_bytes"], 512);
             assert_eq!(detail["reasoning_effort"], "high");
+            assert_eq!(detail["upstream_http_version"], "HTTP/2");
             assert_eq!(detail["previous"]["id"], previous_id);
             let test = provider_request(
                 &state,

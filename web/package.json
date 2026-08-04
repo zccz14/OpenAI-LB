@@ -9,7 +9,7 @@
     "lint": "eslint .",
     "format": "prettier --write \"**/*.{ts,tsx}\"",
     "typecheck": "tsc -b --noEmit",
-    "test": "node --experimental-strip-types --test tests/auth-redirect.test.ts",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
     "check": "npm run test && npm run typecheck && npm run lint && npm run build",
     "preview": "vite preview"
   },

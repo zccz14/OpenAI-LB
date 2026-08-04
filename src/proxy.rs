@@ -8,7 +8,7 @@ use std::{
 use axum::{
     body::{Body, Bytes},
     extract::{ConnectInfo, OriginalUri, State},
-    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Version, header},
     response::Response,
 };
 use futures_util::StreamExt;
@@ -104,6 +104,7 @@ impl AuditTracker {
             model: None,
             reasoning_effort: None,
             status: 0,
+            upstream_http_version: None,
             first_byte_latency_ms: None,
             request_bytes: 0,
             response_bytes: 0,
@@ -192,6 +193,22 @@ impl AuditTracker {
                 return;
             }
             event.response_headers_json = Some(archive_headers(headers));
+        }
+    }
+
+    fn set_upstream_http_version(&mut self, version: Version) {
+        if let Some(event) = &mut self.event {
+            event.upstream_http_version = Some(
+                match version {
+                    Version::HTTP_09 => "HTTP/0.9",
+                    Version::HTTP_10 => "HTTP/1.0",
+                    Version::HTTP_11 => "HTTP/1.1",
+                    Version::HTTP_2 => "HTTP/2",
+                    Version::HTTP_3 => "HTTP/3",
+                    _ => "unknown",
+                }
+                .to_owned(),
+            );
         }
     }
 
@@ -1263,6 +1280,7 @@ async fn relay_response(
 ) -> Result<Response, AppError> {
     audit.mark_first_byte();
     let status = upstream.status();
+    audit.set_upstream_http_version(upstream.version());
     audit.set_compression_headers(&HeaderMap::new(), Some(upstream.headers()));
     audit.set_response_headers(upstream.headers());
     let mut headers = filtered_response_headers(upstream.headers());
@@ -1331,6 +1349,7 @@ async fn image_response(
 ) -> Result<Response, AppError> {
     audit.mark_first_byte();
     let status = upstream.status();
+    audit.set_upstream_http_version(upstream.version());
     if !status.is_success() {
         return relay_response(context, lease, upstream, audit).await;
     }
@@ -2251,13 +2270,16 @@ mod tests {
         assert!(body.ends_with(b"\n\n"));
         wait_for_audits(&state, 1).await;
 
-        let row: (i64, i64, i64, i64) = sqlx::query_as(
-            "SELECT input_tokens,cached_tokens,output_tokens,response_bytes FROM api_calls",
+        let row: (i64, i64, i64, i64, Option<String>) = sqlx::query_as(
+            "SELECT input_tokens,cached_tokens,output_tokens,response_bytes,upstream_http_version FROM api_calls",
         )
         .fetch_one(&state.db)
         .await
         .unwrap();
-        assert_eq!(row, (19, 0, 6, body.len() as i64));
+        assert_eq!(
+            row,
+            (19, 0, 6, body.len() as i64, Some("HTTP/1.1".to_owned()))
+        );
     }
 
     #[tokio::test]

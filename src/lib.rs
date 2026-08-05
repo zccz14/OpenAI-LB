@@ -384,7 +384,7 @@ pub(crate) async fn test_state_with_upstream(
         oauth_redirect_uri: "http://localhost:1455/auth/callback".to_owned(),
         oauth_client_id: "test-client".to_owned(),
         response_body_limit: 1024 * 1024,
-        image_body_limit: 1024 * 1024,
+        image_body_limit: 16 * 1024 * 1024,
         audio_body_limit: 1024 * 1024,
         affinity_ttl_seconds: 3600,
         request_archive_retention_days: 7,

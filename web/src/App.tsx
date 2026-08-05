@@ -376,6 +376,12 @@ type SettingsData = {
   affinity_ttl_seconds: number
   request_archive_retention_days: number
 }
+type ReferenceImage = {
+  id: string
+  name: string
+  size: number
+  dataUrl: string
+}
 
 const copy = {
   zh: {
@@ -405,7 +411,7 @@ const copy = {
     pageProviders: "管理自己拥有的 CodeX OAuth Provider、运行状态与用户授权。",
     pageConsumers: "按 AI App 隔离下游消费者，分别跟踪调用量并独立吊销凭据。",
     pageTranscriptions: "录制或上传音频，使用当前用户可访问的 CodeX OAuth Provider 转写为文字。",
-    pageImages: "通过文字提示生成单张图像，使用当前用户可访问的 CodeX OAuth Provider。",
+    pageImages: "通过文字提示和可选参考图片生成图像，使用当前用户可访问的 CodeX OAuth Provider。",
     pageUsage: "按消费者核算请求、Token、错误和延迟。",
     pageAudit: "逐次追踪请求、上游提供商、结果与用量；诊断内容按配置期限保留。",
     pageRequestDetail: "查看调用上下文、消息结构与同一 Thread ID 的相邻请求。",
@@ -771,6 +777,16 @@ const copy = {
     noAudioSelected: "请先选择或录制音频。",
     imagePrompt: "图像提示词",
     imagePromptPlaceholder: "描述你想生成的图像，包括主体、构图、风格和需要呈现的文字。",
+    imageReference: "参考图片",
+    imageReferenceHelp:
+      "可选：上传 PNG、JPEG、WEBP 或 GIF 作为构图、风格或主体参考；最多 4 张，合计不超过 8 MiB。",
+    imageReferenceCount: "已添加",
+    removeReferenceImage: "移除参考图片",
+    imageReferenceInvalid: "请选择 PNG、JPEG、WEBP 或 GIF 图片。",
+    imageReferenceTooLarge: "单张参考图片不能超过 4 MiB。",
+    imageReferenceCountExceeded: "最多添加 4 张参考图片。",
+    imageReferenceTotalExceeded: "参考图片合计不能超过 8 MiB。",
+    imageReferenceReadError: "读取参考图片失败，请重试。",
     imageSize: "画面比例",
     imageQuality: "生成质量",
     imageSquare: "正方形",
@@ -1218,6 +1234,17 @@ const copy = {
     imagePrompt: "Image prompt",
     imagePromptPlaceholder:
       "Describe the subject, composition, style, and any text that should appear in the image.",
+    imageReference: "Reference images",
+    imageReferenceHelp:
+      "Optional: add PNG, JPEG, WEBP, or GIF images for composition, style, or subject reference; up to 4 images and 8 MiB total.",
+    imageReferenceCount: "Added",
+    removeReferenceImage: "Remove reference image",
+    imageReferenceInvalid: "Choose PNG, JPEG, WEBP, or GIF images.",
+    imageReferenceTooLarge: "Each reference image must be 4 MiB or smaller.",
+    imageReferenceCountExceeded: "You can add up to 4 reference images.",
+    imageReferenceTotalExceeded:
+      "Reference images must be 8 MiB or smaller in total.",
+    imageReferenceReadError: "Could not read the reference image. Try again.",
     imageSize: "Aspect ratio",
     imageQuality: "Generation quality",
     imageSquare: "Square",
@@ -2232,6 +2259,30 @@ function TranscriptionsPage({
   )
 }
 
+const MAX_REFERENCE_IMAGES = 4
+const MAX_REFERENCE_IMAGE_BYTES = 4 * 1024 * 1024
+const MAX_REFERENCE_IMAGE_TOTAL_BYTES = 8 * 1024 * 1024
+const SUPPORTED_REFERENCE_IMAGE_TYPES = [
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/gif",
+]
+
+function readFileAsDataUrl(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.addEventListener("load", () => {
+      if (typeof reader.result === "string") resolve(reader.result)
+      else reject(new Error("reference image data is unavailable"))
+    })
+    reader.addEventListener("error", () =>
+      reject(reader.error ?? new Error("reference image read failed"))
+    )
+    reader.readAsDataURL(file)
+  })
+}
+
 function isSupportedImageSize(width: string, height: string) {
   const parsedWidth = Number(width)
   const parsedHeight = Number(height)
@@ -2267,10 +2318,58 @@ function ImageGenerationPage({
   const [height, setHeight] = useState("1024")
   const [quality, setQuality] = useState("auto")
   const [image, setImage] = useState("")
+  const [referenceImages, setReferenceImages] = useState<ReferenceImage[]>([])
   const [pending, setPending] = useState(false)
   const isCustomSize = sizePreset === "custom"
   const customSizeValid = isSupportedImageSize(width, height)
   const size = isCustomSize ? `${width}x${height}` : sizePreset
+
+  async function selectReferenceImages(fileList: FileList | null) {
+    const files = Array.from(fileList ?? [])
+    if (!files.length) return
+    if (referenceImages.length + files.length > MAX_REFERENCE_IMAGES) {
+      toast.error(t.imageReferenceCountExceeded)
+      return
+    }
+    if (
+      files.some((file) => !SUPPORTED_REFERENCE_IMAGE_TYPES.includes(file.type))
+    ) {
+      toast.error(t.imageReferenceInvalid)
+      return
+    }
+    if (files.some((file) => file.size > MAX_REFERENCE_IMAGE_BYTES)) {
+      toast.error(t.imageReferenceTooLarge)
+      return
+    }
+    const currentBytes = referenceImages.reduce(
+      (total, reference) => total + reference.size,
+      0
+    )
+    const selectedBytes = files.reduce((total, file) => total + file.size, 0)
+    if (currentBytes + selectedBytes > MAX_REFERENCE_IMAGE_TOTAL_BYTES) {
+      toast.error(t.imageReferenceTotalExceeded)
+      return
+    }
+    try {
+      const next = await Promise.all(
+        files.map(async (file) => ({
+          id: crypto.randomUUID(),
+          name: file.name,
+          size: file.size,
+          dataUrl: await readFileAsDataUrl(file),
+        }))
+      )
+      setReferenceImages((current) => [...current, ...next])
+    } catch {
+      toast.error(t.imageReferenceReadError)
+    }
+  }
+
+  function removeReferenceImage(id: string) {
+    setReferenceImages((current) =>
+      current.filter((reference) => reference.id !== id)
+    )
+  }
 
   async function generate() {
     if (!prompt.trim()) {
@@ -2291,6 +2390,13 @@ function ImageGenerationPage({
             size,
             quality,
             output_format: "png",
+            ...(referenceImages.length > 0
+              ? {
+                  reference_images: referenceImages.map(
+                    (reference) => reference.dataUrl
+                  ),
+                }
+              : {}),
           }),
         }
       )
@@ -2328,6 +2434,60 @@ function ImageGenerationPage({
               placeholder={t.imagePromptPlaceholder}
               value={prompt}
             />
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="image-reference">
+              {t.imageReference}
+            </FieldLabel>
+            <Input
+              id="image-reference"
+              type="file"
+              accept="image/png,image/jpeg,image/webp,image/gif"
+              multiple
+              onChange={(event) => {
+                void selectReferenceImages(event.target.files)
+                event.currentTarget.value = ""
+              }}
+            />
+            <FieldDescription>
+              {t.imageReferenceHelp} {t.imageReferenceCount}{" "}
+              {referenceImages.length}/{MAX_REFERENCE_IMAGES}
+            </FieldDescription>
+            {referenceImages.length > 0 && (
+              <div
+                aria-label={t.imageReference}
+                className="grid grid-cols-2 gap-3 sm:grid-cols-4"
+                role="list"
+              >
+                {referenceImages.map((reference) => (
+                  <div className="min-w-0" key={reference.id} role="listitem">
+                    <div className="relative overflow-hidden rounded-md border bg-muted">
+                      <img
+                        alt={reference.name}
+                        className="aspect-square w-full object-cover"
+                        src={reference.dataUrl}
+                      />
+                      <Button
+                        aria-label={`${t.removeReferenceImage}: ${reference.name}`}
+                        className="absolute top-1 right-1 bg-background/90"
+                        onClick={() => removeReferenceImage(reference.id)}
+                        size="icon-sm"
+                        type="button"
+                        variant="ghost"
+                      >
+                        <Trash2Icon />
+                      </Button>
+                    </div>
+                    <p
+                      className="truncate pt-1 text-xs text-muted-foreground"
+                      title={reference.name}
+                    >
+                      {reference.name}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            )}
           </Field>
           <div className="grid gap-5 sm:grid-cols-2">
             <Field>

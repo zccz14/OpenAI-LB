@@ -53,6 +53,7 @@ const TRANSCRIPTION_ORIGINATOR: &str = "Codex Desktop";
 // request identity. OpenAI-LB maintainers should remove this when a supported
 // server-to-server transcription upstream replaces this endpoint.
 const TRANSCRIPTION_USER_AGENT: &str = "Codex Desktop/26.519.81530 (macos; aarch64)";
+const MAX_REFERENCE_IMAGES: usize = 4;
 
 struct CallContext {
     request_id: String,
@@ -888,10 +889,13 @@ fn transform_request(
             .get("moderation")
             .and_then(Value::as_str)
             .unwrap_or("auto");
+        let reference_images = reference_image_inputs(object)?;
+        let mut content = vec![json!({"type":"input_text","text":prompt})];
+        content.extend(reference_images);
         let translated = json!({
             "model": state.config.load().image_host_model,
             "instructions": "You are an image generator. You MUST call image_generation exactly once and return only that tool call. Mirror the user's request verbatim into the prompt argument.",
-            "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":prompt}]}],
+            "input": [{"type":"message","role":"user","content":content}],
             "tools": [{"type":"image_generation","model":image_model,"size":size,"quality":quality,"background":background,"output_format":output_format,"output_compression":output_compression,"moderation":moderation}],
             "tool_choice": {"type":"image_generation"}, "stream": true, "store": false
         });
@@ -953,6 +957,7 @@ fn validate_image_request(object: &serde_json::Map<String, Value>) -> Result<(),
     validate_enum(object, "background", &["auto", "opaque", "transparent"])?;
     validate_enum(object, "output_format", &["png", "jpeg", "webp"])?;
     validate_enum(object, "moderation", &["auto", "low"])?;
+    reference_image_inputs(object)?;
     if let Some(value) = object.get("output_compression") {
         let compression = value.as_i64().ok_or_else(|| {
             AppError::bad_request("output_compression must be an integer from 0 to 100")
@@ -960,6 +965,52 @@ fn validate_image_request(object: &serde_json::Map<String, Value>) -> Result<(),
         if !(0..=100).contains(&compression) {
             return Err(AppError::bad_request("output_compression must be 0-100"));
         }
+    }
+    Ok(())
+}
+
+fn reference_image_inputs(object: &serde_json::Map<String, Value>) -> Result<Vec<Value>, AppError> {
+    let Some(value) = object.get("reference_images") else {
+        return Ok(Vec::new());
+    };
+    let images = value
+        .as_array()
+        .ok_or_else(|| AppError::bad_request("reference_images must be an array"))?;
+    if images.len() > MAX_REFERENCE_IMAGES {
+        return Err(AppError::bad_request(format!(
+            "reference_images supports at most {MAX_REFERENCE_IMAGES} images"
+        )));
+    }
+    images
+        .iter()
+        .map(|image| {
+            let image_url = image
+                .as_str()
+                .ok_or_else(|| AppError::bad_request("reference_images must contain strings"))?;
+            validate_reference_image_url(image_url)?;
+            Ok(json!({
+                "type": "input_image",
+                "image_url": image_url,
+                "detail": "auto"
+            }))
+        })
+        .collect()
+}
+
+fn validate_reference_image_url(image_url: &str) -> Result<(), AppError> {
+    let (metadata, encoded) = image_url
+        .split_once(";base64,")
+        .ok_or_else(|| AppError::bad_request("reference images must be base64 data URLs"))?;
+    let mime = metadata.strip_prefix("data:").filter(|mime| {
+        matches!(
+            *mime,
+            "image/png" | "image/jpeg" | "image/jpg" | "image/webp" | "image/gif"
+        )
+    });
+    if mime.is_none() || encoded.is_empty() {
+        return Err(AppError::bad_request(
+            "reference images must be PNG, JPEG, WEBP, or GIF data URLs",
+        ));
     }
     Ok(())
 }
@@ -1919,6 +1970,33 @@ mod tests {
         assert_eq!(record.headers["x-request-id"], "request-1");
     }
 
+    #[tokio::test]
+    async fn reference_images_are_translated_to_responses_input_images() {
+        let state = crate::test_state("http://token.invalid").await;
+        let payload = transform_request(
+            "/v1/images/generations",
+            Some(json!({
+                "prompt": "a product scene",
+                "reference_images": [
+                    "data:image/png;base64,cG5n",
+                    "data:image/jpeg;base64,anBlZw=="
+                ]
+            })),
+            &state,
+        )
+        .unwrap();
+        let translated: Value = serde_json::from_slice(&payload).unwrap();
+        let content = translated
+            .pointer("/input/0/content")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "data:image/png;base64,cG5n");
+        assert_eq!(content[2]["detail"], "auto");
+    }
+
     #[test]
     fn thread_id_extracts_existing_downstream_headers() {
         let mut headers = HeaderMap::new();
@@ -2849,6 +2927,15 @@ mod tests {
             json!({"prompt":"x","model":"gpt-image-2","size":"2047x2048"}),
             json!({"prompt":"x","model":"gpt-image-2","size":"2048x8192"}),
             json!({"prompt":"x","model":"gpt-image-2","size":"1024x1024x1024"}),
+            json!({"prompt":"x","reference_images":"data:image/png;base64,cG5n"}),
+            json!({"prompt":"x","reference_images":["data:image/svg+xml;base64,PHN2Zz4="]}),
+            json!({"prompt":"x","reference_images":[
+                "data:image/png;base64,x",
+                "data:image/png;base64,x",
+                "data:image/png;base64,x",
+                "data:image/png;base64,x",
+                "data:image/png;base64,x"
+            ]}),
         ] {
             assert!(transform_request("/v1/images/generations", Some(payload), &state,).is_err());
         }

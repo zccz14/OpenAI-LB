@@ -3,8 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Context;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, header};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
@@ -134,20 +133,26 @@ impl AuthVerifier {
         let jwks = self
             .client
             .get(format!("{}/jwks", self.issuer))
+            .header(header::ACCEPT_ENCODING, "identity")
             .send()
             .await
-            .context("failed to fetch Auth Mini JWKS")?
+            .map_err(jwks_unavailable)?
             .error_for_status()
-            .context("Auth Mini JWKS returned an error")?
+            .map_err(jwks_unavailable)?
             .json::<Jwks>()
             .await
-            .context("invalid Auth Mini JWKS")?;
+            .map_err(jwks_unavailable)?;
         *self.cache.write().await = JwksCache {
             fetched_at: Some(Instant::now()),
             keys: jwks.keys,
         };
         Ok(())
     }
+}
+
+fn jwks_unavailable(error: reqwest::Error) -> AppError {
+    tracing::warn!(%error, "Auth Mini JWKS refresh failed");
+    AppError::unavailable("Auth Mini JWKS is unavailable")
 }
 
 #[derive(Clone)]
@@ -467,5 +472,54 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn jwks_request_uses_identity_encoding_and_reports_provider_unavailability() {
+        let signing = SigningKey::from_bytes(&[8_u8; 32]);
+        let x = URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes());
+        let app = Router::new().route(
+            "/jwks",
+            get(move |headers: HeaderMap| {
+                let x = x.clone();
+                async move {
+                    assert_eq!(headers.get(header::ACCEPT_ENCODING).unwrap(), "identity");
+                    Json(serde_json::json!({"keys":[{"kid":"test","kty":"OKP","crv":"Ed25519","alg":"EdDSA","use":"sig","x":x}]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let issuer = format!("http://{address}");
+        let verifier = AuthVerifier::new(issuer.clone(), None, reqwest::Client::new());
+        let token = sign_token(
+            &signing,
+            &issuer,
+            "access",
+            chrono::Utc::now().timestamp() + 60,
+        );
+        assert!(verifier.verify(&token).await.is_ok());
+
+        let unavailable = AuthVerifier::new(
+            "http://127.0.0.1:1".to_owned(),
+            None,
+            reqwest::Client::new(),
+        )
+        .verify(&sign_token(
+            &signing,
+            "http://127.0.0.1:1",
+            "access",
+            chrono::Utc::now().timestamp() + 60,
+        ))
+        .await
+        .unwrap_err();
+        assert_eq!(
+            unavailable.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(unavailable.message(), "Auth Mini JWKS is unavailable");
     }
 }

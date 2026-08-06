@@ -90,12 +90,22 @@ impl AuthVerifier {
         let kid = header
             .kid
             .ok_or_else(|| AppError::unauthorized("token is missing kid"))?;
-        let mut key = self.cached_key(&kid).await;
-        if key.is_none() {
-            self.refresh().await?;
-            key = self.cached_key(&kid).await;
-        }
-        let key = key.ok_or_else(|| AppError::unauthorized("unknown signing key"))?;
+        let key = match self.fresh_cached_key(&kid).await {
+            Some(key) => key,
+            None => {
+                let stale_key = self.cached_key(&kid).await;
+                match self.refresh().await {
+                    Ok(()) => self
+                        .cached_key(&kid)
+                        .await
+                        .ok_or_else(|| AppError::unauthorized("unknown signing key"))?,
+                    // RECOVERY: When Auth Mini is temporarily unavailable, existing sessions can
+                    // continue only if this process already has the token's signing key. New or
+                    // rotated keys still fail closed until the issuer is reachable again.
+                    Err(error) => stale_key.ok_or(error)?,
+                }
+            }
+        };
         let mut validation = Validation::new(Algorithm::EdDSA);
         validation.leeway = 0;
         validation.set_issuer(&[&self.issuer]);
@@ -119,14 +129,23 @@ impl AuthVerifier {
         Ok(claims)
     }
 
-    async fn cached_key(&self, kid: &str) -> Option<EdJwk> {
+    async fn fresh_cached_key(&self, kid: &str) -> Option<EdJwk> {
         let cache = self.cache.read().await;
-        let fresh = cache
+        cache
             .fetched_at
-            .is_some_and(|at| at.elapsed() < Duration::from_secs(300));
-        fresh
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(300))
             .then(|| cache.keys.iter().find(|key| key.kid == kid).cloned())
             .flatten()
+    }
+
+    async fn cached_key(&self, kid: &str) -> Option<EdJwk> {
+        self.cache
+            .read()
+            .await
+            .keys
+            .iter()
+            .find(|key| key.kid == kid)
+            .cloned()
     }
 
     async fn refresh(&self) -> Result<(), AppError> {
@@ -283,7 +302,7 @@ pub(crate) fn bearer(headers: &HeaderMap) -> Result<&str, AppError> {
 mod tests {
     use axum::{
         Json, Router,
-        http::{HeaderMap, HeaderValue},
+        http::{HeaderMap, HeaderValue, StatusCode},
         routing::get,
     };
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -521,5 +540,78 @@ mod tests {
             axum::http::StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(unavailable.message(), "Auth Mini JWKS is unavailable");
+    }
+
+    #[tokio::test]
+    async fn stale_jwks_key_verifies_when_refresh_fails() {
+        let signing = SigningKey::from_bytes(&[9_u8; 32]);
+        let x = URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes());
+        let app = Router::new().route("/jwks", get(|| async { StatusCode::SERVICE_UNAVAILABLE }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let issuer = format!("http://{address}");
+        let verifier = AuthVerifier::new(issuer.clone(), None, reqwest::Client::new());
+        *verifier.cache.write().await = JwksCache {
+            fetched_at: Some(Instant::now() - Duration::from_secs(301)),
+            keys: vec![EdJwk {
+                kid: "test".to_owned(),
+                x: x.clone(),
+            }],
+        };
+
+        let token = sign_token(
+            &signing,
+            &issuer,
+            "access",
+            chrono::Utc::now().timestamp() + 60,
+        );
+        assert!(verifier.verify(&token).await.is_ok());
+
+        let cache = verifier.cache.read().await;
+        assert_eq!(cache.keys.len(), 1);
+        assert_eq!(cache.keys[0].x, x);
+    }
+
+    #[tokio::test]
+    async fn successful_refresh_replaces_stale_jwks() {
+        let stale_signing = SigningKey::from_bytes(&[10_u8; 32]);
+        let refreshed_signing = SigningKey::from_bytes(&[11_u8; 32]);
+        let refreshed_x = URL_SAFE_NO_PAD.encode(refreshed_signing.verifying_key().to_bytes());
+        let app = Router::new().route("/jwks", get(move || {
+            let refreshed_x = refreshed_x.clone();
+            async move { Json(serde_json::json!({"keys":[{"kid":"test","kty":"OKP","crv":"Ed25519","alg":"EdDSA","use":"sig","x":refreshed_x}]})) }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let issuer = format!("http://{address}");
+        let verifier = AuthVerifier::new(issuer.clone(), None, reqwest::Client::new());
+        *verifier.cache.write().await = JwksCache {
+            fetched_at: Some(Instant::now() - Duration::from_secs(301)),
+            keys: vec![EdJwk {
+                kid: "test".to_owned(),
+                x: URL_SAFE_NO_PAD.encode(stale_signing.verifying_key().to_bytes()),
+            }],
+        };
+
+        let token = sign_token(
+            &refreshed_signing,
+            &issuer,
+            "access",
+            chrono::Utc::now().timestamp() + 60,
+        );
+        assert!(verifier.verify(&token).await.is_ok());
+
+        let cache = verifier.cache.read().await;
+        assert_eq!(cache.keys.len(), 1);
+        assert_eq!(
+            cache.keys[0].x,
+            URL_SAFE_NO_PAD.encode(refreshed_signing.verifying_key().to_bytes())
+        );
     }
 }

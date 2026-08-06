@@ -22,7 +22,7 @@ OpenAI-LB 是一个面向 OpenAI / CodeX OAuth 上游提供商的反向代理和
 
 打开 `http://localhost:8080`，填写品牌提供的 Auth Mini issuer，然后前往该 Auth Mini 实例的托管登录页面。登录成功后浏览器会返回 OpenAI-LB，再将当前用户绑定为唯一 `root`。Setup 完成后初始化入口立即关闭。
 
-OpenAI-LB 连接现有的品牌 Auth Mini 实例。用户不需要为 OpenAI-LB 部署 Auth Mini。前端使用 `auth-mini` SDK，后端通过 issuer 的 `/jwks` 验证 Ed25519 JWT，并使用 `user_id` 关联本地 `root / admin / user` 权限。
+OpenAI-LB 连接现有的品牌 Auth Mini 实例。用户不需要为 OpenAI-LB 部署 Auth Mini。前端使用 `auth-mini` SDK，后端使用 `auth-mini-axum` 的预热 JWKS verifier 验证 Ed25519 access JWT，并以精确的服务 hostname audience 和 `user_id` 关联本地 `root / admin / user` 权限。
 
 ## 产品能力
 

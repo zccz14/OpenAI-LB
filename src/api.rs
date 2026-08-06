@@ -46,8 +46,7 @@ pub async fn setup_status(State(state): State<AppState>) -> Result<Json<Value>, 
 #[derive(Deserialize)]
 pub struct SetupInput {
     auth_issuer: String,
-    #[serde(default)]
-    auth_audience: Option<String>,
+    auth_audience: String,
 }
 
 pub async fn setup(
@@ -58,9 +57,9 @@ pub async fn setup(
     if !setup_required(&state).await? {
         return Err(AppError::not_found("setup is already complete"));
     }
-    let issuer = validate_issuer(&input.auth_issuer)?;
-    let audience = input.auth_audience.filter(|value| !value.trim().is_empty());
-    let identity = state
+    let issuer = input.auth_issuer.trim().trim_end_matches('/').to_owned();
+    let audience = required_setting("Auth Mini audience", &input.auth_audience)?.to_owned();
+    let (identity, verifier) = state
         .auth
         .verify_candidate(issuer.clone(), audience.clone(), bearer(&headers)?)
         .await?;
@@ -73,10 +72,8 @@ pub async fn setup(
     if complete == "true" {
         return Err(AppError::not_found("setup is already complete"));
     }
-    sqlx::query("INSERT INTO users(id,email,display_name,role,created_at) VALUES(?,?,?,'root',?) ON CONFLICT(id) DO UPDATE SET email=excluded.email,display_name=excluded.display_name,role='root'")
+    sqlx::query("INSERT INTO users(id,role,created_at) VALUES(?,'root',?) ON CONFLICT(id) DO UPDATE SET role='root'")
         .bind(&identity.id)
-        .bind(&identity.email)
-        .bind(&identity.name)
         .bind(now)
         .execute(&mut *transaction)
         .await?;
@@ -86,7 +83,7 @@ pub async fn setup(
         .await?;
     for (key, value) in [
         ("auth_issuer", issuer.as_str()),
-        ("auth_audience", audience.as_deref().unwrap_or("")),
+        ("auth_audience", audience.as_str()),
         ("setup_complete", "true"),
     ] {
         sqlx::query("UPDATE app_meta SET value=?,updated_at=? WHERE key=?")
@@ -97,11 +94,11 @@ pub async fn setup(
             .await?;
     }
     transaction.commit().await?;
-    state.auth.configure(issuer.clone(), audience.clone()).await;
+    state.auth.install(verifier).await;
     let mut config = (**state.config.load()).clone();
     config.setup_complete = true;
     config.auth_issuer = Some(issuer);
-    config.auth_audience = audience;
+    config.auth_audience = Some(audience);
     state.config.store(std::sync::Arc::new(config));
     Ok(Json(json!({"ok":true,"root_user_id":identity.id})))
 }
@@ -111,29 +108,6 @@ async fn setup_required(state: &AppState) -> Result<bool, AppError> {
         .fetch_one(&state.db)
         .await?;
     Ok(value != "true")
-}
-
-fn validate_issuer(value: &str) -> Result<String, AppError> {
-    let issuer = value.trim().trim_end_matches('/');
-    let parsed = url::Url::parse(issuer)
-        .map_err(|_| AppError::bad_request("Auth Mini issuer must be an absolute URL"))?;
-    if !matches!(parsed.scheme(), "http" | "https")
-        || parsed.host_str().is_none()
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        return Err(AppError::bad_request("Auth Mini issuer URL is not valid"));
-    }
-    if parsed.scheme() == "http"
-        && !matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "::1"))
-    {
-        return Err(AppError::bad_request(
-            "Auth Mini issuer must use HTTPS outside localhost",
-        ));
-    }
-    Ok(issuer.to_owned())
 }
 
 pub async fn me(
@@ -1640,12 +1614,11 @@ pub async fn update_user(
         .map(|value| required_setting("display name", &value))
         .transpose()?;
     if let Some(display_name) = display_name {
-        let result =
-            sqlx::query("UPDATE users SET display_name=?, display_name_overridden=1 WHERE id=?")
-                .bind(display_name)
-                .bind(&id)
-                .execute(&state.db)
-                .await?;
+        let result = sqlx::query("UPDATE users SET display_name=? WHERE id=?")
+            .bind(display_name)
+            .bind(&id)
+            .execute(&state.db)
+            .await?;
         if result.rows_affected() == 0 {
             return Err(AppError::not_found("user not found"));
         }
@@ -1741,15 +1714,20 @@ mod tests {
 
     use super::*;
 
+    const TEST_AUTH_AUDIENCE: &str = "openai-lb.test";
+
     fn setup_token(signing: &SigningKey, issuer: &str, user_id: &str) -> String {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"EdDSA","kid":"setup","typ":"JWT"}"#);
         let payload = URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(&json!({
                 "sub":user_id,
+                "sid":"session-1",
                 "iss":issuer,
+                "aud":TEST_AUTH_AUDIENCE,
+                "amr":["webauthn"],
                 "typ":"access",
+                "iat":chrono::Utc::now().timestamp(),
                 "exp":chrono::Utc::now().timestamp() + 300,
-                "email":"root@example.com"
             }))
             .unwrap(),
         );
@@ -1816,6 +1794,14 @@ mod tests {
             format!("Bearer {token}").parse().unwrap(),
         );
         let state = crate::test_state("http://token.invalid").await;
+        let wrong_audience = state
+            .auth
+            .verify_candidate(issuer.clone(), "other.example.com".to_owned(), &token)
+            .await;
+        assert!(matches!(
+            wrong_audience,
+            Err(error) if error.status() == StatusCode::UNAUTHORIZED
+        ));
         let now = chrono::Utc::now().timestamp();
         sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES('legacy-provider','legacy','legacy','access','refresh',?,?)")
             .bind(now)
@@ -1828,7 +1814,7 @@ mod tests {
             headers.clone(),
             Json(SetupInput {
                 auth_issuer: issuer.clone(),
-                auth_audience: None,
+                auth_audience: TEST_AUTH_AUDIENCE.to_owned(),
             }),
         )
         .await
@@ -1851,7 +1837,7 @@ mod tests {
             headers,
             Json(SetupInput {
                 auth_issuer: issuer,
-                auth_audience: None,
+                auth_audience: TEST_AUTH_AUDIENCE.to_owned(),
             }),
         )
         .await
@@ -1921,7 +1907,11 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, jwks).await.unwrap() });
         let issuer = format!("http://{address}");
         let state = crate::test_state("http://token.invalid").await;
-        state.auth.configure(issuer.clone(), None).await;
+        state
+            .auth
+            .configure(issuer.clone(), TEST_AUTH_AUDIENCE.to_owned())
+            .await
+            .unwrap();
         let now = chrono::Utc::now().timestamp();
         for (id, role) in [("admin", "admin"), ("tenant", "user")] {
             sqlx::query("INSERT INTO users(id,role,created_at) VALUES(?,?,?)")
@@ -2373,7 +2363,11 @@ mod tests {
             &format!("{issuer}/backend-api/codex"),
         )
         .await;
-        state.auth.configure(issuer.clone(), None).await;
+        state
+            .auth
+            .configure(issuer.clone(), TEST_AUTH_AUDIENCE.to_owned())
+            .await
+            .unwrap();
         let now = chrono::Utc::now().timestamp();
         for (id, role) in [
             ("root-user", "root"),
@@ -2461,13 +2455,12 @@ mod tests {
         )
         .await;
         assert_eq!(rename.status(), StatusCode::OK);
-        let renamed: (String, i64) = sqlx::query_as(
-            "SELECT display_name,display_name_overridden FROM users WHERE id='tenant-user'",
-        )
-        .fetch_one(&state.db)
-        .await
-        .unwrap();
-        assert_eq!(renamed, ("Tenant operations".to_owned(), 1));
+        let renamed: String =
+            sqlx::query_scalar("SELECT display_name FROM users WHERE id='tenant-user'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(renamed, "Tenant operations");
         let name_audits: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM admin_audit WHERE action='user.display_name.update' AND target_id='tenant-user'",
         )
@@ -2914,7 +2907,11 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, jwks).await.unwrap() });
         let issuer = format!("http://{address}");
         let state = crate::test_state("http://token.invalid").await;
-        state.auth.configure(issuer.clone(), None).await;
+        state
+            .auth
+            .configure(issuer.clone(), TEST_AUTH_AUDIENCE.to_owned())
+            .await
+            .unwrap();
         let now = chrono::Utc::now().timestamp();
         for user_id in ["consumer-owner", "other-owner"] {
             sqlx::query("INSERT INTO users(id,role,created_at) VALUES(?,'user',?)")

@@ -55,11 +55,8 @@ impl AppState {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(600))
             .build()?;
-        let auth = AuthManager::new(
-            config.auth_issuer.clone(),
-            config.auth_audience.clone(),
-            client.clone(),
-        );
+        let auth =
+            AuthManager::new(config.auth_issuer.clone(), config.auth_audience.clone()).await?;
         let config = Arc::new(ArcSwap::from_pointee(config));
         let audit = AuditWriter::new(db.clone(), config.clone());
         let resources = Arc::new(tokio::sync::Mutex::new(ResourceMonitor::new(
@@ -381,8 +378,8 @@ pub(crate) async fn test_state_with_upstream(
         listen: "127.0.0.1:0".parse().unwrap(),
         data_dir: std::env::temp_dir(),
         database_path: std::path::PathBuf::from(":memory:"),
-        setup_complete: true,
-        auth_issuer: Some("http://auth.invalid".to_owned()),
+        setup_complete: false,
+        auth_issuer: None,
         auth_audience: None,
         upstream_base: upstream_base.to_owned(),
         upstream_openai_beta: None,

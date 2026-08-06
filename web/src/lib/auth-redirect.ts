@@ -41,7 +41,8 @@ export function normalizeAuthMiniIssuer(value: string) {
 export function buildAuthMiniLoginUrl(
   issuer: string,
   redirectUri: string,
-  state: string
+  state: string,
+  audience?: string
 ) {
   const callback = new URL(redirectUri)
   if (!["http:", "https:"].includes(callback.protocol))
@@ -51,6 +52,9 @@ export function buildAuthMiniLoginUrl(
     redirect_uri: callback.toString(),
     state,
   })
+  const callbackAudience = callback.hostname.replace(/^\[|\]$/g, "")
+  if (isLoopback(callbackAudience))
+    params.set("aud", audience?.trim() || callbackAudience)
   const login = new URL("web/", `${normalizeAuthMiniIssuer(issuer)}/`)
   login.hash = `/login?${params.toString()}`
   return login.toString()
@@ -73,7 +77,12 @@ export function startAuthMiniLogin(issuer: string, setupDraft?: SetupDraft) {
     )
   }
   window.location.assign(
-    buildAuthMiniLoginUrl(normalizedIssuer, callback.toString(), state)
+    buildAuthMiniLoginUrl(
+      normalizedIssuer,
+      callback.toString(),
+      state,
+      setupDraft?.audience
+    )
   )
 }
 
@@ -111,10 +120,9 @@ export function adoptAuthMiniCallback(
   try {
     const session = parseAuthMiniCallback(hash, context.state, now)
 
-    // COMPATIBILITY: OpenAI-LB owns this bridge for auth-mini 0.3.0, whose
-    // redirect contract returns session tokens but whose public browser SDK has
-    // no callback-adoption API. Remove this direct persisted-state write when
-    // auth-mini exposes that API; the callback tests prove safe replacement.
+    // COMPATIBILITY: Auth Mini's public browser SDK has no callback-adoption API.
+    // Remove this direct persisted-state write when it exposes one; the callback
+    // tests prove safe replacement.
     persistentStorage.setItem(
       authMiniSdkStorageKey(context.issuer),
       JSON.stringify(session)
@@ -122,6 +130,10 @@ export function adoptAuthMiniCallback(
   } finally {
     transientStorage.removeItem(LOGIN_CONTEXT_KEY)
   }
+}
+
+function isLoopback(hostname: string) {
+  return ["localhost", "127.0.0.1", "::1"].includes(hostname)
 }
 
 export function readAuthMiniSetupDraft(

@@ -150,6 +150,10 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import { api, apiForm, type AuthSdk } from "@/lib/api"
+import {
+  rateLimitResetExpiryStatus,
+  sortRateLimitResetCreditsByExpiry,
+} from "@/lib/rate-limit-reset-expiry"
 import { responseOutputText } from "@/lib/response-output"
 import {
   clearAuthMiniSetupDraft,
@@ -554,6 +558,10 @@ const copy = {
       "每次兑换会消耗一项已获得的额度，并只能重置当前符合条件的 ChatGPT / Codex 限额窗口。",
     rateLimitResetGrantedAt: "获得时间",
     rateLimitResetExpiresAt: "失效时间",
+    rateLimitResetNextExpiresAt: "最近到期",
+    rateLimitResetExpiresIn: "剩余",
+    rateLimitResetNoExpiry: "无到期时间",
+    rateLimitResetExpired: "已过期",
     rateLimitResetUnknownCredit:
       "服务端未提供逐项详情；确认后将使用下一项可用机会。",
     rateLimitResetUse: "使用此机会",
@@ -1018,6 +1026,10 @@ const copy = {
       "Redeeming a credit consumes one earned entitlement and only resets an eligible ChatGPT / Codex rate-limit window.",
     rateLimitResetGrantedAt: "Granted",
     rateLimitResetExpiresAt: "Expires",
+    rateLimitResetNextExpiresAt: "Next expiry",
+    rateLimitResetExpiresIn: "Left",
+    rateLimitResetNoExpiry: "No expiry",
+    rateLimitResetExpired: "Expired",
     rateLimitResetUnknownCredit:
       "The server did not return item details. Confirmation will use the next available credit.",
     rateLimitResetUse: "Use this credit",
@@ -2881,6 +2893,7 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                     <TableHead>{t.quotaRemaining}</TableHead>
                     <TableHead>{t.resetsIn}</TableHead>
                     <TableHead>{t.rateLimitResetsAvailable}</TableHead>
+                    <TableHead>{t.rateLimitResetNextExpiresAt}</TableHead>
                     <TableHead>{t.status}</TableHead>
                     <TableHead>{t.inflight}</TableHead>
                     <TableHead>{t.recoveryReason}</TableHead>
@@ -2896,6 +2909,9 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                       usage?.rate_limit?.secondary_window
                     const resetEntry = resetData?.providers[provider.id]
                     const resets = resetEntry?.resets
+                    const resetCredits = sortRateLimitResetCreditsByExpiry(
+                      resets?.credits ?? []
+                    )
                     const availableResetCount = Math.max(
                       0,
                       resets?.available_count ?? 0
@@ -2937,6 +2953,21 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                             <Badge variant="secondary">
                               {availableResetCount}
                             </Badge>
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          {resetError || resetEntry?.error ? (
+                            <span
+                              className="text-xs text-muted-foreground"
+                              title={resetEntry?.error || resetError}
+                            >
+                              —
+                            </span>
+                          ) : (
+                            <RateLimitResetExpiry
+                              locale={locale}
+                              credit={resetCredits[0]}
+                            />
                           )}
                         </TableCell>
                         <TableCell>
@@ -3127,6 +3158,12 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
             <AlertDialogDescription>
               {t.rateLimitResetConfirmDescription}
             </AlertDialogDescription>
+            {resetTarget?.credit && (
+              <RateLimitResetExpiry
+                locale={locale}
+                credit={resetTarget.credit}
+              />
+            )}
           </AlertDialogHeader>
           <Definition
             rows={[
@@ -3389,7 +3426,7 @@ function ProviderRateLimitResetsDialog({
   onConsume: (provider: Provider, credit?: ProviderRateLimitResetCredit) => void
 }) {
   const t = copy[locale]
-  const credits = resets?.credits ?? []
+  const credits = sortRateLimitResetCreditsByExpiry(resets?.credits ?? [])
   const availableCount = Math.max(0, resets?.available_count ?? 0)
   return (
     <Dialog open onOpenChange={(next) => !next && onClose()}>
@@ -3434,8 +3471,11 @@ function ProviderRateLimitResetsDialog({
                             </span>
                           </div>
                         </TableCell>
-                        <TableCell className="text-xs tabular-nums">
-                          {formatTime(credit.expires_at ?? undefined, locale)}
+                        <TableCell>
+                          <RateLimitResetExpiry
+                            locale={locale}
+                            credit={credit}
+                          />
                         </TableCell>
                         <TableCell className="text-right">
                           <Button
@@ -3482,6 +3522,43 @@ function ProviderRateLimitResetsDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  )
+}
+
+function RateLimitResetExpiry({
+  locale,
+  credit,
+}: {
+  locale: Locale
+  credit?: ProviderRateLimitResetCredit
+}) {
+  const t = copy[locale]
+  if (!credit) return <span className="text-xs text-muted-foreground">—</span>
+
+  const expiresAt = credit.expires_at
+  if (typeof expiresAt !== "number")
+    return (
+      <span className="text-xs text-muted-foreground">
+        {t.rateLimitResetNoExpiry}
+      </span>
+    )
+  const status = rateLimitResetExpiryStatus(expiresAt)
+
+  return (
+    <div className="flex flex-col items-start gap-1 text-xs tabular-nums">
+      <span>{formatTime(expiresAt, locale)}</span>
+      <Badge
+        variant={
+          status === "expires-soon" || status === "expired"
+            ? "destructive"
+            : "secondary"
+        }
+      >
+        {status === "expired"
+          ? t.rateLimitResetExpired
+          : `${t.rateLimitResetExpiresIn} ${formatRateLimitResetTimeRemaining(expiresAt, locale)}`}
+      </Badge>
+    </div>
   )
 }
 
@@ -6446,6 +6523,15 @@ function formatTime(timestamp: number | undefined, locale: Locale) {
         timeStyle: "medium",
       }).format(timestamp * 1000)
     : "—"
+}
+function formatRateLimitResetTimeRemaining(timestamp: number, locale: Locale) {
+  const seconds = Math.max(0, timestamp - Math.floor(Date.now() / 1000))
+  const days = Math.floor(seconds / 86400)
+  const hours = Math.floor((seconds % 86400) / 3600)
+  const minutes = Math.floor((seconds % 3600) / 60)
+  return locale === "zh"
+    ? `${days ? `${days}天` : ""}${hours}小时${minutes}分`
+    : `${days ? `${days}d ` : ""}${hours}h ${minutes}m`
 }
 function formatPercent(value: number, locale: Locale) {
   return new Intl.NumberFormat(locale === "zh" ? "zh-CN" : "en-US", {

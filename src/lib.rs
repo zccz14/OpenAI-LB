@@ -119,6 +119,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/providers/usage", get(api::list_provider_usage))
         .route(
+            "/api/providers/rate-limit-resets",
+            get(api::list_provider_rate_limit_resets),
+        )
+        .route(
             "/api/providers/{id}",
             get(api::read_provider_tokens)
                 .put(api::replace_provider_tokens)
@@ -126,6 +130,10 @@ pub fn router(state: AppState) -> Router {
                 .delete(api::delete_provider),
         )
         .route("/api/providers/{id}/test", post(api::test_provider))
+        .route(
+            "/api/providers/{id}/rate-limit-resets/consume",
+            post(api::consume_provider_rate_limit_reset),
+        )
         .route(
             "/api/providers/{id}/grants",
             get(api::list_provider_grants).post(api::create_provider_grant),

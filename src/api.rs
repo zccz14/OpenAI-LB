@@ -605,6 +605,34 @@ pub async fn list_provider_usage(
     Ok(Json(json!({"providers": providers})))
 }
 
+pub async fn list_provider_rate_limit_resets(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let user = browser_identity(&state, &headers).await?;
+    let ids = if is_admin(&user) {
+        sqlx::query_scalar::<_, String>("SELECT id FROM providers ORDER BY created_at DESC")
+            .fetch_all(&state.db)
+            .await?
+    } else {
+        sqlx::query_scalar::<_, String>(
+            "SELECT id FROM providers WHERE owner_id=? ORDER BY created_at DESC",
+        )
+        .bind(&user.id)
+        .fetch_all(&state.db)
+        .await?
+    };
+    let mut providers = serde_json::Map::new();
+    for id in ids {
+        let value = match provider_rate_limit_resets_value(&state, &id).await {
+            Ok(resets) => json!({"resets": resets}),
+            Err(error) => json!({"error": error.message()}),
+        };
+        providers.insert(id, value);
+    }
+    Ok(Json(json!({"providers": providers})))
+}
+
 pub async fn test_provider(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -658,6 +686,115 @@ async fn provider_usage_value(state: &AppState, id: &str) -> Result<Value, AppEr
         .await
         .map_err(|_| AppError::upstream(502, "provider Usage API returned invalid JSON"))?;
     Ok(usage)
+}
+
+async fn provider_rate_limit_resets_value(state: &AppState, id: &str) -> Result<Value, AppError> {
+    let row: (String, String) =
+        sqlx::query_as("SELECT access_token,account_id FROM providers WHERE id=?")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or_else(|| AppError::not_found("provider not found"))?;
+    let mut resets_url = url::Url::parse(&state.config.load().upstream_base)?;
+    resets_url.set_path("/backend-api/wham/rate-limit-reset-credits");
+    resets_url.set_query(None);
+    let response = state
+        .client
+        .get(resets_url)
+        .bearer_auth(row.0)
+        .header("chatgpt-account-id", row.1)
+        .send()
+        .await
+        .map_err(|_| AppError::upstream(502, "provider rate-limit reset API request failed"))?;
+    if !response.status().is_success() {
+        return Err(AppError::upstream(
+            502,
+            format!(
+                "provider rate-limit reset API returned {}",
+                response.status()
+            ),
+        ));
+    }
+    response
+        .json::<Value>()
+        .await
+        .map_err(|_| AppError::upstream(502, "provider rate-limit reset API returned invalid JSON"))
+}
+
+#[derive(Deserialize)]
+pub struct ConsumeProviderRateLimitReset {
+    credit_id: Option<String>,
+    idempotency_key: String,
+}
+
+pub async fn consume_provider_rate_limit_reset(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<ConsumeProviderRateLimitReset>,
+) -> Result<Json<Value>, AppError> {
+    let user = browser_identity(&state, &headers).await?;
+    require_provider_manager(&state, &user, &id).await?;
+    let result = consume_provider_rate_limit_reset_value(&state, &id, input).await;
+    let action = if result.is_ok() {
+        "provider.rate_limit_reset.consume"
+    } else {
+        "provider.rate_limit_reset.consume.failed"
+    };
+    write_admin_audit(&state, &user.id, action, Some(&id), &peer.ip().to_string()).await?;
+    result.map(Json)
+}
+
+async fn consume_provider_rate_limit_reset_value(
+    state: &AppState,
+    id: &str,
+    input: ConsumeProviderRateLimitReset,
+) -> Result<Value, AppError> {
+    let idempotency_key = input.idempotency_key.trim();
+    if Uuid::parse_str(idempotency_key).is_err() {
+        return Err(AppError::bad_request("idempotency_key must be a UUID"));
+    }
+    let credit_id = input.credit_id.map(|credit_id| credit_id.trim().to_owned());
+    if credit_id.as_deref().is_some_and(str::is_empty) {
+        return Err(AppError::bad_request("credit_id must not be empty"));
+    }
+    let row: (String, String) =
+        sqlx::query_as("SELECT access_token,account_id FROM providers WHERE id=?")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or_else(|| AppError::not_found("provider not found"))?;
+    let mut consume_url = url::Url::parse(&state.config.load().upstream_base)?;
+    consume_url.set_path("/backend-api/wham/rate-limit-reset-credits/consume");
+    consume_url.set_query(None);
+    let mut body = serde_json::Map::new();
+    body.insert("idempotency_key".to_owned(), json!(idempotency_key));
+    if let Some(credit_id) = credit_id {
+        body.insert("credit_id".to_owned(), json!(credit_id));
+    }
+    let response = state
+        .client
+        .post(consume_url)
+        .bearer_auth(row.0)
+        .header("chatgpt-account-id", row.1)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|_| AppError::upstream(502, "provider rate-limit reset API request failed"))?;
+    if !response.status().is_success() {
+        return Err(AppError::upstream(
+            502,
+            format!(
+                "provider rate-limit reset API returned {}",
+                response.status()
+            ),
+        ));
+    }
+    response
+        .json::<Value>()
+        .await
+        .map_err(|_| AppError::upstream(502, "provider rate-limit reset API returned invalid JSON"))
 }
 
 pub async fn delete_provider(
@@ -1596,7 +1733,7 @@ mod tests {
         body::Body,
         http::{Method, Request, StatusCode},
         response::{IntoResponse, Response},
-        routing::get,
+        routing::{get, post},
     };
     use ed25519_dalek::{Signer, SigningKey};
     use http_body_util::BodyExt;
@@ -2111,6 +2248,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_rate_limit_resets_use_server_side_credentials_and_idempotency() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        let read_sender = sender.clone();
+        let credits = Router::new()
+            .route(
+                "/backend-api/wham/rate-limit-reset-credits",
+                get(move |headers: HeaderMap| {
+                    let sender = read_sender.clone();
+                    async move {
+                        sender.send((headers, None)).await.unwrap();
+                        Json(json!({
+                            "available_count": 1,
+                            "credits": [{
+                                "id": "credit-1",
+                                "reset_type": "codex_rate_limits",
+                                "status": "available",
+                                "granted_at": 1,
+                                "expires_at": null,
+                                "title": "Rate-limit reset",
+                                "description": "Reset Codex limits"
+                            }]
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/backend-api/wham/rate-limit-reset-credits/consume",
+                post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                    let sender = sender.clone();
+                    async move {
+                        sender.send((headers, Some(body))).await.unwrap();
+                        Json(json!({"outcome":"reset"}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, credits).await.unwrap() });
+        let state = crate::test_state_with_upstream(
+            "http://token.invalid",
+            &format!("http://{address}/backend-api/codex"),
+        )
+        .await;
+        let now = chrono::Utc::now().timestamp();
+        sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,created_at,updated_at) VALUES('provider','Provider','account','access','refresh',?,?)")
+            .bind(now).bind(now).execute(&state.db).await.unwrap();
+
+        let listed = provider_rate_limit_resets_value(&state, "provider")
+            .await
+            .unwrap();
+        assert_eq!(listed["available_count"], 1);
+        assert_eq!(listed["credits"][0]["id"], "credit-1");
+
+        let idempotency_key = Uuid::new_v4().to_string();
+        let consumed = consume_provider_rate_limit_reset_value(
+            &state,
+            "provider",
+            ConsumeProviderRateLimitReset {
+                credit_id: Some("credit-1".to_owned()),
+                idempotency_key: idempotency_key.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(consumed["outcome"], "reset");
+
+        let (read_headers, read_body) = receiver.recv().await.unwrap();
+        assert!(read_body.is_none());
+        assert_eq!(read_headers[header::AUTHORIZATION], "Bearer access");
+        assert_eq!(read_headers["chatgpt-account-id"], "account");
+        let (consume_headers, consume_body) = receiver.recv().await.unwrap();
+        assert_eq!(consume_headers[header::AUTHORIZATION], "Bearer access");
+        assert_eq!(consume_headers["chatgpt-account-id"], "account");
+        assert_eq!(
+            consume_body,
+            Some(json!({
+                "credit_id": "credit-1",
+                "idempotency_key": idempotency_key
+            }))
+        );
+    }
+
+    #[tokio::test]
     async fn provider_routes_enforce_roles_audit_actions_and_preserve_call_history() {
         let signing = SigningKey::from_bytes(&[31_u8; 32]);
         let x = URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes());
@@ -2130,6 +2350,19 @@ mod tests {
                     }
                     Json(json!({"email":"ops@example.com","plan_type":"team","rate_limit":{"primary_window":{"used_percent":10,"reset_after_seconds":1800}}})).into_response()
                 }),
+            )
+            .route(
+                "/backend-api/wham/rate-limit-reset-credits",
+                get(|| async {
+                    Json(json!({
+                        "available_count": 1,
+                        "credits": [{"id":"credit-1","title":"Rate-limit reset"}]
+                    }))
+                }),
+            )
+            .route(
+                "/backend-api/wham/rate-limit-reset-credits/consume",
+                post(|| async { Json(json!({"outcome":"reset"})) }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -2444,6 +2677,35 @@ mod tests {
                 usage_value.pointer(&format!("/providers/{provider_id}/usage/email")),
                 Some(&json!("ops@example.com"))
             );
+            let resets = provider_request(
+                &state,
+                Method::GET,
+                "/api/providers/rate-limit-resets",
+                &browser_token,
+                None,
+            )
+            .await;
+            assert_eq!(resets.status(), StatusCode::OK);
+            let resets: Value =
+                serde_json::from_slice(&resets.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(
+                resets.pointer(&format!("/providers/{provider_id}/resets/available_count")),
+                Some(&json!(1))
+            );
+            let consumed = provider_request(
+                &state,
+                Method::POST,
+                &format!("/api/providers/{provider_id}/rate-limit-resets/consume"),
+                &browser_token,
+                Some(json!({"credit_id":"credit-1","idempotency_key":Uuid::new_v4()})),
+            )
+            .await;
+            assert_eq!(consumed.status(), StatusCode::OK);
+            let consumed: Value =
+                serde_json::from_slice(&consumed.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(consumed["outcome"], "reset");
             let delete = provider_request(
                 &state,
                 Method::DELETE,
@@ -2570,6 +2832,7 @@ mod tests {
                 ),
             ),
             (Method::POST, "/api/providers/tenant-provider/test", None),
+            (Method::GET, "/api/providers/rate-limit-resets", None),
             (Method::DELETE, "/api/providers/tenant-provider", None),
         ] {
             let response = provider_request(&state, method, path, &tenant_token, body).await;
@@ -2623,6 +2886,7 @@ mod tests {
             ("provider.test.failed", 1),
             ("provider.grant.create", 1),
             ("provider.grant.delete", 1),
+            ("provider.rate_limit_reset.consume", 2),
         ] {
             let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_audit WHERE action=?")
                 .bind(action)

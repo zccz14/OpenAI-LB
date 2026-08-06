@@ -148,11 +148,18 @@ import {
 } from "@/components/ui/table"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Toaster } from "@/components/ui/sonner"
-import { TooltipProvider } from "@/components/ui/tooltip"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
 import { api, apiForm, type AuthSdk } from "@/lib/api"
 import {
   rateLimitResetExpiryStatus,
+  rateLimitResetTimestampSeconds,
   sortRateLimitResetCreditsByExpiry,
+  type RateLimitResetTimestamp,
 } from "@/lib/rate-limit-reset-expiry"
 import { responseOutputText } from "@/lib/response-output"
 import {
@@ -269,8 +276,8 @@ type ProviderRateLimitResetCredit = {
   id: string
   reset_type?: string
   status?: string
-  granted_at?: number
-  expires_at?: number | null
+  granted_at?: RateLimitResetTimestamp
+  expires_at?: RateLimitResetTimestamp
   title?: string | null
   description?: string | null
 }
@@ -558,9 +565,9 @@ const copy = {
       "每次兑换会消耗一项已获得的额度，并只能重置当前符合条件的 ChatGPT / Codex 限额窗口。",
     rateLimitResetGrantedAt: "获得时间",
     rateLimitResetExpiresAt: "失效时间",
-    rateLimitResetNextExpiresAt: "最近到期",
+    rateLimitResetNextExpiresAt: "重置机会倒计时",
     rateLimitResetExpiresIn: "剩余",
-    rateLimitResetNoExpiry: "无到期时间",
+    rateLimitResetNoExpiry: "未提供到期时间",
     rateLimitResetExpired: "已过期",
     rateLimitResetUnknownCredit:
       "服务端未提供逐项详情；确认后将使用下一项可用机会。",
@@ -1026,9 +1033,9 @@ const copy = {
       "Redeeming a credit consumes one earned entitlement and only resets an eligible ChatGPT / Codex rate-limit window.",
     rateLimitResetGrantedAt: "Granted",
     rateLimitResetExpiresAt: "Expires",
-    rateLimitResetNextExpiresAt: "Next expiry",
+    rateLimitResetNextExpiresAt: "Credit expirations",
     rateLimitResetExpiresIn: "Left",
-    rateLimitResetNoExpiry: "No expiry",
+    rateLimitResetNoExpiry: "Expiry unavailable",
     rateLimitResetExpired: "Expired",
     rateLimitResetUnknownCredit:
       "The server did not return item details. Confirmation will use the next available credit.",
@@ -2964,9 +2971,9 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                               —
                             </span>
                           ) : (
-                            <RateLimitResetExpiry
+                            <RateLimitResetExpiries
                               locale={locale}
-                              credit={resetCredits[0]}
+                              credits={resetCredits}
                             />
                           )}
                         </TableCell>
@@ -3535,29 +3542,56 @@ function RateLimitResetExpiry({
   const t = copy[locale]
   if (!credit) return <span className="text-xs text-muted-foreground">—</span>
 
-  const expiresAt = credit.expires_at
-  if (typeof expiresAt !== "number")
+  const expiresAt = rateLimitResetTimestampSeconds(credit.expires_at)
+  if (expiresAt === undefined)
     return (
       <span className="text-xs text-muted-foreground">
         {t.rateLimitResetNoExpiry}
       </span>
     )
   const status = rateLimitResetExpiryStatus(expiresAt)
+  const exactTime = formatRateLimitResetExpiryTime(expiresAt, locale)
 
   return (
-    <div className="flex flex-col items-start gap-1 text-xs tabular-nums">
-      <span>{formatTime(expiresAt, locale)}</span>
-      <Badge
-        variant={
-          status === "expires-soon" || status === "expired"
-            ? "destructive"
-            : "secondary"
-        }
+    <Tooltip>
+      <TooltipTrigger
+        aria-label={`${t.rateLimitResetExpiresAt}: ${exactTime}`}
+        className="inline-flex cursor-help rounded-sm bg-transparent p-0 text-inherit outline-none focus-visible:ring-3 focus-visible:ring-ring"
       >
-        {status === "expired"
-          ? t.rateLimitResetExpired
-          : `${t.rateLimitResetExpiresIn} ${formatRateLimitResetTimeRemaining(expiresAt, locale)}`}
-      </Badge>
+        <Badge
+          variant={
+            status === "expires-soon" || status === "expired"
+              ? "destructive"
+              : "secondary"
+          }
+        >
+          {status === "expired"
+            ? t.rateLimitResetExpired
+            : `${t.rateLimitResetExpiresIn} ${formatRateLimitResetTimeRemaining(expiresAt, locale)}`}
+        </Badge>
+      </TooltipTrigger>
+      <TooltipContent>
+        {t.rateLimitResetExpiresAt}: {exactTime}
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+function RateLimitResetExpiries({
+  locale,
+  credits,
+}: {
+  locale: Locale
+  credits: ProviderRateLimitResetCredit[]
+}) {
+  if (!credits.length)
+    return <span className="text-xs text-muted-foreground">—</span>
+
+  return (
+    <div className="flex min-w-28 flex-col items-start gap-1">
+      {credits.map((credit) => (
+        <RateLimitResetExpiry key={credit.id} locale={locale} credit={credit} />
+      ))}
     </div>
   )
 }
@@ -6516,13 +6550,14 @@ function message(cause: unknown, t = currentMessages()) {
 function isAbortError(cause: unknown) {
   return cause instanceof DOMException && cause.name === "AbortError"
 }
-function formatTime(timestamp: number | undefined, locale: Locale) {
-  return timestamp
-    ? new Intl.DateTimeFormat(locale === "zh" ? "zh-CN" : "en-US", {
+function formatTime(timestamp: RateLimitResetTimestamp, locale: Locale) {
+  const seconds = rateLimitResetTimestampSeconds(timestamp)
+  return seconds === undefined
+    ? "—"
+    : new Intl.DateTimeFormat(locale === "zh" ? "zh-CN" : "en-US", {
         dateStyle: "short",
         timeStyle: "medium",
-      }).format(timestamp * 1000)
-    : "—"
+      }).format(seconds * 1000)
 }
 function formatRateLimitResetTimeRemaining(timestamp: number, locale: Locale) {
   const seconds = Math.max(0, timestamp - Math.floor(Date.now() / 1000))
@@ -6532,6 +6567,21 @@ function formatRateLimitResetTimeRemaining(timestamp: number, locale: Locale) {
   return locale === "zh"
     ? `${days ? `${days}天` : ""}${hours}小时${minutes}分`
     : `${days ? `${days}d ` : ""}${hours}h ${minutes}m`
+}
+function formatRateLimitResetExpiryTime(
+  timestamp: number,
+  locale: Locale
+) {
+  return new Intl.DateTimeFormat(locale === "zh" ? "zh-CN" : "en-US", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZone: "Asia/Shanghai",
+    timeZoneName: "short",
+  }).format(timestamp * 1000)
 }
 function formatPercent(value: number, locale: Locale) {
   return new Intl.NumberFormat(locale === "zh" ? "zh-CN" : "en-US", {

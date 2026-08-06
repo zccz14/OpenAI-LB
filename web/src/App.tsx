@@ -777,7 +777,7 @@ const copy = {
     setupIssuer: "Auth Mini issuer",
     setupIssuerHelp:
       "填写品牌提供的 Auth Mini HTTPS 地址。OpenAI-LB 只连接该实例，不会部署或管理它。",
-    setupAudience: "JWT audience（可选）",
+    setupAudience: "JWT audience",
     connectAuth: "连接 Auth Mini",
     changeAuth: "更换实例",
     setupLogin: "验证 root 身份",
@@ -1259,7 +1259,7 @@ const copy = {
     setupIssuer: "Auth Mini issuer",
     setupIssuerHelp:
       "Enter the Auth Mini HTTPS URL supplied by the brand. OpenAI-LB connects to it; it does not deploy or manage it.",
-    setupAudience: "JWT audience (optional)",
+    setupAudience: "JWT audience",
     connectAuth: "Connect Auth Mini",
     changeAuth: "Change instance",
     setupLogin: "Verify the root identity",
@@ -1455,7 +1455,9 @@ function Setup({
   const t = copy[locale]
   const [setupDraft] = useState(() => readAuthMiniSetupDraft())
   const [issuer, setIssuer] = useState(setupDraft?.issuer ?? "")
-  const [audience, setAudience] = useState(setupDraft?.audience ?? "")
+  const [audience, setAudience] = useState(
+    setupDraft?.audience ?? window.location.hostname.replace(/^\[|\]$/g, "")
+  )
   const [issuerError, setIssuerError] = useState("")
   const [sdk, setSdk] = useState<AuthSdk | null>(() =>
     setupDraft ? createBrowserSdk(setupDraft.issuer) : null
@@ -1492,7 +1494,7 @@ function Setup({
         method: "POST",
         body: JSON.stringify({
           auth_issuer: issuer.trim(),
-          auth_audience: audience.trim() || null,
+          auth_audience: audience.trim(),
         }),
       })
       clearAuthMiniSetupDraft()
@@ -1593,6 +1595,8 @@ function Setup({
                         id="setup-audience"
                         value={audience}
                         onChange={(event) => setAudience(event.target.value)}
+                        placeholder={window.location.hostname}
+                        required
                       />
                     </Field>
                     <Button type="submit" disabled={!issuer.trim()}>

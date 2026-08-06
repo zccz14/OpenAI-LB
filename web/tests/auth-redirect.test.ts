@@ -34,6 +34,17 @@ test("builds the hosted Auth Mini login URL", () => {
   )
 })
 
+test("sets the required audience for a loopback callback", () => {
+  assert.equal(
+    buildAuthMiniLoginUrl(
+      "http://127.0.0.1:7777",
+      "http://127.0.0.1:8080/",
+      "state-1"
+    ),
+    "http://127.0.0.1:7777/web/#/login?redirect_uri=http%3A%2F%2F127.0.0.1%3A8080%2F&state=state-1&aud=127.0.0.1"
+  )
+})
+
 test("accepts HTTPS and localhost issuers only", () => {
   assert.equal(
     normalizeAuthMiniIssuer("https://auth.ntnl.io/"),

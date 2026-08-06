@@ -1,11 +1,8 @@
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::sync::Arc;
 
-use axum::http::{HeaderMap, header};
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
-use serde::{Deserialize, Serialize};
+use auth_mini_axum::{AuthMiniError, AuthMiniVerifier, JwksCachePolicy};
+use axum::http::HeaderMap;
+use serde::Serialize;
 use sqlx::{Row, SqlitePool};
 use tokio::sync::RwLock;
 
@@ -30,194 +27,81 @@ pub struct ApiIdentity {
 #[derive(Clone, Debug)]
 pub struct VerifiedIdentity {
     pub id: String,
-    pub email: Option<String>,
-    pub name: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Claims {
-    sub: String,
-    iss: String,
-    exp: usize,
-    #[serde(default)]
-    email: Option<String>,
-    #[serde(default, alias = "display_name")]
-    name: Option<String>,
-    typ: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct Jwks {
-    keys: Vec<EdJwk>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct EdJwk {
-    kid: String,
-    x: String,
-}
-
-#[derive(Default)]
-struct JwksCache {
-    fetched_at: Option<Instant>,
-    keys: Vec<EdJwk>,
-}
-
-#[derive(Clone)]
-pub struct AuthVerifier {
-    issuer: String,
-    audience: Option<String>,
-    client: reqwest::Client,
-    cache: Arc<RwLock<JwksCache>>,
-}
-
-impl AuthVerifier {
-    pub fn new(issuer: String, audience: Option<String>, client: reqwest::Client) -> Self {
-        Self {
-            issuer,
-            audience,
-            client,
-            cache: Arc::new(RwLock::new(JwksCache::default())),
-        }
-    }
-
-    async fn verify(&self, token: &str) -> Result<Claims, AppError> {
-        let header =
-            decode_header(token).map_err(|_| AppError::unauthorized("invalid bearer token"))?;
-        if header.alg != Algorithm::EdDSA {
-            return Err(AppError::unauthorized("unsupported token algorithm"));
-        }
-        let kid = header
-            .kid
-            .ok_or_else(|| AppError::unauthorized("token is missing kid"))?;
-        let key = match self.fresh_cached_key(&kid).await {
-            Some(key) => key,
-            None => {
-                let stale_key = self.cached_key(&kid).await;
-                match self.refresh().await {
-                    Ok(()) => self
-                        .cached_key(&kid)
-                        .await
-                        .ok_or_else(|| AppError::unauthorized("unknown signing key"))?,
-                    // RECOVERY: When Auth Mini is temporarily unavailable, existing sessions can
-                    // continue only if this process already has the token's signing key. New or
-                    // rotated keys still fail closed until the issuer is reachable again.
-                    Err(error) => stale_key.ok_or(error)?,
-                }
-            }
-        };
-        let mut validation = Validation::new(Algorithm::EdDSA);
-        validation.leeway = 0;
-        validation.set_issuer(&[&self.issuer]);
-        if let Some(audience) = &self.audience {
-            validation.set_audience(&[audience]);
-        } else {
-            validation.validate_aud = false;
-        }
-        let decoding_key = DecodingKey::from_ed_components(&key.x)
-            .map_err(|_| AppError::unauthorized("invalid signing key"))?;
-        let claims = decode::<Claims>(token, &decoding_key, &validation)
-            .map_err(|_| AppError::unauthorized("invalid or expired bearer token"))?
-            .claims;
-        if claims.iss != self.issuer
-            || claims.typ != "access"
-            || claims.sub.trim().is_empty()
-            || claims.exp == 0
-        {
-            return Err(AppError::unauthorized("invalid access token claims"));
-        }
-        Ok(claims)
-    }
-
-    async fn fresh_cached_key(&self, kid: &str) -> Option<EdJwk> {
-        let cache = self.cache.read().await;
-        cache
-            .fetched_at
-            .is_some_and(|at| at.elapsed() < Duration::from_secs(300))
-            .then(|| cache.keys.iter().find(|key| key.kid == kid).cloned())
-            .flatten()
-    }
-
-    async fn cached_key(&self, kid: &str) -> Option<EdJwk> {
-        self.cache
-            .read()
-            .await
-            .keys
-            .iter()
-            .find(|key| key.kid == kid)
-            .cloned()
-    }
-
-    async fn refresh(&self) -> Result<(), AppError> {
-        let jwks = self
-            .client
-            .get(format!("{}/jwks", self.issuer))
-            .header(header::ACCEPT_ENCODING, "identity")
-            .send()
-            .await
-            .map_err(jwks_unavailable)?
-            .error_for_status()
-            .map_err(jwks_unavailable)?
-            .json::<Jwks>()
-            .await
-            .map_err(jwks_unavailable)?;
-        *self.cache.write().await = JwksCache {
-            fetched_at: Some(Instant::now()),
-            keys: jwks.keys,
-        };
-        Ok(())
-    }
-}
-
-fn jwks_unavailable(error: reqwest::Error) -> AppError {
-    tracing::warn!(%error, "Auth Mini JWKS refresh failed");
-    AppError::unavailable("Auth Mini JWKS is unavailable")
 }
 
 #[derive(Clone)]
 pub struct AuthManager {
-    client: reqwest::Client,
-    verifier: Arc<RwLock<Option<AuthVerifier>>>,
+    verifier: Arc<RwLock<Option<AuthMiniVerifier>>>,
 }
 
 impl AuthManager {
-    pub fn new(issuer: Option<String>, audience: Option<String>, client: reqwest::Client) -> Self {
-        let verifier = issuer.map(|issuer| AuthVerifier::new(issuer, audience, client.clone()));
-        Self {
-            client,
+    pub async fn new(issuer: Option<String>, audience: Option<String>) -> anyhow::Result<Self> {
+        let verifier = match (issuer, audience) {
+            (None, None) => None,
+            (Some(issuer), Some(audience)) => Some(create_verifier(&issuer, audience).await?),
+            _ => anyhow::bail!("Auth Mini issuer and audience must be configured together"),
+        };
+        Ok(Self {
             verifier: Arc::new(RwLock::new(verifier)),
-        }
+        })
     }
 
-    pub async fn configure(&self, issuer: String, audience: Option<String>) {
-        *self.verifier.write().await =
-            Some(AuthVerifier::new(issuer, audience, self.client.clone()));
+    #[cfg(test)]
+    pub async fn configure(&self, issuer: String, audience: String) -> Result<(), AppError> {
+        self.install(
+            create_verifier(&issuer, audience)
+                .await
+                .map_err(auth_error)?,
+        )
+        .await;
+        Ok(())
+    }
+
+    pub async fn install(&self, verifier: AuthMiniVerifier) {
+        *self.verifier.write().await = Some(verifier);
     }
 
     pub async fn verify_candidate(
         &self,
         issuer: String,
-        audience: Option<String>,
+        audience: String,
         token: &str,
-    ) -> Result<VerifiedIdentity, AppError> {
-        let claims = AuthVerifier::new(issuer, audience, self.client.clone())
-            .verify(token)
-            .await?;
-        Ok(VerifiedIdentity {
-            id: claims.sub,
-            email: claims.email,
-            name: claims.name,
-        })
+    ) -> Result<(VerifiedIdentity, AuthMiniVerifier), AppError> {
+        let verifier = create_verifier(&issuer, audience)
+            .await
+            .map_err(auth_error)?;
+        let principal = verifier.verify(token).await.map_err(auth_error)?;
+        Ok((
+            VerifiedIdentity {
+                id: principal.subject,
+            },
+            verifier,
+        ))
     }
 
-    async fn verify(&self, token: &str) -> Result<Claims, AppError> {
+    async fn verify(&self, token: &str) -> Result<String, AppError> {
         let verifier = self
             .verifier
             .read()
             .await
             .clone()
             .ok_or_else(|| AppError::unavailable("OpenAI-LB setup is not complete"))?;
-        verifier.verify(token).await
+        Ok(verifier.verify(token).await.map_err(auth_error)?.subject)
+    }
+}
+
+async fn create_verifier(
+    issuer: &str,
+    audience: String,
+) -> Result<AuthMiniVerifier, auth_mini_axum::AuthMiniError> {
+    AuthMiniVerifier::from_issuer(issuer, audience, JwksCachePolicy::default()).await
+}
+
+fn auth_error(error: AuthMiniError) -> AppError {
+    match error {
+        AuthMiniError::JwksUnavailable => AppError::unavailable("Auth Mini JWKS is unavailable"),
+        AuthMiniError::InvalidIssuer => AppError::bad_request("Auth Mini issuer is not valid"),
+        AuthMiniError::InvalidToken => AppError::unauthorized("invalid or expired bearer token"),
     }
 }
 
@@ -226,25 +110,25 @@ pub async fn browser_identity(
     headers: &HeaderMap,
 ) -> Result<UserIdentity, AppError> {
     let token = bearer(headers)?;
-    let claims = state.auth.verify(token).await?;
-    upsert_user(&state.db, &claims).await
+    let user_id = state.auth.verify(token).await?;
+    upsert_user(&state.db, &user_id).await
 }
 
-async fn upsert_user(pool: &SqlitePool, claims: &Claims) -> Result<UserIdentity, AppError> {
+async fn upsert_user(pool: &SqlitePool, user_id: &str) -> Result<UserIdentity, AppError> {
     let now = chrono::Utc::now().timestamp();
-    sqlx::query("INSERT INTO users(id,email,display_name,role,created_at) VALUES(?,?,?,'user',?) ON CONFLICT(id) DO UPDATE SET email=excluded.email,display_name=CASE WHEN users.display_name_overridden=0 THEN excluded.display_name ELSE users.display_name END")
-        .bind(&claims.sub)
-        .bind(&claims.email)
-        .bind(&claims.name)
-        .bind(now)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO users(id,role,created_at) VALUES(?,'user',?) ON CONFLICT(id) DO NOTHING",
+    )
+    .bind(user_id)
+    .bind(now)
+    .execute(pool)
+    .await?;
     let row = sqlx::query("SELECT email,display_name,role FROM users WHERE id=?")
-        .bind(&claims.sub)
+        .bind(user_id)
         .fetch_one(pool)
         .await?;
     Ok(UserIdentity {
-        id: claims.sub.clone(),
+        id: user_id.to_owned(),
         email: row.get(0),
         name: row.get(1),
         role: row.get(2),
@@ -259,18 +143,17 @@ pub async fn api_identity(state: &AppState, headers: &HeaderMap) -> Result<ApiId
     let row = sqlx::query(
         "SELECT k.id,k.user_id,u.role,u.provider_access,k.request_archive FROM consumers k JOIN users u ON u.id=k.user_id WHERE k.secret_hash=? AND k.revoked_at IS NULL",
     )
-            .bind(consumer_secret_hash(secret))
-            .fetch_optional(&state.db)
-            .await?
-            .ok_or_else(|| AppError::unauthorized("invalid consumer credential"))?;
+    .bind(consumer_secret_hash(secret))
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(|| AppError::unauthorized("invalid consumer credential"))?;
     let role: String = row.get(2);
-    let identity = ApiIdentity {
+    Ok(ApiIdentity {
         consumer_id: row.get(0),
         user_id: row.get(1),
         request_archive: row.get::<i64, _>(4) != 0,
         all_providers: role != "user" || row.get::<i64, _>(3) != 0,
-    };
-    Ok(identity)
+    })
 }
 
 pub fn require_admin(identity: &UserIdentity) -> Result<(), AppError> {
@@ -300,15 +183,18 @@ pub(crate) fn bearer(headers: &HeaderMap) -> Result<&str, AppError> {
 
 #[cfg(test)]
 mod tests {
-    use axum::{
-        Json, Router,
-        http::{HeaderMap, HeaderValue, StatusCode},
-        routing::get,
-    };
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    use ed25519_dalek::{Signer, SigningKey};
+    use axum::http::{HeaderMap, HeaderValue};
 
     use super::*;
+
+    #[tokio::test]
+    async fn configured_issuer_requires_an_audience() {
+        assert!(
+            AuthManager::new(Some("https://auth.example.com".to_owned()), None)
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn consumer_auth_accepts_active_hash_and_rejects_revoked_key() {
@@ -401,217 +287,10 @@ mod tests {
         );
     }
 
-    fn claims(sub: &str) -> Claims {
-        Claims {
-            sub: sub.to_owned(),
-            iss: "http://issuer".to_owned(),
-            exp: (chrono::Utc::now().timestamp() + 300) as usize,
-            email: None,
-            name: None,
-            typ: "access".to_owned(),
-        }
-    }
-
     #[tokio::test]
     async fn ordinary_login_never_bootstraps_privilege() {
         let state = crate::test_state("http://token.invalid").await;
-        let ordinary = upsert_user(&state.db, &claims("ordinary")).await.unwrap();
+        let ordinary = upsert_user(&state.db, "ordinary").await.unwrap();
         assert_eq!(ordinary.role, "user");
-    }
-
-    #[tokio::test]
-    async fn administrator_display_name_override_survives_later_logins() {
-        let state = crate::test_state("http://token.invalid").await;
-        let mut identity = claims("ordinary");
-        identity.name = Some("Auth Mini name".to_owned());
-        upsert_user(&state.db, &identity).await.unwrap();
-        sqlx::query(
-            "UPDATE users SET display_name='Operations name', display_name_overridden=1 WHERE id='ordinary'",
-        )
-        .execute(&state.db)
-        .await
-        .unwrap();
-
-        identity.name = Some("Changed in Auth Mini".to_owned());
-        let user = upsert_user(&state.db, &identity).await.unwrap();
-
-        assert_eq!(user.name.as_deref(), Some("Operations name"));
-    }
-
-    fn sign_token(key: &SigningKey, issuer: &str, typ: &str, exp: i64) -> String {
-        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"EdDSA","kid":"test","typ":"JWT"}"#);
-        let payload = URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(&serde_json::json!({
-                "sub":"user-1", "iss":issuer, "typ":typ, "exp":exp
-            }))
-            .unwrap(),
-        );
-        let input = format!("{header}.{payload}");
-        let signature = key.sign(input.as_bytes());
-        format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()))
-    }
-
-    #[tokio::test]
-    async fn ed25519_jwks_verification_fails_closed_on_claims() {
-        let signing = SigningKey::from_bytes(&[7_u8; 32]);
-        let x = URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes());
-        let app = Router::new().route("/jwks", get(move || {
-            let x = x.clone();
-            async move { Json(serde_json::json!({"keys":[{"kid":"test","kty":"OKP","crv":"Ed25519","alg":"EdDSA","use":"sig","x":x}]})) }
-        }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        let issuer = format!("http://{address}");
-        let verifier = AuthVerifier::new(issuer.clone(), None, reqwest::Client::new());
-        let now = chrono::Utc::now().timestamp();
-        assert!(
-            verifier
-                .verify(&sign_token(&signing, &issuer, "access", now + 60))
-                .await
-                .is_ok()
-        );
-        assert!(
-            verifier
-                .verify(&sign_token(&signing, &issuer, "refresh", now + 60))
-                .await
-                .is_err()
-        );
-        assert!(
-            verifier
-                .verify(&sign_token(&signing, "http://wrong", "access", now + 60))
-                .await
-                .is_err()
-        );
-        assert!(
-            verifier
-                .verify(&sign_token(&signing, &issuer, "access", now - 1))
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn jwks_request_uses_identity_encoding_and_reports_provider_unavailability() {
-        let signing = SigningKey::from_bytes(&[8_u8; 32]);
-        let x = URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes());
-        let app = Router::new().route(
-            "/jwks",
-            get(move |headers: HeaderMap| {
-                let x = x.clone();
-                async move {
-                    assert_eq!(headers.get(header::ACCEPT_ENCODING).unwrap(), "identity");
-                    Json(serde_json::json!({"keys":[{"kid":"test","kty":"OKP","crv":"Ed25519","alg":"EdDSA","use":"sig","x":x}]}))
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        let issuer = format!("http://{address}");
-        let verifier = AuthVerifier::new(issuer.clone(), None, reqwest::Client::new());
-        let token = sign_token(
-            &signing,
-            &issuer,
-            "access",
-            chrono::Utc::now().timestamp() + 60,
-        );
-        assert!(verifier.verify(&token).await.is_ok());
-
-        let unavailable = AuthVerifier::new(
-            "http://127.0.0.1:1".to_owned(),
-            None,
-            reqwest::Client::new(),
-        )
-        .verify(&sign_token(
-            &signing,
-            "http://127.0.0.1:1",
-            "access",
-            chrono::Utc::now().timestamp() + 60,
-        ))
-        .await
-        .unwrap_err();
-        assert_eq!(
-            unavailable.status(),
-            axum::http::StatusCode::SERVICE_UNAVAILABLE
-        );
-        assert_eq!(unavailable.message(), "Auth Mini JWKS is unavailable");
-    }
-
-    #[tokio::test]
-    async fn stale_jwks_key_verifies_when_refresh_fails() {
-        let signing = SigningKey::from_bytes(&[9_u8; 32]);
-        let x = URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes());
-        let app = Router::new().route("/jwks", get(|| async { StatusCode::SERVICE_UNAVAILABLE }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        let issuer = format!("http://{address}");
-        let verifier = AuthVerifier::new(issuer.clone(), None, reqwest::Client::new());
-        *verifier.cache.write().await = JwksCache {
-            fetched_at: Some(Instant::now() - Duration::from_secs(301)),
-            keys: vec![EdJwk {
-                kid: "test".to_owned(),
-                x: x.clone(),
-            }],
-        };
-
-        let token = sign_token(
-            &signing,
-            &issuer,
-            "access",
-            chrono::Utc::now().timestamp() + 60,
-        );
-        assert!(verifier.verify(&token).await.is_ok());
-
-        let cache = verifier.cache.read().await;
-        assert_eq!(cache.keys.len(), 1);
-        assert_eq!(cache.keys[0].x, x);
-    }
-
-    #[tokio::test]
-    async fn successful_refresh_replaces_stale_jwks() {
-        let stale_signing = SigningKey::from_bytes(&[10_u8; 32]);
-        let refreshed_signing = SigningKey::from_bytes(&[11_u8; 32]);
-        let refreshed_x = URL_SAFE_NO_PAD.encode(refreshed_signing.verifying_key().to_bytes());
-        let app = Router::new().route("/jwks", get(move || {
-            let refreshed_x = refreshed_x.clone();
-            async move { Json(serde_json::json!({"keys":[{"kid":"test","kty":"OKP","crv":"Ed25519","alg":"EdDSA","use":"sig","x":refreshed_x}]})) }
-        }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        let issuer = format!("http://{address}");
-        let verifier = AuthVerifier::new(issuer.clone(), None, reqwest::Client::new());
-        *verifier.cache.write().await = JwksCache {
-            fetched_at: Some(Instant::now() - Duration::from_secs(301)),
-            keys: vec![EdJwk {
-                kid: "test".to_owned(),
-                x: URL_SAFE_NO_PAD.encode(stale_signing.verifying_key().to_bytes()),
-            }],
-        };
-
-        let token = sign_token(
-            &refreshed_signing,
-            &issuer,
-            "access",
-            chrono::Utc::now().timestamp() + 60,
-        );
-        assert!(verifier.verify(&token).await.is_ok());
-
-        let cache = verifier.cache.read().await;
-        assert_eq!(cache.keys.len(), 1);
-        assert_eq!(
-            cache.keys[0].x,
-            URL_SAFE_NO_PAD.encode(refreshed_signing.verifying_key().to_bytes())
-        );
     }
 }

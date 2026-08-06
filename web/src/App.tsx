@@ -261,6 +261,32 @@ type ProviderUsage = {
 }
 type ProviderUsageEntry = { usage?: ProviderUsage; error?: string }
 type ProviderUsageResponse = { providers: Record<string, ProviderUsageEntry> }
+type ProviderRateLimitResetCredit = {
+  id: string
+  reset_type?: string
+  status?: string
+  granted_at?: number
+  expires_at?: number | null
+  title?: string | null
+  description?: string | null
+}
+type ProviderRateLimitResets = {
+  available_count?: number
+  credits?: ProviderRateLimitResetCredit[] | null
+}
+type ProviderRateLimitResetEntry = {
+  resets?: ProviderRateLimitResets
+  error?: string
+}
+type ProviderRateLimitResetsResponse = {
+  providers: Record<string, ProviderRateLimitResetEntry>
+}
+type ProviderRateLimitResetResult = { outcome?: string }
+type ProviderRateLimitResetTarget = {
+  provider: Provider
+  credit?: ProviderRateLimitResetCredit
+  idempotencyKey: string
+}
 type ProviderTokenDialogState = {
   provider: Provider
   loading: boolean
@@ -521,6 +547,26 @@ const copy = {
     credits: "Credits",
     rawUsage: "Usage 原始字段",
     usageUnavailable: "Usage API 未返回可识别的额度字段，请查看原始字段。",
+    rateLimitResetsAvailable: "可用重置",
+    viewRateLimitResets: "重置机会",
+    rateLimitResetsTitle: "限额重置机会",
+    rateLimitResetsDescription:
+      "每次兑换会消耗一项已获得的额度，并只能重置当前符合条件的 ChatGPT / Codex 限额窗口。",
+    rateLimitResetGrantedAt: "获得时间",
+    rateLimitResetExpiresAt: "失效时间",
+    rateLimitResetUnknownCredit:
+      "服务端未提供逐项详情；确认后将使用下一项可用机会。",
+    rateLimitResetUse: "使用此机会",
+    rateLimitResetUseNext: "使用下一项机会",
+    rateLimitResetConfirmTitle: "使用限额重置机会？",
+    rateLimitResetConfirmDescription:
+      "此操作将为当前 Provider 消耗一项已获得的重置额度。额度不可恢复。",
+    confirmRateLimitReset: "确认重置",
+    rateLimitResetting: "正在重置…",
+    rateLimitResetSuccess: "限额已重置，当前状态已刷新。",
+    rateLimitResetAlreadyRedeemed: "本次重置已完成，当前状态已刷新。",
+    rateLimitResetNothingToReset: "当前没有符合条件的限额窗口可重置。",
+    rateLimitResetNoCredit: "账户没有可用的重置机会。",
     consumersTitle: "租户消费者",
     consumersDescription:
       "每个 AI App 建议使用一个独立消费者；这样用量、错误和吊销都能按 App 隔离。消费者凭据只在创建后显示一次。",
@@ -965,6 +1011,29 @@ const copy = {
     rawUsage: "Raw Usage fields",
     usageUnavailable:
       "The Usage API returned no recognized quota fields. Review the raw fields below.",
+    rateLimitResetsAvailable: "Resets available",
+    viewRateLimitResets: "Reset credits",
+    rateLimitResetsTitle: "Rate-limit reset credits",
+    rateLimitResetsDescription:
+      "Redeeming a credit consumes one earned entitlement and only resets an eligible ChatGPT / Codex rate-limit window.",
+    rateLimitResetGrantedAt: "Granted",
+    rateLimitResetExpiresAt: "Expires",
+    rateLimitResetUnknownCredit:
+      "The server did not return item details. Confirmation will use the next available credit.",
+    rateLimitResetUse: "Use this credit",
+    rateLimitResetUseNext: "Use next credit",
+    rateLimitResetConfirmTitle: "Use a rate-limit reset credit?",
+    rateLimitResetConfirmDescription:
+      "This consumes one earned reset credit for the current Provider. A consumed credit cannot be restored.",
+    confirmRateLimitReset: "Use reset credit",
+    rateLimitResetting: "Resetting…",
+    rateLimitResetSuccess: "Rate limit reset and current status refreshed.",
+    rateLimitResetAlreadyRedeemed:
+      "This reset was already completed and the current status refreshed.",
+    rateLimitResetNothingToReset:
+      "There is no eligible rate-limit window to reset right now.",
+    rateLimitResetNoCredit:
+      "This account has no earned reset credits available.",
     consumersTitle: "Tenant Consumers",
     consumersDescription:
       "Create one downstream Consumer per AI app so usage, errors, and revocation remain isolated. Secrets are shown once.",
@@ -2618,6 +2687,10 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
   const [tokenDialog, setTokenDialog] =
     useState<ProviderTokenDialogState | null>(null)
   const [testState, setTestState] = useState<ProviderTestState | null>(null)
+  const [resetProvider, setResetProvider] = useState<Provider | null>(null)
+  const [resetTarget, setResetTarget] =
+    useState<ProviderRateLimitResetTarget | null>(null)
+  const [resetPending, setResetPending] = useState(false)
   const [grantProvider, setGrantProvider] = useState<Provider | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<Provider | null>(null)
   const [deletePending, setDeletePending] = useState(false)
@@ -2626,6 +2699,11 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
   const { data, error, loading } = useApiQuery<Provider[]>(sdk, "/api/providers")
   const { data: usageData, error: usageError } =
     useApiQuery<ProviderUsageResponse>(sdk, "/api/providers/usage")
+  const { data: resetData, error: resetError } =
+    useApiQuery<ProviderRateLimitResetsResponse>(
+      sdk,
+      "/api/providers/rate-limit-resets"
+    )
   useEffect(
     () => () => {
       tokenRequest.current?.abort()
@@ -2635,6 +2713,10 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
   )
   function refreshProviders() {
     void queryClient.invalidateQueries({ queryKey: ["/api/providers"] })
+    void queryClient.invalidateQueries({ queryKey: ["/api/providers/usage"] })
+    void queryClient.invalidateQueries({
+      queryKey: ["/api/providers/rate-limit-resets"],
+    })
   }
   async function mutate(id: string, body: object) {
     try {
@@ -2714,6 +2796,53 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
     testRequest.current = null
     setTestState(null)
   }
+  function beginRateLimitReset(
+    provider: Provider,
+    credit?: ProviderRateLimitResetCredit
+  ) {
+    setResetProvider(null)
+    setResetTarget({
+      provider,
+      credit,
+      idempotencyKey: crypto.randomUUID(),
+    })
+  }
+  async function consumeRateLimitReset() {
+    if (!resetTarget || resetPending) return
+    setResetPending(true)
+    try {
+      const result = await api<ProviderRateLimitResetResult>(
+        sdk,
+        `/api/providers/${resetTarget.provider.id}/rate-limit-resets/consume`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            credit_id: resetTarget.credit?.id,
+            idempotency_key: resetTarget.idempotencyKey,
+          }),
+        }
+      )
+      const outcome = result.outcome
+      if (outcome === "nothing_to_reset" || outcome === "nothingToReset") {
+        toast.warning(t.rateLimitResetNothingToReset)
+      } else if (outcome === "no_credit" || outcome === "noCredit") {
+        toast.warning(t.rateLimitResetNoCredit)
+      } else if (
+        outcome === "already_redeemed" ||
+        outcome === "alreadyRedeemed"
+      ) {
+        toast.success(t.rateLimitResetAlreadyRedeemed)
+      } else {
+        toast.success(t.rateLimitResetSuccess)
+      }
+      setResetTarget(null)
+      refreshProviders()
+    } catch (cause) {
+      toast.error(message(cause, t))
+    } finally {
+      setResetPending(false)
+    }
+  }
   if (loading) return <LoadingTable />
   if (error) return <ErrorState message={error} />
   return (
@@ -2751,6 +2880,7 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                     <TableHead>{t.usagePlan}</TableHead>
                     <TableHead>{t.quotaRemaining}</TableHead>
                     <TableHead>{t.resetsIn}</TableHead>
+                    <TableHead>{t.rateLimitResetsAvailable}</TableHead>
                     <TableHead>{t.status}</TableHead>
                     <TableHead>{t.inflight}</TableHead>
                     <TableHead>{t.recoveryReason}</TableHead>
@@ -2764,6 +2894,12 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                     const quota =
                       usage?.rate_limit?.primary_window ??
                       usage?.rate_limit?.secondary_window
+                    const resetEntry = resetData?.providers[provider.id]
+                    const resets = resetEntry?.resets
+                    const availableResetCount = Math.max(
+                      0,
+                      resets?.available_count ?? 0
+                    )
                     return (
                       <TableRow key={provider.id}>
                         <TableCell className="font-medium">
@@ -2790,6 +2926,20 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                           {quotaReset(quota, locale)}
                         </TableCell>
                         <TableCell>
+                          {resetError || resetEntry?.error ? (
+                            <span
+                              className="text-xs text-muted-foreground"
+                              title={resetEntry?.error || resetError}
+                            >
+                              —
+                            </span>
+                          ) : (
+                            <Badge variant="secondary">
+                              {availableResetCount}
+                            </Badge>
+                          )}
+                        </TableCell>
+                        <TableCell>
                           <StatusBadge
                             status={provider.status}
                             locale={locale}
@@ -2806,6 +2956,16 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                         </TableCell>
                         <TableCell>
                           <div className="flex justify-end gap-2">
+                            {availableResetCount > 0 && (
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() => setResetProvider(provider)}
+                              >
+                                <RefreshCwIcon data-icon="inline-start" />
+                                {t.viewRateLimitResets}
+                              </Button>
+                            )}
                             <Button
                               size="sm"
                               variant="outline"
@@ -2911,6 +3071,16 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
         state={testState}
         onClose={closeTest}
       />
+      {resetProvider && (
+        <ProviderRateLimitResetsDialog
+          locale={locale}
+          provider={resetProvider}
+          resets={resetData?.providers[resetProvider.id]?.resets}
+          error={resetData?.providers[resetProvider.id]?.error || resetError}
+          onClose={() => setResetProvider(null)}
+          onConsume={beginRateLimitReset}
+        />
+      )}
       {grantProvider && (
         <ProviderGrantsDialog
           sdk={sdk}
@@ -2943,6 +3113,44 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
             >
               {deletePending && <Spinner data-icon="inline-start" />}
               {t.confirmDeleteProvider}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+      <AlertDialog
+        open={Boolean(resetTarget)}
+        onOpenChange={(next) => !next && !resetPending && setResetTarget(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t.rateLimitResetConfirmTitle}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t.rateLimitResetConfirmDescription}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <Definition
+            rows={[
+              [t.provider, resetTarget?.provider.name || "—"],
+              [
+                t.viewRateLimitResets,
+                resetTarget?.credit?.title || t.rateLimitResetUseNext,
+              ],
+            ]}
+          />
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={resetPending}>
+              {t.cancel}
+            </AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              disabled={resetPending}
+              onClick={(event) => {
+                event.preventDefault()
+                void consumeRateLimitReset()
+              }}
+            >
+              {resetPending && <Spinner data-icon="inline-start" />}
+              {resetPending ? t.rateLimitResetting : t.confirmRateLimitReset}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -3156,6 +3364,118 @@ function ProviderTestDialog({
               </div>
             </div>
           )
+        )}
+        <DialogFooter>
+          <Button onClick={onClose}>{t.close}</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function ProviderRateLimitResetsDialog({
+  locale,
+  provider,
+  resets,
+  error,
+  onClose,
+  onConsume,
+}: {
+  locale: Locale
+  provider: Provider
+  resets?: ProviderRateLimitResets
+  error?: string
+  onClose: () => void
+  onConsume: (provider: Provider, credit?: ProviderRateLimitResetCredit) => void
+}) {
+  const t = copy[locale]
+  const credits = resets?.credits ?? []
+  const availableCount = Math.max(0, resets?.available_count ?? 0)
+  return (
+    <Dialog open onOpenChange={(next) => !next && onClose()}>
+      <DialogContent className="sm:max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>
+            {t.rateLimitResetsTitle}: {provider.name}
+          </DialogTitle>
+          <DialogDescription>{t.rateLimitResetsDescription}</DialogDescription>
+        </DialogHeader>
+        {error ? (
+          <ErrorState message={error} />
+        ) : (
+          <div className="flex flex-col gap-4">
+            <Definition rows={[[t.rateLimitResetsAvailable, availableCount]]} />
+            {credits.length > 0 ? (
+              <DataTable>
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>{t.viewRateLimitResets}</TableHead>
+                      <TableHead>{t.rateLimitResetExpiresAt}</TableHead>
+                      <TableHead className="text-right">{t.actions}</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {credits.map((credit) => (
+                      <TableRow key={credit.id}>
+                        <TableCell>
+                          <div className="flex flex-col gap-1">
+                            <span className="font-medium">
+                              {credit.title || credit.reset_type || credit.id}
+                            </span>
+                            {credit.description && (
+                              <span className="text-xs text-muted-foreground">
+                                {credit.description}
+                              </span>
+                            )}
+                            <span className="text-xs text-muted-foreground">
+                              {t.rateLimitResetGrantedAt}:{" "}
+                              {formatTime(credit.granted_at, locale)}
+                            </span>
+                          </div>
+                        </TableCell>
+                        <TableCell className="text-xs tabular-nums">
+                          {formatTime(credit.expires_at ?? undefined, locale)}
+                        </TableCell>
+                        <TableCell className="text-right">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => onConsume(provider, credit)}
+                          >
+                            <RefreshCwIcon data-icon="inline-start" />
+                            {t.rateLimitResetUse}
+                          </Button>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </DataTable>
+            ) : availableCount > 0 ? (
+              <Alert>
+                <RefreshCwIcon />
+                <AlertTitle>{t.rateLimitResetsTitle}</AlertTitle>
+                <AlertDescription className="flex flex-wrap items-center justify-between gap-3">
+                  <span>{t.rateLimitResetUnknownCredit}</span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => onConsume(provider)}
+                  >
+                    <RefreshCwIcon data-icon="inline-start" />
+                    {t.rateLimitResetUseNext}
+                  </Button>
+                </AlertDescription>
+              </Alert>
+            ) : (
+              <EmptyState
+                icon={<RefreshCwIcon />}
+                title={t.rateLimitResetsAvailable}
+                description={t.rateLimitResetNoCredit}
+              />
+            )}
+          </div>
         )}
         <DialogFooter>
           <Button onClick={onClose}>{t.close}</Button>

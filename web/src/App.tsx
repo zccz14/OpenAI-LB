@@ -325,6 +325,7 @@ type UsageRow = {
   cached_tokens: number
   output_tokens: number
   network_transport_bytes: number
+  cost_usd_nanos: number
 }
 type UsageResponse = { period: UsagePeriod; since: number; rows: UsageRow[] }
 type PivotCell = Pick<
@@ -334,6 +335,7 @@ type PivotCell = Pick<
   | "cached_tokens"
   | "output_tokens"
   | "network_transport_bytes"
+  | "cost_usd_nanos"
 >
 type PivotTableRow = {
   id: string
@@ -362,6 +364,7 @@ type Audit = {
   input_tokens: number
   output_tokens: number
   cached_tokens: number
+  cost_usd_nanos?: number
   error?: string
   created_at: number
 }
@@ -460,6 +463,7 @@ const copy = {
     activeConsumers: "有效消费者",
     calls24h: "24 小时调用",
     errors24h: "24 小时错误",
+    cost24h: "24 小时费用 (USD)",
     systemResources: "系统资源",
     systemResourcesDescription:
       "宿主机当前负载与 OpenAI-LB 数据占用，仅 root 和管理员可见。",
@@ -642,6 +646,7 @@ const copy = {
     inputTokens: "输入 Token",
     cachedInputTokens: "缓存输入 Token",
     outputTokens: "输出 Token",
+    cost: "费用 (USD)",
     requestCount: "请求次数",
     usageRows: "条聚合记录",
     sortColumn: "排序",
@@ -922,6 +927,7 @@ const copy = {
     activeConsumers: "Active Consumers",
     calls24h: "Calls in 24h",
     errors24h: "Errors in 24h",
+    cost24h: "Cost in 24h (USD)",
     systemResources: "System resources",
     systemResourcesDescription:
       "Current host load and OpenAI-LB data footprint. Visible to root and administrators only.",
@@ -1117,6 +1123,7 @@ const copy = {
     inputTokens: "Input Tokens",
     cachedInputTokens: "Cached Input Tokens",
     outputTokens: "Output Tokens",
+    cost: "Cost (USD)",
     requestCount: "Request count",
     usageRows: "aggregated rows",
     sortColumn: "Sort",
@@ -1937,6 +1944,7 @@ function Dashboard({
     [t.activeConsumers, data?.active_consumers],
     [t.calls24h, data?.calls_24h],
     [t.errors24h, data?.errors_24h],
+    [t.cost24h, formatUsd(data?.cost_usd_nanos_24h, locale)],
   ]
   return (
     <div className="flex flex-col gap-5">
@@ -4358,7 +4366,9 @@ function UsagePage({
           header: usageAggregateLabel(field, t),
           cell: (info) => (
             <span className="block text-right tabular-nums">
-              {Number(info.getValue()).toLocaleString(locale)}
+              {field === "cost_usd_nanos"
+                ? formatUsd(Number(info.getValue()), locale)
+                : Number(info.getValue()).toLocaleString(locale)}
             </span>
           ),
         })),
@@ -4924,6 +4934,7 @@ function AuditPage({
                     <TableRow>
                       <TableHead>{t.time}</TableHead>
                       <TableHead>{t.model}</TableHead>
+                      <TableHead className="text-right">{t.cost}</TableHead>
                       <TableHead>{t.reasoningEffort}</TableHead>
                       <TableHead>{t.userId}</TableHead>
                       <TableHead>{t.consumer}</TableHead>
@@ -4942,6 +4953,9 @@ function AuditPage({
                         </TableCell>
                         <TableCell>
                           <code>{row.model || "—"}</code>
+                        </TableCell>
+                        <TableCell className="text-right tabular-nums">
+                          {formatUsd(row.cost_usd_nanos, locale)}
                         </TableCell>
                         <TableCell>
                           <code>{row.reasoning_effort || "—"}</code>
@@ -5267,6 +5281,7 @@ function RequestSummary({
                 data.cached_tokens.toLocaleString(locale),
               ],
               [labels.outputTokens, data.output_tokens.toLocaleString(locale)],
+              [labels.cost, formatUsd(data.cost_usd_nanos, locale)],
               [
                 labels.cacheHitRate,
                 cacheHitRate(data.cached_tokens, data.input_tokens, locale),
@@ -6280,6 +6295,7 @@ const usageMetrics: UsageMetric[] = [
   "input_tokens",
   "output_tokens",
   "cached_tokens",
+  "cost_usd_nanos",
   "network_transport_bytes",
 ]
 
@@ -6298,7 +6314,7 @@ function usageDimensionLabel(row: UsageRow, dimension: PivotDimension) {
 }
 function usageAggregateLabel(metric: UsageMetric, t: typeof copy.zh) {
   if (metric === "requests") return `COUNT(${t.requestCount})`
-  return `SUM(${metric === "input_tokens" ? t.inputTokens : metric === "cached_tokens" ? t.cachedInputTokens : metric === "output_tokens" ? t.outputTokens : t.networkTransport})`
+  return `SUM(${metric === "input_tokens" ? t.inputTokens : metric === "cached_tokens" ? t.cachedInputTokens : metric === "output_tokens" ? t.outputTokens : metric === "cost_usd_nanos" ? t.cost : t.networkTransport})`
 }
 function uniqueUsageOptions(
   rows: UsageRow[],
@@ -6357,12 +6373,14 @@ function pivotUsageRows(
       input_tokens: 0,
       cached_tokens: 0,
       output_tokens: 0,
+      cost_usd_nanos: 0,
       network_transport_bytes: 0,
     }
     cell.requests += row.requests
     cell.input_tokens += row.input_tokens
     cell.cached_tokens += row.cached_tokens
     cell.output_tokens += row.output_tokens
+    cell.cost_usd_nanos += row.cost_usd_nanos
     cell.network_transport_bytes += row.network_transport_bytes
     pivotRow.cells[columnId] = cell
     grouped.set(rowId, pivotRow)
@@ -6615,6 +6633,15 @@ function formatLatency(milliseconds: number | undefined) {
 }
 function formatBytes(bytes: number, locale: Locale) {
   return `${bytes.toLocaleString(locale)} B`
+}
+function formatUsd(nanos: number | undefined, locale: Locale) {
+  if (typeof nanos !== "number") return "—"
+  return new Intl.NumberFormat(locale === "zh" ? "zh-CN" : "en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 9,
+  }).format(nanos / 1_000_000_000)
 }
 
 function compressionRatio(contentBytes: number, transportBytes: number) {

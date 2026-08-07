@@ -119,6 +119,7 @@ impl AuditTracker {
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,
+            cost_usd_nanos: None,
             error: None,
             client_ip: client_ip.to_owned(),
             created_at: chrono::Utc::now().timestamp(),
@@ -346,6 +347,7 @@ fn settle(
     event.input_tokens = usage.input_tokens;
     event.output_tokens = usage.output_tokens;
     event.cached_tokens = usage.cached_tokens;
+    event.cost_usd_nanos = model.and_then(|model| cost_usd_nanos(model, usage));
     event.error = error.map(str::to_owned);
 }
 
@@ -1595,6 +1597,7 @@ struct Usage {
     input_tokens: i64,
     output_tokens: i64,
     cached_tokens: i64,
+    cache_write_tokens: i64,
 }
 
 impl Usage {
@@ -1602,6 +1605,7 @@ impl Usage {
         self.input_tokens = self.input_tokens.max(other.input_tokens);
         self.output_tokens = self.output_tokens.max(other.output_tokens);
         self.cached_tokens = self.cached_tokens.max(other.cached_tokens);
+        self.cache_write_tokens = self.cache_write_tokens.max(other.cache_write_tokens);
     }
 }
 
@@ -1629,7 +1633,408 @@ fn usage_from_value(value: &Value) -> Usage {
             .and_then(|v| v.pointer("/input_tokens_details/cached_tokens"))
             .and_then(Value::as_i64)
             .unwrap_or_default(),
+        cache_write_tokens: usage
+            .and_then(|v| v.pointer("/input_tokens_details/cache_write_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
     }
+}
+
+const LONG_CONTEXT_THRESHOLD_TOKENS: i64 = 272_000;
+
+#[derive(Clone, Copy)]
+struct TokenRates {
+    input_usd_nanos: i64,
+    cached_input_usd_nanos: i64,
+    cache_write_usd_nanos: i64,
+    output_usd_nanos: i64,
+}
+
+#[derive(Clone, Copy)]
+struct TokenPricing {
+    model: &'static str,
+    short: TokenRates,
+    long: Option<TokenRates>,
+}
+
+impl TokenPricing {
+    const fn rates(self, input_tokens: i64) -> TokenRates {
+        if input_tokens >= LONG_CONTEXT_THRESHOLD_TOKENS {
+            match self.long {
+                Some(rates) => rates,
+                None => self.short,
+            }
+        } else {
+            self.short
+        }
+    }
+}
+
+// INVARIANT: These standard token prices are release-owned. Their computed value
+// is stored with the audit event, so later price-table updates cannot rewrite history.
+const TOKEN_PRICING: &[TokenPricing] = &[
+    TokenPricing {
+        model: "gpt-5.6-sol",
+        short: TokenRates {
+            input_usd_nanos: 5_000,
+            cached_input_usd_nanos: 500,
+            cache_write_usd_nanos: 6_250,
+            output_usd_nanos: 30_000,
+        },
+        long: Some(TokenRates {
+            input_usd_nanos: 10_000,
+            cached_input_usd_nanos: 1_000,
+            cache_write_usd_nanos: 12_500,
+            output_usd_nanos: 45_000,
+        }),
+    },
+    TokenPricing {
+        model: "gpt-5.6-terra",
+        short: TokenRates {
+            input_usd_nanos: 2_000,
+            cached_input_usd_nanos: 200,
+            cache_write_usd_nanos: 2_500,
+            output_usd_nanos: 12_000,
+        },
+        long: Some(TokenRates {
+            input_usd_nanos: 4_000,
+            cached_input_usd_nanos: 400,
+            cache_write_usd_nanos: 5_000,
+            output_usd_nanos: 18_000,
+        }),
+    },
+    TokenPricing {
+        model: "gpt-5.6-luna",
+        short: TokenRates {
+            input_usd_nanos: 200,
+            cached_input_usd_nanos: 20,
+            cache_write_usd_nanos: 250,
+            output_usd_nanos: 1_200,
+        },
+        long: Some(TokenRates {
+            input_usd_nanos: 400,
+            cached_input_usd_nanos: 40,
+            cache_write_usd_nanos: 500,
+            output_usd_nanos: 1_800,
+        }),
+    },
+    TokenPricing {
+        model: "gpt-5.5",
+        short: TokenRates {
+            input_usd_nanos: 5_000,
+            cached_input_usd_nanos: 500,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 30_000,
+        },
+        long: Some(TokenRates {
+            input_usd_nanos: 10_000,
+            cached_input_usd_nanos: 1_000,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 45_000,
+        }),
+    },
+    TokenPricing {
+        model: "gpt-5.5-pro",
+        short: TokenRates {
+            input_usd_nanos: 30_000,
+            cached_input_usd_nanos: 0,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 180_000,
+        },
+        long: Some(TokenRates {
+            input_usd_nanos: 60_000,
+            cached_input_usd_nanos: 0,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 270_000,
+        }),
+    },
+    TokenPricing {
+        model: "gpt-5.4",
+        short: TokenRates {
+            input_usd_nanos: 2_500,
+            cached_input_usd_nanos: 250,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 15_000,
+        },
+        long: Some(TokenRates {
+            input_usd_nanos: 5_000,
+            cached_input_usd_nanos: 500,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 22_500,
+        }),
+    },
+    TokenPricing {
+        model: "gpt-5.4-mini",
+        short: TokenRates {
+            input_usd_nanos: 750,
+            cached_input_usd_nanos: 75,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 4_500,
+        },
+        long: None,
+    },
+    TokenPricing {
+        model: "gpt-5.4-nano",
+        short: TokenRates {
+            input_usd_nanos: 200,
+            cached_input_usd_nanos: 20,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 1_250,
+        },
+        long: None,
+    },
+    TokenPricing {
+        model: "gpt-5.4-pro",
+        short: TokenRates {
+            input_usd_nanos: 30_000,
+            cached_input_usd_nanos: 0,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 180_000,
+        },
+        long: Some(TokenRates {
+            input_usd_nanos: 60_000,
+            cached_input_usd_nanos: 0,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 270_000,
+        }),
+    },
+    TokenPricing {
+        model: "gpt-5.3-codex",
+        short: TokenRates {
+            input_usd_nanos: 1_750,
+            cached_input_usd_nanos: 175,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 14_000,
+        },
+        long: None,
+    },
+    TokenPricing {
+        model: "gpt-5.2",
+        short: TokenRates {
+            input_usd_nanos: 1_750,
+            cached_input_usd_nanos: 175,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 14_000,
+        },
+        long: None,
+    },
+    TokenPricing {
+        model: "gpt-5.2-pro",
+        short: TokenRates {
+            input_usd_nanos: 21_000,
+            cached_input_usd_nanos: 0,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 168_000,
+        },
+        long: None,
+    },
+    TokenPricing {
+        model: "gpt-5.1",
+        short: TokenRates {
+            input_usd_nanos: 1_250,
+            cached_input_usd_nanos: 125,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 10_000,
+        },
+        long: None,
+    },
+    TokenPricing {
+        model: "gpt-5",
+        short: TokenRates {
+            input_usd_nanos: 1_250,
+            cached_input_usd_nanos: 125,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 10_000,
+        },
+        long: None,
+    },
+    TokenPricing {
+        model: "gpt-5-mini",
+        short: TokenRates {
+            input_usd_nanos: 250,
+            cached_input_usd_nanos: 25,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 2_000,
+        },
+        long: None,
+    },
+    TokenPricing {
+        model: "gpt-5-nano",
+        short: TokenRates {
+            input_usd_nanos: 50,
+            cached_input_usd_nanos: 5,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 400,
+        },
+        long: None,
+    },
+    TokenPricing {
+        model: "gpt-5-pro",
+        short: TokenRates {
+            input_usd_nanos: 15_000,
+            cached_input_usd_nanos: 0,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 120_000,
+        },
+        long: None,
+    },
+    TokenPricing {
+        model: "gpt-4.1",
+        short: TokenRates {
+            input_usd_nanos: 2_000,
+            cached_input_usd_nanos: 500,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 8_000,
+        },
+        long: None,
+    },
+    TokenPricing {
+        model: "gpt-4.1-mini",
+        short: TokenRates {
+            input_usd_nanos: 400,
+            cached_input_usd_nanos: 100,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 1_600,
+        },
+        long: None,
+    },
+    TokenPricing {
+        model: "gpt-4.1-nano",
+        short: TokenRates {
+            input_usd_nanos: 100,
+            cached_input_usd_nanos: 25,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 400,
+        },
+        long: None,
+    },
+    TokenPricing {
+        model: "gpt-4o",
+        short: TokenRates {
+            input_usd_nanos: 2_500,
+            cached_input_usd_nanos: 1_250,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 10_000,
+        },
+        long: None,
+    },
+    TokenPricing {
+        model: "gpt-4o-mini",
+        short: TokenRates {
+            input_usd_nanos: 150,
+            cached_input_usd_nanos: 75,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 600,
+        },
+        long: None,
+    },
+    TokenPricing {
+        model: "o1",
+        short: TokenRates {
+            input_usd_nanos: 15_000,
+            cached_input_usd_nanos: 7_500,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 60_000,
+        },
+        long: None,
+    },
+    TokenPricing {
+        model: "o1-pro",
+        short: TokenRates {
+            input_usd_nanos: 150_000,
+            cached_input_usd_nanos: 0,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 600_000,
+        },
+        long: None,
+    },
+    TokenPricing {
+        model: "o3",
+        short: TokenRates {
+            input_usd_nanos: 2_000,
+            cached_input_usd_nanos: 500,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 8_000,
+        },
+        long: None,
+    },
+    TokenPricing {
+        model: "o3-pro",
+        short: TokenRates {
+            input_usd_nanos: 20_000,
+            cached_input_usd_nanos: 0,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 80_000,
+        },
+        long: None,
+    },
+    TokenPricing {
+        model: "o4-mini",
+        short: TokenRates {
+            input_usd_nanos: 1_100,
+            cached_input_usd_nanos: 275,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 4_400,
+        },
+        long: None,
+    },
+    TokenPricing {
+        model: "o3-mini",
+        short: TokenRates {
+            input_usd_nanos: 1_100,
+            cached_input_usd_nanos: 550,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 4_400,
+        },
+        long: None,
+    },
+    TokenPricing {
+        model: "gpt-4o-transcribe",
+        short: TokenRates {
+            input_usd_nanos: 2_500,
+            cached_input_usd_nanos: 0,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 10_000,
+        },
+        long: None,
+    },
+    TokenPricing {
+        model: "gpt-4o-mini-transcribe",
+        short: TokenRates {
+            input_usd_nanos: 1_250,
+            cached_input_usd_nanos: 0,
+            cache_write_usd_nanos: 0,
+            output_usd_nanos: 5_000,
+        },
+        long: None,
+    },
+];
+
+fn cost_usd_nanos(model: &str, usage: Usage) -> Option<i64> {
+    let pricing = TOKEN_PRICING
+        .iter()
+        .find(|pricing| pricing.model == model)?;
+    let rates = pricing.rates(usage.input_tokens);
+    let cached_tokens = usage.cached_tokens.clamp(0, usage.input_tokens.max(0));
+    let uncached_tokens = usage.input_tokens.saturating_sub(cached_tokens);
+    let cache_write_tokens = if rates.cache_write_usd_nanos == 0 {
+        0
+    } else {
+        usage.cache_write_tokens.clamp(0, uncached_tokens)
+    };
+    Some(
+        uncached_tokens
+            .saturating_sub(cache_write_tokens)
+            .saturating_mul(rates.input_usd_nanos)
+            .saturating_add(cached_tokens.saturating_mul(rates.cached_input_usd_nanos))
+            .saturating_add(cache_write_tokens.saturating_mul(rates.cache_write_usd_nanos))
+            .saturating_add(
+                usage
+                    .output_tokens
+                    .max(0)
+                    .saturating_mul(rates.output_usd_nanos),
+            ),
+    )
 }
 
 fn update_sse_usage(pending: &mut Vec<u8>, bytes: &[u8], usage: &mut Usage) {
@@ -2140,12 +2545,34 @@ mod tests {
     #[test]
     fn reads_usage_without_retaining_prompt() {
         let usage = usage_from_value(
-            &json!({"usage":{"input_tokens":10,"output_tokens":4,"input_tokens_details":{"cached_tokens":3}}}),
+            &json!({"usage":{"input_tokens":10,"output_tokens":4,"input_tokens_details":{"cached_tokens":3,"cache_write_tokens":2}}}),
         );
         assert_eq!(
-            (usage.input_tokens, usage.output_tokens, usage.cached_tokens),
-            (10, 4, 3)
+            (
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cached_tokens,
+                usage.cache_write_tokens,
+            ),
+            (10, 4, 3, 2)
         );
+    }
+
+    #[test]
+    fn prices_uncached_cached_and_cache_write_tokens_once() {
+        assert_eq!(
+            cost_usd_nanos(
+                "gpt-5.6-terra",
+                Usage {
+                    input_tokens: 20_000,
+                    output_tokens: 1_000,
+                    cached_tokens: 10_000,
+                    cache_write_tokens: 2_000,
+                },
+            ),
+            Some(35_000_000)
+        );
+        assert_eq!(cost_usd_nanos("unknown", Usage::default()), None);
     }
 
     #[test]
@@ -2247,11 +2674,12 @@ mod tests {
         audit.set_response_size(64);
         audit.finish(
             StatusCode::OK,
-            None,
+            Some("gpt-5.4"),
             Usage {
                 input_tokens: 12,
                 output_tokens: 4,
                 cached_tokens: 3,
+                cache_write_tokens: 0,
             },
             None,
         );
@@ -2272,6 +2700,12 @@ mod tests {
                 "previous_response_id".to_owned(),
             )
         );
+        let cost_usd_nanos: Option<i64> =
+            sqlx::query_scalar("SELECT cost_usd_nanos FROM api_calls WHERE request_id='request-1'")
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(cost_usd_nanos, Some(83_250));
         let effort: Option<String> = sqlx::query_scalar(
             "SELECT reasoning_effort FROM api_calls WHERE request_id='request-1'",
         )

@@ -66,6 +66,7 @@ pub struct AuditEvent {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cached_tokens: i64,
+    pub cost_usd_nanos: Option<i64>,
     pub error: Option<String>,
     pub client_ip: String,
     pub created_at: i64,
@@ -254,7 +255,7 @@ async fn insert(
     transaction: &mut Transaction<'_, Sqlite>,
     event: &AuditEvent,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO api_calls(id,request_id,thread_id,consumer_id,user_id,provider_id,affinity_hash,affinity_source,method,path,model,reasoning_effort,status,first_byte_latency_ms,request_bytes,response_bytes,request_transport_bytes,response_transport_bytes,downstream_accept_encoding,downstream_content_encoding,upstream_accept_encoding,upstream_content_encoding,latency_ms,input_tokens,output_tokens,cached_tokens,error,client_ip,created_at,upstream_http_version) VALUES(?,?,?,?,?,(SELECT id FROM providers WHERE id=?),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    sqlx::query("INSERT INTO api_calls(id,request_id,thread_id,consumer_id,user_id,provider_id,affinity_hash,affinity_source,method,path,model,reasoning_effort,status,first_byte_latency_ms,request_bytes,response_bytes,request_transport_bytes,response_transport_bytes,downstream_accept_encoding,downstream_content_encoding,upstream_accept_encoding,upstream_content_encoding,latency_ms,input_tokens,output_tokens,cached_tokens,cost_usd_nanos,error,client_ip,created_at,upstream_http_version) VALUES(?,?,?,?,?,(SELECT id FROM providers WHERE id=?),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(&event.id)
         .bind(&event.request_id)
         .bind(&event.thread_id)
@@ -281,6 +282,7 @@ async fn insert(
         .bind(event.input_tokens)
         .bind(event.output_tokens)
         .bind(event.cached_tokens)
+        .bind(event.cost_usd_nanos)
         .bind(&event.error)
         .bind(&event.client_ip)
         .bind(event.created_at)

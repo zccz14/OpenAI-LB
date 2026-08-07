@@ -1,9 +1,4 @@
-use std::{
-    convert::Infallible,
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-    time::Instant,
-};
+use std::{convert::Infallible, net::SocketAddr, time::Instant};
 
 use axum::{
     body::{Body, Bytes},
@@ -18,6 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     AppError, AppState,
+    audio_spool::AudioSpool,
     audit::{ARCHIVE_BODY_LIMIT, AuditEvent, AuditReservation},
     auth::{ApiIdentity, api_identity, browser_identity, is_admin},
     balancer::{Lease, affinity_hash, track_response},
@@ -483,16 +479,35 @@ pub async fn handle_console_transcription(
             .await?
             != 0
     };
-    let lease = select_ready_provider(&state, &user.id, all_providers, None).await?;
-    let upstream = send_transcription_upstream(
-        &state,
-        &lease,
-        &headers,
-        reqwest::Body::wrap_stream(body.into_data_stream()),
-    )
-    .await?;
-    let upstream =
-        track_upstream(&state, &lease.provider.id, UpstreamResponse::Live(upstream)).await?;
+    let data_dir = state.config.load().data_dir.clone();
+    let spool = AudioSpool::create(&data_dir, body, 0).await?;
+    let first = select_ready_provider(&state, &user.id, all_providers, None).await?;
+    let first_id = first.provider.id.clone();
+    let response =
+        send_transcription_upstream(&state, &first, &headers, spool.body().await?).await?;
+    let response = track_upstream(&state, &first_id, UpstreamResponse::Live(response)).await?;
+    let (_lease, upstream) = if retryable(response.status()) {
+        match retry_provider(&state, &user.id, all_providers, None, &first_id).await {
+            Some(second) => {
+                drop(response);
+                drop(first);
+                let second_response =
+                    send_transcription_upstream(&state, &second, &headers, spool.body().await?)
+                        .await?;
+                let second_response = track_upstream(
+                    &state,
+                    &second.provider.id,
+                    UpstreamResponse::Live(second_response),
+                )
+                .await?;
+                (second, second_response)
+            }
+            None => (first, response),
+        }
+    } else {
+        (first, response)
+    };
+    drop(spool);
     let status = upstream.status();
     let body = upstream.into_bytes().await?;
     if !status.is_success() {
@@ -530,10 +545,30 @@ pub async fn handle_console_image_generation(
     let payload = serde_json::from_slice(&body)
         .map_err(|_| AppError::bad_request("JSON request body required"))?;
     let request = transform_request("/v1/images/generations", Some(payload), &state)?;
-    let lease = select_ready_provider(&state, &user.id, all_providers, None).await?;
-    let upstream = send_console_image_upstream(&state, &lease, &headers, request).await?;
-    let upstream =
-        track_upstream(&state, &lease.provider.id, UpstreamResponse::Live(upstream)).await?;
+    let first = select_ready_provider(&state, &user.id, all_providers, None).await?;
+    let first_id = first.provider.id.clone();
+    let response = send_console_image_upstream(&state, &first, &headers, request.clone()).await?;
+    let response = track_upstream(&state, &first_id, UpstreamResponse::Live(response)).await?;
+    let (_lease, upstream) = if retryable(response.status()) {
+        match retry_provider(&state, &user.id, all_providers, None, &first_id).await {
+            Some(second) => {
+                drop(response);
+                drop(first);
+                let second_response =
+                    send_console_image_upstream(&state, &second, &headers, request).await?;
+                let second_response = track_upstream(
+                    &state,
+                    &second.provider.id,
+                    UpstreamResponse::Live(second_response),
+                )
+                .await?;
+                (second, second_response)
+            }
+            None => (first, response),
+        }
+    } else {
+        (first, response)
+    };
     let status = upstream.status();
     let body = upstream.into_bytes().await?;
     if !status.is_success() {
@@ -645,22 +680,16 @@ async fn dispatch(
     let response = track_upstream(&state, &first_id, UpstreamResponse::Live(response)).await?;
     let should_retry = retryable(response.status());
     let (lease, upstream) = if should_retry {
-        let second = state
-            .balancer
-            .select(
-                &state,
-                &identity.user_id,
-                identity.all_providers,
-                affinity.as_deref(),
-                Some(&first_id),
-            )
-            .await;
-        match second {
-            Ok(mut second) => {
-                if refresh_if_needed(&state, &mut second).await.is_err() {
-                    return relay_response(CallContext { model, stream }, first, response, audit)
-                        .await;
-                }
+        match retry_provider(
+            &state,
+            &identity.user_id,
+            identity.all_providers,
+            affinity.as_deref(),
+            &first_id,
+        )
+        .await
+        {
+            Some(second) => {
                 drop(response);
                 drop(first);
                 audit.set_provider(&second.provider.id);
@@ -676,7 +705,7 @@ async fn dispatch(
                 .await?;
                 (second, second_response)
             }
-            _ => (first, response),
+            None => (first, response),
         }
     } else {
         (first, response)
@@ -713,43 +742,52 @@ async fn dispatch_audio(
         affinity.as_deref(),
         affinity_key.as_ref().map(|key| key.source),
     );
-    let lease = select_ready_provider(
+    let data_dir = state.config.load().data_dir.clone();
+    let spool = AudioSpool::create(&data_dir, body, ARCHIVE_BODY_LIMIT).await?;
+    audit.set_request(headers, &spool.preview, spool.preview_truncated);
+    audit.set_request_size(spool.bytes);
+    let first = select_ready_provider(
         &state,
         &identity.user_id,
         identity.all_providers,
         affinity.as_deref(),
     )
     .await?;
-    audit.set_provider(&lease.provider.id);
-    let preview = Arc::new(Mutex::new(StreamingPreview::default()));
-    let capture = preview.clone();
-    let stream = body.into_data_stream().map(move |item| {
-        if let Ok(bytes) = &item {
-            capture
-                .lock()
-                .expect("audio preview mutex is not poisoned")
-                .capture(bytes);
+    audit.set_provider(&first.provider.id);
+    let first_id = first.provider.id.clone();
+    let response = send_upstream(&state, &first, path, headers, spool.body().await?, audit).await?;
+    let response = track_upstream(&state, &first_id, UpstreamResponse::Live(response)).await?;
+    let (lease, upstream) = if retryable(response.status()) {
+        match retry_provider(
+            &state,
+            &identity.user_id,
+            identity.all_providers,
+            affinity.as_deref(),
+            &first_id,
+        )
+        .await
+        {
+            Some(second) => {
+                drop(response);
+                drop(first);
+                audit.set_provider(&second.provider.id);
+                let second_response =
+                    send_upstream(&state, &second, path, headers, spool.body().await?, audit)
+                        .await?;
+                let second_response = track_upstream(
+                    &state,
+                    &second.provider.id,
+                    UpstreamResponse::Live(second_response),
+                )
+                .await?;
+                (second, second_response)
+            }
+            None => (first, response),
         }
-        item
-    });
-    let upstream = send_upstream(
-        &state,
-        &lease,
-        path,
-        headers,
-        reqwest::Body::wrap_stream(stream),
-        audit,
-    )
-    .await;
-    let (body, truncated, bytes) = {
-        let preview = preview.lock().expect("audio preview mutex is not poisoned");
-        (preview.body.clone(), preview.truncated, preview.bytes)
+    } else {
+        (first, response)
     };
-    audit.set_request(headers, &body, truncated);
-    audit.set_request_size(bytes);
-    let upstream = upstream?;
-    let upstream =
-        track_upstream(&state, &lease.provider.id, UpstreamResponse::Live(upstream)).await?;
+    drop(spool);
     relay_response(
         CallContext {
             model: None,
@@ -760,6 +798,22 @@ async fn dispatch_audio(
         audit,
     )
     .await
+}
+
+async fn retry_provider(
+    state: &AppState,
+    user_id: &str,
+    all_providers: bool,
+    affinity: Option<&str>,
+    first_id: &str,
+) -> Option<Lease> {
+    let mut second = state
+        .balancer
+        .select(state, user_id, all_providers, affinity, Some(first_id))
+        .await
+        .ok()?;
+    refresh_if_needed(state, &mut second).await.ok()?;
+    Some(second)
 }
 
 async fn select_ready_provider(
@@ -3081,6 +3135,92 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(audio_sizes, (audio.len() as i64, audio.len() as i64));
+    }
+
+    #[tokio::test]
+    async fn audio_retries_another_provider_from_the_spool_file() {
+        let records = Arc::new(Mutex::new(Vec::<RecordedRequest>::new()));
+        let recorded = records.clone();
+        let upstream = Router::new().route(
+            "/transcribe",
+            post(move |headers: HeaderMap, body: Bytes| {
+                let recorded = recorded.clone();
+                async move {
+                    recorded.lock().await.push(RecordedRequest {
+                        path: "/transcribe".to_owned(),
+                        headers: headers.clone(),
+                        body: body.clone(),
+                    });
+                    if headers.get(header::AUTHORIZATION).unwrap() == "Bearer access-token" {
+                        return Response::builder()
+                            .status(StatusCode::TOO_MANY_REQUESTS)
+                            .header("retry-after", "30")
+                            .body(Body::from(r#"{"error":{"message":"limited"}}"#))
+                            .unwrap();
+                    }
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/octet-stream")
+                        .body(Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let state =
+            crate::test_state_with_upstream("http://token.invalid", &format!("http://{address}"))
+                .await;
+        let data_dir = std::env::temp_dir().join(format!("openai-lb-audio-{}", Uuid::new_v4()));
+        let mut config = (**state.config.load()).clone();
+        config.data_dir = data_dir.clone();
+        state.config.store(Arc::new(config));
+        seed_proxy(&state, true).await;
+        let now = chrono::Utc::now().timestamp();
+        sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,status,created_at,updated_at) VALUES('provider-2','two','account-2','access-token-2','refresh-token-2','active',?,?)")
+            .bind(now).bind(now).execute(&state.db).await.unwrap();
+        state.balancer.reload_providers(&state.db).await.unwrap();
+
+        let audio = Bytes::from_static(b"\0RIFF\xffretryable-audio");
+        let response = crate::router(state.clone())
+            .oneshot(proxy_request(
+                "/v1/audio/transcriptions",
+                "multipart/form-data; boundary=test",
+                Body::from(audio.clone()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            audio
+        );
+
+        let records = records.lock().await;
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].body, audio);
+        assert_eq!(records[1].body, audio);
+        assert_eq!(
+            records[1].headers.get(header::AUTHORIZATION).unwrap(),
+            "Bearer access-token-2"
+        );
+        drop(records);
+        wait_for_audits(&state, 1).await;
+        let provider_id: String = sqlx::query_scalar(
+            "SELECT provider_id FROM api_calls WHERE path='/v1/audio/transcriptions'",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(provider_id, "provider-2");
+
+        let mut entries = tokio::fs::read_dir(crate::audio_spool::directory(&data_dir))
+            .await
+            .unwrap();
+        assert!(entries.next_entry().await.unwrap().is_none());
+        tokio::fs::remove_dir_all(data_dir).await.unwrap();
     }
 
     #[tokio::test]

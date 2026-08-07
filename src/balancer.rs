@@ -13,6 +13,7 @@ use reqwest::{StatusCode, header::HeaderMap};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, Row};
+use uuid::Uuid;
 
 use crate::{AppError, AppState};
 
@@ -57,12 +58,36 @@ struct AffinityEntry {
 
 #[derive(Clone, PartialEq)]
 struct ProviderUpdate {
-    status: String,
+    status: Option<String>,
     cooldown_until: Option<i64>,
     rate_limit_json: String,
     last_error: Option<String>,
     last_used_at: Option<i64>,
     updated_at: i64,
+    circuit: Option<CircuitOpen>,
+}
+
+#[derive(Clone, PartialEq)]
+struct CircuitOpen {
+    id: String,
+    cause: String,
+    rate_limit_json: String,
+    opened_at: i64,
+    cooldown_until: i64,
+}
+
+impl ProviderUpdate {
+    fn merge(&mut self, next: Self) {
+        if next.status.is_some() {
+            self.status = next.status;
+            self.cooldown_until = next.cooldown_until;
+            self.last_error = next.last_error;
+            self.circuit = next.circuit;
+        }
+        self.rate_limit_json = next.rate_limit_json;
+        self.last_used_at = next.last_used_at.or(self.last_used_at);
+        self.updated_at = self.updated_at.max(next.updated_at);
+    }
 }
 
 pub struct Lease {
@@ -299,9 +324,16 @@ impl Balancer {
             .collect::<Vec<_>>();
         let mut transaction = pool.begin().await?;
         for (id, update) in &updates {
-            sqlx::query("UPDATE providers SET status=CASE WHEN manual_disabled=1 THEN 'disabled' ELSE ? END,cooldown_until=CASE WHEN manual_disabled=1 THEN NULL ELSE ? END,rate_limit_json=?,last_error=?,last_used_at=COALESCE(?,last_used_at),updated_at=? WHERE id=?")
-                .bind(&update.status).bind(update.cooldown_until).bind(&update.rate_limit_json)
-                .bind(&update.last_error).bind(update.last_used_at).bind(update.updated_at).bind(id)
+            if let Some(circuit) = &update.circuit {
+                sqlx::query("INSERT INTO provider_circuit_events(id,provider_id,cause,rate_limit_json,opened_at,cooldown_until) SELECT ?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM providers WHERE id=? AND manual_disabled=0) ON CONFLICT(provider_id) WHERE closed_at IS NULL DO UPDATE SET cause=excluded.cause,rate_limit_json=excluded.rate_limit_json,cooldown_until=MAX(provider_circuit_events.cooldown_until,excluded.cooldown_until)")
+                    .bind(&circuit.id).bind(id).bind(&circuit.cause).bind(&circuit.rate_limit_json)
+                    .bind(circuit.opened_at).bind(circuit.cooldown_until).bind(id)
+                    .execute(&mut *transaction).await?;
+            }
+            sqlx::query("UPDATE providers SET status=CASE WHEN manual_disabled=1 THEN 'disabled' WHEN ? IS NULL THEN status ELSE ? END,cooldown_until=CASE WHEN manual_disabled=1 THEN NULL WHEN ? IS NULL THEN cooldown_until ELSE ? END,rate_limit_json=?,last_error=CASE WHEN ? IS NULL THEN last_error ELSE ? END,last_used_at=COALESCE(?,last_used_at),updated_at=? WHERE id=?")
+                .bind(&update.status).bind(&update.status).bind(&update.status).bind(update.cooldown_until)
+                .bind(&update.rate_limit_json).bind(&update.status).bind(&update.last_error)
+                .bind(update.last_used_at).bind(update.updated_at).bind(id)
                 .execute(&mut *transaction).await?;
         }
         let mut persisted_affinities = Vec::with_capacity(affinities.len());
@@ -370,21 +402,22 @@ impl Balancer {
             .iter_mut()
             .find(|provider| provider.id == provider_id)
         {
-            provider.status = if provider.manual_disabled == 1 {
-                "disabled".to_owned()
-            } else {
-                update.status.clone()
-            };
-            provider.cooldown_until = (provider.manual_disabled == 0)
-                .then_some(update.cooldown_until)
-                .flatten();
+            if provider.manual_disabled == 0
+                && let Some(status) = &update.status
+            {
+                provider.status = status.clone();
+                provider.cooldown_until = update.cooldown_until;
+                provider.last_error = update.last_error.clone();
+            }
             provider.rate_limit_json = Some(update.rate_limit_json.clone());
-            provider.last_error = update.last_error.clone();
             provider.last_used_at = update.last_used_at.or(provider.last_used_at);
             provider.updated_at = update.updated_at;
         }
         self.providers.store(Arc::new(providers));
-        self.provider_updates.insert(provider_id.to_owned(), update);
+        self.provider_updates
+            .entry(provider_id.to_owned())
+            .and_modify(|current| current.merge(update.clone()))
+            .or_insert(update);
     }
 }
 
@@ -422,31 +455,40 @@ pub async fn track_response(
     let rate_json = serde_json::Value::Object(tracked).to_string();
     let update = match status.as_u16() {
         401 | 403 => ProviderUpdate {
-            status: "auth_error".to_owned(),
+            status: Some("auth_error".to_owned()),
             cooldown_until: None,
             rate_limit_json: rate_json,
             last_error: Some(format!("upstream HTTP {}", status.as_u16())),
             last_used_at: Some(now),
             updated_at: now,
+            circuit: None,
         },
         429 => {
             let cooldown = cooldown_until(headers, now);
             ProviderUpdate {
-                status: "cooldown".to_owned(),
+                status: Some("cooldown".to_owned()),
                 cooldown_until: Some(cooldown),
-                rate_limit_json: rate_json,
+                rate_limit_json: rate_json.clone(),
                 last_error: Some("rate limited".to_owned()),
                 last_used_at: Some(now),
                 updated_at: now,
+                circuit: Some(CircuitOpen {
+                    id: Uuid::new_v4().to_string(),
+                    cause: "upstream HTTP 429".to_owned(),
+                    rate_limit_json: rate_json,
+                    opened_at: now,
+                    cooldown_until: cooldown,
+                }),
             }
         }
         _ => ProviderUpdate {
-            status: "active".to_owned(),
+            status: None,
             cooldown_until: None,
             rate_limit_json: rate_json,
             last_error: None,
             last_used_at: Some(now),
             updated_at: now,
+            circuit: None,
         },
     };
     state.balancer.observe(provider_id, update);
@@ -553,6 +595,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rate_limit_circuit_is_persisted_and_closed_after_cooldown() {
+        let state = crate::test_state("http://token.invalid").await;
+        let now = chrono::Utc::now().timestamp();
+        sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,status,created_at,updated_at) VALUES('provider','provider','account','access','refresh','active',?,?)")
+            .bind(now)
+            .bind(now)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        state.balancer.reload_providers(&state.db).await.unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("30"));
+        track_response(&state, "provider", StatusCode::TOO_MANY_REQUESTS, &headers)
+            .await
+            .unwrap();
+        track_response(&state, "provider", StatusCode::OK, &HeaderMap::new())
+            .await
+            .unwrap();
+        state.balancer.maintain(&state.db).await.unwrap();
+
+        let status: String = sqlx::query_scalar("SELECT status FROM providers WHERE id='provider'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(status, "cooldown");
+
+        let open: (String, String, i64, Option<i64>) = sqlx::query_as("SELECT cause,rate_limit_json,cooldown_until,closed_at FROM provider_circuit_events WHERE provider_id='provider'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(open.0, "upstream HTTP 429");
+        assert!(open.1.contains("retry-after"));
+        assert!(open.2 >= now + 30);
+        assert_eq!(open.3, None);
+
+        sqlx::query("UPDATE providers SET cooldown_until=?,updated_at=? WHERE id='provider'")
+            .bind(now - 1)
+            .bind(now + 1)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        state.balancer.maintain(&state.db).await.unwrap();
+
+        let closed: (String, Option<i64>, Option<String>) = sqlx::query_as("SELECT status,closed_at,resolution FROM providers LEFT JOIN provider_circuit_events ON provider_circuit_events.provider_id=providers.id WHERE providers.id='provider'")
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        assert_eq!(closed.0, "active");
+        assert!(closed.1.is_some());
+        assert_eq!(closed.2.as_deref(), Some("provider became active"));
+    }
+
+    #[tokio::test]
     async fn selection_respects_owner_grants_and_global_access() {
         let state = crate::test_state("http://token.invalid").await;
         let now = chrono::Utc::now().timestamp();
@@ -626,12 +722,13 @@ mod tests {
         balancer.observe(
             "deleted",
             ProviderUpdate {
-                status: "cooldown".to_owned(),
+                status: Some("cooldown".to_owned()),
                 cooldown_until: Some(now + 60),
                 rate_limit_json: "before-delete".to_owned(),
                 last_error: None,
                 last_used_at: Some(now),
                 updated_at: now,
+                circuit: None,
             },
         );
 
@@ -649,12 +746,13 @@ mod tests {
             balancer.observe(
                 id,
                 ProviderUpdate {
-                    status: "cooldown".to_owned(),
+                    status: Some("cooldown".to_owned()),
                     cooldown_until: Some(now + 60),
                     rate_limit_json: rate_limit_json.to_owned(),
                     last_error: None,
                     last_used_at: Some(now),
                     updated_at: now,
+                    circuit: None,
                 },
             );
         }

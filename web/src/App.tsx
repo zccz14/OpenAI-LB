@@ -113,6 +113,13 @@ import { Textarea } from "@/components/ui/textarea"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Separator } from "@/components/ui/separator"
 import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet"
+import {
   Select,
   SelectContent,
   SelectGroup,
@@ -291,6 +298,19 @@ type ProviderRateLimitResetEntry = {
 }
 type ProviderRateLimitResetsResponse = {
   providers: Record<string, ProviderRateLimitResetEntry>
+}
+type ProviderCircuitEvent = {
+  id: string
+  provider_id: string
+  cause: string
+  rate_limit_json: string
+  opened_at: number
+  cooldown_until: number
+  closed_at?: number
+  resolution?: string
+}
+type ProviderCircuitSummaryResponse = {
+  providers: Record<string, ProviderCircuitEvent>
 }
 type ProviderRateLimitResetResult = { outcome?: string }
 type ProviderRateLimitResetTarget = {
@@ -507,7 +527,20 @@ const copy = {
     account: "账户",
     ownerId: "所有者 ID",
     status: "状态",
-    recoveryReason: "恢复 / 原因",
+    circuitBreaker: "熔断",
+    circuitOpen: "已熔断",
+    circuitRecovered: "已恢复",
+    circuitNeverOpened: "无熔断记录",
+    circuitUntil: "熔断至",
+    circuitOpenedAt: "触发时间",
+    circuitClosedAt: "恢复时间",
+    circuitReason: "触发原因",
+    circuitResolution: "结束方式",
+    circuitRateLimitHeaders: "限流响应头",
+    circuitHistory: "熔断记录",
+    circuitHistoryTitle: "上游熔断记录",
+    circuitHistoryDescription:
+      "429 触发、熔断截止时间和恢复结果均持久化在 SQLite。",
     actions: "操作",
     refresh: "刷新",
     providerUpdated: "上游提供商已更新",
@@ -973,7 +1006,20 @@ const copy = {
     account: "Account",
     ownerId: "Owner ID",
     status: "Status",
-    recoveryReason: "Recovery / reason",
+    circuitBreaker: "Circuit breaker",
+    circuitOpen: "Circuit open",
+    circuitRecovered: "Recovered",
+    circuitNeverOpened: "No circuit history",
+    circuitUntil: "Open until",
+    circuitOpenedAt: "Opened",
+    circuitClosedAt: "Recovered",
+    circuitReason: "Trigger",
+    circuitResolution: "Resolution",
+    circuitRateLimitHeaders: "Rate-limit response headers",
+    circuitHistory: "Circuit history",
+    circuitHistoryTitle: "Provider circuit history",
+    circuitHistoryDescription:
+      "429 triggers, cooldown deadlines, and recovery results are persisted in SQLite.",
     actions: "Actions",
     refresh: "Refresh",
     providerUpdated: "Provider updated",
@@ -2723,6 +2769,7 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
     useState<ProviderRateLimitResetTarget | null>(null)
   const [resetPending, setResetPending] = useState(false)
   const [grantProvider, setGrantProvider] = useState<Provider | null>(null)
+  const [circuitProvider, setCircuitProvider] = useState<Provider | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<Provider | null>(null)
   const [deletePending, setDeletePending] = useState(false)
   const tokenRequest = useRef<AbortController | null>(null)
@@ -2735,6 +2782,11 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
       sdk,
       "/api/providers/rate-limit-resets"
     )
+  const { data: circuitData } =
+    useApiQuery<ProviderCircuitSummaryResponse>(
+      sdk,
+      "/api/providers/circuit-events"
+    )
   useEffect(
     () => () => {
       tokenRequest.current?.abort()
@@ -2745,6 +2797,9 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
   function refreshProviders() {
     void queryClient.invalidateQueries({ queryKey: ["/api/providers"] })
     void queryClient.invalidateQueries({ queryKey: ["/api/providers/usage"] })
+    void queryClient.invalidateQueries({
+      queryKey: ["/api/providers/circuit-events"],
+    })
     void queryClient.invalidateQueries({
       queryKey: ["/api/providers/rate-limit-resets"],
     })
@@ -2915,7 +2970,7 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                     <TableHead>{t.rateLimitResetNextExpiresAt}</TableHead>
                     <TableHead>{t.status}</TableHead>
                     <TableHead>{t.inflight}</TableHead>
-                    <TableHead>{t.recoveryReason}</TableHead>
+                    <TableHead>{t.circuitBreaker}</TableHead>
                     <TableHead className="text-right">{t.actions}</TableHead>
                   </TableRow>
                 </TableHeader>
@@ -2998,11 +3053,13 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                         <TableCell className="tabular-nums">
                           {provider.inflight}
                         </TableCell>
-                        <TableCell className="max-w-64 text-xs text-muted-foreground">
-                          {provider.last_error ||
-                            (provider.cooldown_until
-                              ? formatTime(provider.cooldown_until, locale)
-                              : "—")}
+                        <TableCell>
+                          <ProviderCircuitStatus
+                            event={circuitData?.providers[provider.id]}
+                            locale={locale}
+                            provider={provider}
+                            onOpenHistory={() => setCircuitProvider(provider)}
+                          />
                         </TableCell>
                         <TableCell>
                           <div className="flex justify-end gap-2">
@@ -3129,6 +3186,14 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
           error={resetData?.providers[resetProvider.id]?.error || resetError}
           onClose={() => setResetProvider(null)}
           onConsume={beginRateLimitReset}
+        />
+      )}
+      {circuitProvider && (
+        <ProviderCircuitHistorySheet
+          sdk={sdk}
+          locale={locale}
+          provider={circuitProvider}
+          onClose={() => setCircuitProvider(null)}
         />
       )}
       {grantProvider && (
@@ -3605,6 +3670,93 @@ function RateLimitResetExpiries({
         <RateLimitResetExpiry key={credit.id} locale={locale} credit={credit} />
       ))}
     </div>
+  )
+}
+
+function ProviderCircuitHistorySheet({
+  sdk,
+  locale,
+  provider,
+  onClose,
+}: {
+  sdk: AuthSdk
+  locale: Locale
+  provider: Provider
+  onClose: () => void
+}) {
+  const t = copy[locale]
+  const { data, error, loading } = useApiQuery<ProviderCircuitEvent[]>(
+    sdk,
+    `/api/providers/${provider.id}/circuit-events`
+  )
+  return (
+    <Sheet open onOpenChange={(next) => !next && onClose()}>
+      <SheetContent className="w-full p-0 sm:max-w-xl">
+        <SheetHeader>
+          <SheetTitle>
+            {t.circuitHistoryTitle}: {provider.name}
+          </SheetTitle>
+          <SheetDescription>{t.circuitHistoryDescription}</SheetDescription>
+        </SheetHeader>
+        <ScrollArea className="min-h-0 flex-1 px-4 pb-4">
+          {loading ? (
+            <div className="flex flex-col gap-3">
+              {Array.from({ length: 3 }, (_, index) => (
+                <Skeleton key={index} className="h-28 w-full" />
+              ))}
+            </div>
+          ) : error ? (
+            <ErrorState message={error} />
+          ) : !data?.length ? (
+            <EmptyState
+              icon={<ShieldCheckIcon />}
+              title={t.circuitNeverOpened}
+              description={t.circuitHistoryDescription}
+            />
+          ) : (
+            <div className="flex flex-col gap-4">
+              {data.map((event, index) => (
+                <div key={event.id} className="flex flex-col gap-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <Badge variant={event.closed_at ? "secondary" : "destructive"}>
+                      {event.closed_at ? <CheckCircle2Icon /> : <ShieldAlertIcon />}
+                      {event.closed_at ? t.circuitRecovered : t.circuitOpen}
+                    </Badge>
+                    <span className="text-xs tabular-nums text-muted-foreground">
+                      {t.circuitOpenedAt}: {formatTime(event.opened_at, locale)}
+                    </span>
+                  </div>
+                  <Definition
+                    rows={[
+                      [t.circuitReason, event.cause],
+                      [t.circuitUntil, formatTime(event.cooldown_until, locale)],
+                      [
+                        t.circuitClosedAt,
+                        event.closed_at
+                          ? formatTime(event.closed_at, locale)
+                          : "—",
+                      ],
+                      [t.circuitResolution, event.resolution || "—"],
+                    ]}
+                  />
+                  <div className="flex flex-col gap-2">
+                    <span className="text-xs font-medium text-muted-foreground">
+                      {t.circuitRateLimitHeaders}
+                    </span>
+                    <ScrollArea className="max-h-40 rounded-lg border bg-muted p-3">
+                      <pre className="text-xs break-all whitespace-pre-wrap">
+                        {formatCircuitRateLimitHeaders(event.rate_limit_json)}
+                      </pre>
+                    </ScrollArea>
+                  </div>
+                  {index < data.length - 1 && <Separator />}
+                </div>
+              ))}
+            </div>
+          )}
+        </ScrollArea>
+      </SheetContent>
+    </Sheet>
   )
 }
 
@@ -6471,7 +6623,8 @@ function Definition({ rows }: { rows: [string, unknown][] }) {
   )
 }
 function StatusBadge({ status, locale }: { status: string; locale: Locale }) {
-  const bad = status === "auth_error" || status === "disabled"
+  const bad =
+    status === "auth_error" || status === "cooldown" || status === "disabled"
   return (
     <Badge variant={bad ? "destructive" : "secondary"}>
       {status === "active" ? (
@@ -6483,6 +6636,49 @@ function StatusBadge({ status, locale }: { status: string; locale: Locale }) {
       )}
       {statusLabel(status, locale)}
     </Badge>
+  )
+}
+function ProviderCircuitStatus({
+  event,
+  locale,
+  provider,
+  onOpenHistory,
+}: {
+  event?: ProviderCircuitEvent
+  locale: Locale
+  provider: Provider
+  onOpenHistory: () => void
+}) {
+  const t = copy[locale]
+  const open = provider.status === "cooldown"
+  const deadline = provider.cooldown_until ?? event?.cooldown_until
+  return (
+    <div className="flex min-w-40 flex-col items-start gap-1">
+      <Badge variant={open ? "destructive" : "secondary"}>
+        {open ? <ShieldAlertIcon /> : <CheckCircle2Icon />}
+        {open
+          ? t.circuitOpen
+          : event?.closed_at
+            ? t.circuitRecovered
+            : t.circuitNeverOpened}
+      </Badge>
+      {open ? (
+        <span className="text-xs tabular-nums text-muted-foreground">
+          {t.circuitUntil}: {formatTime(deadline, locale)}
+        </span>
+      ) : event?.closed_at ? (
+        <span className="text-xs tabular-nums text-muted-foreground">
+          {t.circuitClosedAt}: {formatTime(event.closed_at, locale)}
+        </span>
+      ) : null}
+      {open && provider.last_error && (
+        <span className="text-xs text-muted-foreground">{provider.last_error}</span>
+      )}
+      <Button size="sm" variant="link" onClick={onOpenHistory}>
+        <ScrollTextIcon data-icon="inline-start" />
+        {t.circuitHistory}
+      </Button>
+    </div>
   )
 }
 function DataTable({ children }: { children: ReactNode }) {
@@ -6580,6 +6776,13 @@ function formatTime(timestamp: RateLimitResetTimestamp, locale: Locale) {
         dateStyle: "short",
         timeStyle: "medium",
       }).format(seconds * 1000)
+}
+function formatCircuitRateLimitHeaders(value: string) {
+  try {
+    return JSON.stringify(JSON.parse(value), null, 2)
+  } catch {
+    return value
+  }
 }
 function formatRateLimitResetTimeRemaining(timestamp: number, locale: Locale) {
   const seconds = Math.max(0, timestamp - Math.floor(Date.now() / 1000))

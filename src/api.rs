@@ -7,9 +7,9 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::{QueryBuilder, Row, Sqlite};
+use sqlx::{FromRow, QueryBuilder, Row, Sqlite};
 use uuid::Uuid;
 
 use crate::{
@@ -269,6 +269,18 @@ pub struct CreateProvider {
     refresh_key: String,
 }
 
+#[derive(FromRow, Serialize)]
+pub struct ProviderCircuitEvent {
+    id: String,
+    provider_id: String,
+    cause: String,
+    rate_limit_json: String,
+    opened_at: i64,
+    cooldown_until: i64,
+    closed_at: Option<i64>,
+    resolution: Option<String>,
+}
+
 pub async fn list_providers(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -297,6 +309,45 @@ pub async fn list_providers(
             })
             .collect(),
     )))
+}
+
+pub async fn list_provider_circuit_summaries(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    let user = browser_identity(&state, &headers).await?;
+    let rows = if is_admin(&user) {
+        sqlx::query_as::<_, ProviderCircuitEvent>("SELECT e.id,e.provider_id,e.cause,e.rate_limit_json,e.opened_at,e.cooldown_until,e.closed_at,e.resolution FROM provider_circuit_events e JOIN providers p ON p.id=e.provider_id WHERE e.id=(SELECT latest.id FROM provider_circuit_events latest WHERE latest.provider_id=e.provider_id ORDER BY latest.opened_at DESC,latest.id DESC LIMIT 1) ORDER BY e.opened_at DESC,e.id DESC")
+            .fetch_all(&state.db)
+            .await?
+    } else {
+        sqlx::query_as::<_, ProviderCircuitEvent>("SELECT e.id,e.provider_id,e.cause,e.rate_limit_json,e.opened_at,e.cooldown_until,e.closed_at,e.resolution FROM provider_circuit_events e JOIN providers p ON p.id=e.provider_id WHERE p.owner_id=? AND e.id=(SELECT latest.id FROM provider_circuit_events latest WHERE latest.provider_id=e.provider_id ORDER BY latest.opened_at DESC,latest.id DESC LIMIT 1) ORDER BY e.opened_at DESC,e.id DESC")
+            .bind(&user.id)
+            .fetch_all(&state.db)
+            .await?
+    };
+    let mut providers = serde_json::Map::new();
+    for event in rows {
+        providers.insert(
+            event.provider_id.clone(),
+            serde_json::to_value(event).expect("circuit event serializes"),
+        );
+    }
+    Ok(Json(json!({"providers": providers})))
+}
+
+pub async fn list_provider_circuit_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<ProviderCircuitEvent>>, AppError> {
+    let user = browser_identity(&state, &headers).await?;
+    require_provider_manager(&state, &user, &id).await?;
+    let events = sqlx::query_as::<_, ProviderCircuitEvent>("SELECT id,provider_id,cause,rate_limit_json,opened_at,cooldown_until,closed_at,resolution FROM provider_circuit_events WHERE provider_id=? ORDER BY opened_at DESC,id DESC LIMIT 100")
+        .bind(&id)
+        .fetch_all(&state.db)
+        .await?;
+    Ok(Json(events))
 }
 
 pub async fn create_provider(
@@ -2685,6 +2736,53 @@ mod tests {
             assert_eq!(detail["reasoning_effort"], "high");
             assert_eq!(detail["upstream_http_version"], "HTTP/2");
             assert_eq!(detail["previous"]["id"], previous_id);
+            let circuit_id = format!("circuit-{user_id}");
+            sqlx::query("INSERT INTO provider_circuit_events(id,provider_id,cause,rate_limit_json,opened_at,cooldown_until) VALUES(?,?, 'upstream HTTP 429','{}',?,?)")
+                .bind(&circuit_id)
+                .bind(&provider_id)
+                .bind(now)
+                .bind(now + 60)
+                .execute(&state.db)
+                .await
+                .unwrap();
+            let circuit_summary = provider_request(
+                &state,
+                Method::GET,
+                "/api/providers/circuit-events",
+                &browser_token,
+                None,
+            )
+            .await;
+            assert_eq!(circuit_summary.status(), StatusCode::OK);
+            let circuit_summary: Value = serde_json::from_slice(
+                &circuit_summary
+                    .into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes(),
+            )
+            .unwrap();
+            assert_eq!(circuit_summary["providers"][&provider_id]["id"], circuit_id);
+            let circuit_history = provider_request(
+                &state,
+                Method::GET,
+                &format!("/api/providers/{provider_id}/circuit-events"),
+                &browser_token,
+                None,
+            )
+            .await;
+            assert_eq!(circuit_history.status(), StatusCode::OK);
+            let circuit_history: Value = serde_json::from_slice(
+                &circuit_history
+                    .into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes(),
+            )
+            .unwrap();
+            assert_eq!(circuit_history[0]["id"], circuit_id);
             let test = provider_request(
                 &state,
                 Method::POST,

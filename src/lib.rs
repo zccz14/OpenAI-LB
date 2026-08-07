@@ -238,6 +238,8 @@ async fn record_response_transport(
     Response::from_parts(parts, Body::from_stream(output))
 }
 
+include!(concat!(env!("OUT_DIR"), "/embedded_assets_fingerprint.rs"));
+
 #[derive(RustEmbed)]
 #[folder = "web/dist/"]
 struct Assets;

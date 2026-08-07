@@ -51,6 +51,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
         run: cargo build --release --locked
+      - name: Verify embedded frontend bundle
+        run: |
+          bundle="$(sed -n 's/.*src="\(\/assets\/[^" ]*\.js\)".*/\1/p' web/dist/index.html)"
+          test -n "$bundle"
+          strings target/release/openai-lb | grep -F "$bundle" >/dev/null
       - name: Package binary
         run: |
           mkdir package

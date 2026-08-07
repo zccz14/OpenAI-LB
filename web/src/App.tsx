@@ -2960,7 +2960,6 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                 <TableHeader>
                   <TableRow>
                     <TableHead>{t.name}</TableHead>
-                    <TableHead>{t.account}</TableHead>
                     <TableHead>{t.ownerId}</TableHead>
                     <TableHead>{t.usageEmail}</TableHead>
                     <TableHead>{t.usagePlan}</TableHead>
@@ -2994,9 +2993,6 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                       <TableRow key={provider.id}>
                         <TableCell className="font-medium">
                           {provider.name}
-                        </TableCell>
-                        <TableCell className="font-mono text-xs">
-                          {provider.account_id}
                         </TableCell>
                         <TableCell className="font-mono text-xs">
                           {provider.owner_id || "—"}

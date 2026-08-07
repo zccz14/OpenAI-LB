@@ -36,6 +36,8 @@ pub struct Provider {
     pub created_at: i64,
     pub updated_at: i64,
     pub owner_id: Option<String>,
+    #[sqlx(default)]
+    pub owner_name: Option<String>,
 }
 
 #[derive(Clone)]

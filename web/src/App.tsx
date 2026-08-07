@@ -253,6 +253,7 @@ type Provider = {
   name: string
   account_id: string
   owner_id?: string
+  owner_name?: string
   status: string
   manual_disabled: number
   cooldown_until?: number
@@ -368,6 +369,7 @@ type Audit = {
   request_id: string
   thread_id?: string
   user_id: string
+  user_name?: string
   consumer_name: string
   provider_id?: string
   provider_name?: string
@@ -525,7 +527,7 @@ const copy = {
       "添加 access_key 与 refresh_key，或开始 PKCE OAuth。",
     name: "名称",
     account: "账户",
-    ownerId: "所有者 ID",
+    owner: "所有者",
     status: "状态",
     circuitBreaker: "熔断",
     circuitOpen: "已熔断",
@@ -1004,7 +1006,7 @@ const copy = {
       "Add access_key and refresh_key, or start PKCE OAuth.",
     name: "Name",
     account: "Account",
-    ownerId: "Owner ID",
+    owner: "Owner",
     status: "Status",
     circuitBreaker: "Circuit breaker",
     circuitOpen: "Circuit open",
@@ -2960,7 +2962,7 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                 <TableHeader>
                   <TableRow>
                     <TableHead>{t.name}</TableHead>
-                    <TableHead>{t.ownerId}</TableHead>
+                    <TableHead>{t.owner}</TableHead>
                     <TableHead>{t.usageEmail}</TableHead>
                     <TableHead>{t.usagePlan}</TableHead>
                     <TableHead>{t.quotaRemaining}</TableHead>
@@ -2994,8 +2996,15 @@ function Providers({ sdk, locale }: { sdk: AuthSdk; locale: Locale }) {
                         <TableCell className="font-medium">
                           {provider.name}
                         </TableCell>
-                        <TableCell className="font-mono text-xs">
-                          {provider.owner_id || "—"}
+                        <TableCell>
+                          {provider.owner_id ? (
+                            <UserDisplay
+                              displayName={provider.owner_name}
+                              userId={provider.owner_id}
+                            />
+                          ) : (
+                            "—"
+                          )}
                         </TableCell>
                         <TableCell className="text-xs">
                           {usageEmail(usage) || "—"}
@@ -4880,10 +4889,7 @@ function UsageDimensionCell({
 }) {
   if (dimension === "user")
     return (
-      <div className="flex flex-col">
-        <span className="font-medium">{usageUserLabel(row)}</span>
-        <code>{row.user_id}</code>
-      </div>
+      <UserDisplay displayName={usageUserLabel(row)} userId={row.user_id} />
     )
   if (dimension === "consumer")
     return (
@@ -4893,6 +4899,21 @@ function UsageDimensionCell({
       </div>
     )
   return <code>{usageDimensionLabel(row, dimension)}</code>
+}
+
+function UserDisplay({
+  displayName,
+  userId,
+}: {
+  displayName?: string
+  userId: string
+}) {
+  return (
+    <div className="flex flex-col">
+      <span className="font-medium">{displayName || userId}</span>
+      <code>{userId}</code>
+    </div>
+  )
 }
 
 function AuditPage({
@@ -5084,7 +5105,7 @@ function AuditPage({
                       <TableHead>{t.model}</TableHead>
                       <TableHead className="text-right">{t.cost}</TableHead>
                       <TableHead>{t.reasoningEffort}</TableHead>
-                      <TableHead>{t.userId}</TableHead>
+                      <TableHead>{t.userLabel}</TableHead>
                       <TableHead>{t.consumer}</TableHead>
                       <TableHead>{t.provider}</TableHead>
                       <TableHead>{t.threadId}</TableHead>
@@ -5109,11 +5130,9 @@ function AuditPage({
                           <code>{row.reasoning_effort || "—"}</code>
                         </TableCell>
                         <TableCell>
-                          <CopyableIdentifier
-                            value={row.user_id}
-                            label={t.userId}
-                            copyLabel={t.copyUserId}
-                            copiedLabel={t.copied}
+                          <UserDisplay
+                            displayName={row.user_name}
+                            userId={row.user_id}
                           />
                         </TableCell>
                         <TableCell className="font-medium">

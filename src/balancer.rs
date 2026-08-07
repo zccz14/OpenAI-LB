@@ -4,12 +4,12 @@ use std::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use arc_swap::ArcSwap;
 use dashmap::{DashMap, DashSet};
-use reqwest::{StatusCode, header::HeaderMap};
+use reqwest::StatusCode;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, Row};
@@ -438,23 +438,16 @@ pub async fn track_response(
     state: &AppState,
     provider_id: &str,
     status: StatusCode,
-    headers: &HeaderMap,
+    body: &[u8],
 ) -> Result<(), AppError> {
     let now = chrono::Utc::now().timestamp();
-    let tracked = headers
-        .iter()
-        .filter_map(|(name, value)| {
-            let name = name.as_str().to_ascii_lowercase();
-            if name != "retry-after" && !name.starts_with("x-ratelimit-") {
-                return None;
-            }
-            Some((
-                name,
-                serde_json::Value::String(value.to_str().ok()?.to_owned()),
-            ))
-        })
-        .collect::<serde_json::Map<String, serde_json::Value>>();
-    let rate_json = serde_json::Value::Object(tracked).to_string();
+    let error = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|response| response.get("error").cloned());
+    let rate_json = error
+        .as_ref()
+        .map(serde_json::Value::to_string)
+        .unwrap_or_else(|| "{}".to_owned());
     let update = match status.as_u16() {
         401 | 403 => ProviderUpdate {
             status: Some("auth_error".to_owned()),
@@ -465,24 +458,32 @@ pub async fn track_response(
             updated_at: now,
             circuit: None,
         },
-        429 => {
-            let cooldown = cooldown_until(headers, now);
-            ProviderUpdate {
+        429 => match usage_limit_cooldown(error.as_ref(), now) {
+            Some(cooldown) => ProviderUpdate {
                 status: Some("cooldown".to_owned()),
                 cooldown_until: Some(cooldown),
                 rate_limit_json: rate_json.clone(),
-                last_error: Some("rate limited".to_owned()),
+                last_error: Some("usage limit reached".to_owned()),
                 last_used_at: Some(now),
                 updated_at: now,
                 circuit: Some(CircuitOpen {
                     id: Uuid::new_v4().to_string(),
-                    cause: "upstream HTTP 429".to_owned(),
+                    cause: "usage_limit_reached".to_owned(),
                     rate_limit_json: rate_json,
                     opened_at: now,
                     cooldown_until: cooldown,
                 }),
-            }
-        }
+            },
+            None => ProviderUpdate {
+                status: None,
+                cooldown_until: None,
+                rate_limit_json: rate_json,
+                last_error: None,
+                last_used_at: Some(now),
+                updated_at: now,
+                circuit: None,
+            },
+        },
         _ => ProviderUpdate {
             status: None,
             cooldown_until: None,
@@ -497,57 +498,54 @@ pub async fn track_response(
     Ok(())
 }
 
-fn cooldown_until(headers: &HeaderMap, now: i64) -> i64 {
-    headers
-        .get("retry-after")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| {
-            value
-                .parse::<i64>()
-                .ok()
-                .map(|seconds| now + seconds.max(1))
-                .or_else(|| {
-                    httpdate::parse_http_date(value)
-                        .ok()
-                        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
-                        .map(|duration| duration.as_secs() as i64)
-                })
-        })
+fn usage_limit_cooldown(error: Option<&serde_json::Value>, now: i64) -> Option<i64> {
+    let error = error?;
+    (error.get("type").and_then(serde_json::Value::as_str) == Some("usage_limit_reached"))
+        .then_some(())?;
+    error
+        .get("resets_at")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|reset| *reset > now)
         .or_else(|| {
-            headers.iter().find_map(|(name, value)| {
-                name.as_str()
-                    .starts_with("x-ratelimit-reset")
-                    .then(|| parse_reset(value.to_str().ok()?, now))
-                    .flatten()
-            })
+            error
+                .get("resets_in_seconds")
+                .and_then(serde_json::Value::as_i64)
+                .filter(|seconds| *seconds > 0)
+                .and_then(|seconds| now.checked_add(seconds))
         })
-        .unwrap_or(now + 60)
-}
-
-fn parse_reset(value: &str, now: i64) -> Option<i64> {
-    if let Ok(timestamp) = value.parse::<i64>() {
-        return Some(if timestamp > 2_000_000_000 {
-            timestamp / 1000
-        } else if timestamp > now {
-            timestamp
-        } else {
-            now + timestamp.max(1)
-        });
-    }
-    let seconds = value.strip_suffix('s')?.parse::<f64>().ok()?;
-    Some(now + Duration::from_secs_f64(seconds.max(1.0)).as_secs() as i64)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reqwest::header::{HeaderMap, HeaderValue};
+    use serde_json::json;
 
     #[test]
-    fn retry_after_sets_cooldown() {
-        let mut headers = HeaderMap::new();
-        headers.insert("retry-after", HeaderValue::from_static("15"));
-        assert_eq!(cooldown_until(&headers, 100), 115);
+    fn usage_limit_response_sets_cooldown_from_resets_at() {
+        let error = json!({
+            "type": "usage_limit_reached",
+            "resets_at": 1_786_159_988_i64,
+            "resets_in_seconds": 31_710,
+        });
+        assert_eq!(
+            usage_limit_cooldown(Some(&error), 1_786_128_278),
+            Some(1_786_159_988)
+        );
+    }
+
+    #[test]
+    fn usage_limit_response_uses_resets_in_seconds_without_resets_at() {
+        let error = json!({
+            "type": "usage_limit_reached",
+            "resets_in_seconds": 31_710,
+        });
+        assert_eq!(usage_limit_cooldown(Some(&error), 100), Some(31_810));
+    }
+
+    #[test]
+    fn rate_limit_without_a_usage_reset_does_not_set_cooldown() {
+        let error = json!({"type": "rate_limit_exceeded"});
+        assert_eq!(usage_limit_cooldown(Some(&error), 100), None);
     }
 
     #[test]
@@ -608,12 +606,21 @@ mod tests {
             .unwrap();
         state.balancer.reload_providers(&state.db).await.unwrap();
 
-        let mut headers = HeaderMap::new();
-        headers.insert("retry-after", HeaderValue::from_static("30"));
-        track_response(&state, "provider", StatusCode::TOO_MANY_REQUESTS, &headers)
+        let reset = now + 30;
+        let body = serde_json::to_vec(&json!({
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "The usage limit has been reached",
+                "plan_type": "pro",
+                "resets_at": reset,
+                "resets_in_seconds": 30,
+            }
+        }))
+        .unwrap();
+        track_response(&state, "provider", StatusCode::TOO_MANY_REQUESTS, &body)
             .await
             .unwrap();
-        track_response(&state, "provider", StatusCode::OK, &HeaderMap::new())
+        track_response(&state, "provider", StatusCode::OK, &[])
             .await
             .unwrap();
         state.balancer.maintain(&state.db).await.unwrap();
@@ -628,9 +635,9 @@ mod tests {
             .fetch_one(&state.db)
             .await
             .unwrap();
-        assert_eq!(open.0, "upstream HTTP 429");
-        assert!(open.1.contains("retry-after"));
-        assert!(open.2 >= now + 30);
+        assert_eq!(open.0, "usage_limit_reached");
+        assert!(open.1.contains("resets_at"));
+        assert_eq!(open.2, reset);
         assert_eq!(open.3, None);
 
         sqlx::query("UPDATE providers SET cooldown_until=?,updated_at=? WHERE id='provider'")

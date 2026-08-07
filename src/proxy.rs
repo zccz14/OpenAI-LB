@@ -61,6 +61,48 @@ struct CallContext {
     stream: bool,
 }
 
+struct BufferedUpstream {
+    status: StatusCode,
+    version: Version,
+    headers: HeaderMap,
+    body: Bytes,
+}
+
+enum UpstreamResponse {
+    Live(reqwest::Response),
+    Buffered(BufferedUpstream),
+}
+
+impl UpstreamResponse {
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::Live(response) => response.status(),
+            Self::Buffered(response) => response.status,
+        }
+    }
+
+    fn version(&self) -> Version {
+        match self {
+            Self::Live(response) => response.version(),
+            Self::Buffered(response) => response.version,
+        }
+    }
+
+    fn headers(&self) -> &HeaderMap {
+        match self {
+            Self::Live(response) => response.headers(),
+            Self::Buffered(response) => &response.headers,
+        }
+    }
+
+    async fn into_bytes(self) -> Result<Bytes, AppError> {
+        match self {
+            Self::Live(response) => Ok(response.bytes().await?),
+            Self::Buffered(response) => Ok(response.body),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct AuditTransportId {
     pub id: String,
@@ -470,15 +512,10 @@ pub async fn handle_console_transcription(
         reqwest::Body::wrap_stream(body.into_data_stream()),
     )
     .await?;
-    track_response(
-        &state,
-        &lease.provider.id,
-        upstream.status(),
-        upstream.headers(),
-    )
-    .await?;
+    let upstream =
+        track_upstream(&state, &lease.provider.id, UpstreamResponse::Live(upstream)).await?;
     let status = upstream.status();
-    let body = upstream.bytes().await?;
+    let body = upstream.into_bytes().await?;
     if !status.is_success() {
         return Err(AppError::upstream(
             status.as_u16(),
@@ -518,15 +555,10 @@ pub async fn handle_console_image_generation(
     let upstream =
         send_console_image_upstream(&state, &lease, &headers, &request_id(&headers), request)
             .await?;
-    track_response(
-        &state,
-        &lease.provider.id,
-        upstream.status(),
-        upstream.headers(),
-    )
-    .await?;
+    let upstream =
+        track_upstream(&state, &lease.provider.id, UpstreamResponse::Live(upstream)).await?;
     let status = upstream.status();
-    let body = upstream.bytes().await?;
+    let body = upstream.into_bytes().await?;
     if !status.is_success() {
         return Err(AppError::upstream(
             status.as_u16(),
@@ -669,7 +701,7 @@ async fn dispatch(
         audit,
     )
     .await?;
-    track_response(&state, &first_id, response.status(), response.headers()).await?;
+    let response = track_upstream(&state, &first_id, UpstreamResponse::Live(response)).await?;
     let should_retry = retryable(response.status());
     let (lease, upstream) = if should_retry {
         let second = state
@@ -712,11 +744,10 @@ async fn dispatch(
                     audit,
                 )
                 .await?;
-                track_response(
+                let second_response = track_upstream(
                     &state,
                     &second.provider.id,
-                    second_response.status(),
-                    second_response.headers(),
+                    UpstreamResponse::Live(second_response),
                 )
                 .await?;
                 (second, second_response)
@@ -803,13 +834,8 @@ async fn dispatch_audio(
     audit.set_request(headers, &body, truncated);
     audit.set_request_size(bytes);
     let upstream = upstream?;
-    track_response(
-        &state,
-        &lease.provider.id,
-        upstream.status(),
-        upstream.headers(),
-    )
-    .await?;
+    let upstream =
+        track_upstream(&state, &lease.provider.id, UpstreamResponse::Live(upstream)).await?;
     relay_response(
         CallContext {
             request_id,
@@ -1325,10 +1351,32 @@ fn retryable(status: StatusCode) -> bool {
     matches!(status.as_u16(), 401 | 403 | 429) || status.is_server_error()
 }
 
+async fn track_upstream(
+    state: &AppState,
+    provider_id: &str,
+    upstream: UpstreamResponse,
+) -> Result<UpstreamResponse, AppError> {
+    if upstream.status() != StatusCode::TOO_MANY_REQUESTS {
+        track_response(state, provider_id, upstream.status(), &[]).await?;
+        return Ok(upstream);
+    }
+    let buffered = match upstream {
+        UpstreamResponse::Live(response) => BufferedUpstream {
+            status: response.status(),
+            version: response.version(),
+            headers: response.headers().clone(),
+            body: response.bytes().await?,
+        },
+        UpstreamResponse::Buffered(response) => response,
+    };
+    track_response(state, provider_id, buffered.status, &buffered.body).await?;
+    Ok(UpstreamResponse::Buffered(buffered))
+}
+
 async fn relay_response(
     context: CallContext,
     lease: Lease,
-    upstream: reqwest::Response,
+    upstream: UpstreamResponse,
     audit: &mut AuditTracker,
 ) -> Result<Response, AppError> {
     audit.mark_first_byte();
@@ -1337,9 +1385,10 @@ async fn relay_response(
     audit.set_compression_headers(&HeaderMap::new(), Some(upstream.headers()));
     audit.set_response_headers(upstream.headers());
     let mut headers = filtered_response_headers(upstream.headers());
-    let is_stream = context.stream && status.is_success();
+    let is_stream =
+        context.stream && status.is_success() && matches!(&upstream, UpstreamResponse::Live(_));
     if !is_stream {
-        let bytes = upstream.bytes().await?;
+        let bytes = upstream.into_bytes().await?;
         audit.set_response_size(bytes.len() as i64);
         audit.set_response_body(&bytes, false);
         let usage = usage_from_bytes(&bytes);
@@ -1366,6 +1415,9 @@ async fn relay_response(
         diagnostics_enabled: event.request_archive,
     });
     let completion = audit.take_stream(status, context.model.as_deref());
+    let UpstreamResponse::Live(upstream) = upstream else {
+        unreachable!("only successful live upstream responses stream")
+    };
     let mut stream = upstream.bytes_stream();
     let output = async_stream::stream! {
         let mut completion = completion;
@@ -1397,7 +1449,7 @@ async fn relay_response(
 async fn image_response(
     context: CallContext,
     lease: Lease,
-    upstream: reqwest::Response,
+    upstream: UpstreamResponse,
     audit: &mut AuditTracker,
 ) -> Result<Response, AppError> {
     audit.mark_first_byte();
@@ -1407,7 +1459,7 @@ async fn image_response(
         return relay_response(context, lease, upstream, audit).await;
     }
     audit.set_response_headers(upstream.headers());
-    let bytes = upstream.bytes().await?;
+    let bytes = upstream.into_bytes().await?;
     let (images, usage) = images_from_sse(&bytes)?;
     let envelope = serde_json::to_vec(
         &json!({"created": chrono::Utc::now().timestamp(), "data": images, "usage": usage}),
@@ -2205,6 +2257,41 @@ mod tests {
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (format!("http://{address}"), records)
+    }
+
+    async fn spawn_usage_limit_then_success(reset: i64) -> (String, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let app = Router::new().route(
+            "/responses",
+            post(move || {
+                let calls = counter.clone();
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return Response::builder()
+                            .status(StatusCode::TOO_MANY_REQUESTS)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                json!({"error": {
+                                    "type": "usage_limit_reached",
+                                    "message": "The usage limit has been reached",
+                                    "plan_type": "pro",
+                                    "resets_at": reset,
+                                    "resets_in_seconds": 3_600,
+                                }})
+                                .to_string(),
+                            ))
+                            .unwrap();
+                    }
+                    Json(json!({"id":"resp","usage":{"input_tokens":1,"output_tokens":2}}))
+                        .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}"), calls)
     }
 
     async fn spawn_stream_mock(fail_after_first_chunk: bool) -> (String, Arc<Notify>) {
@@ -3343,6 +3430,39 @@ mod tests {
                 .unwrap()
                 .contains("no available CodeX provider")
         );
+    }
+
+    #[tokio::test]
+    async fn usage_limit_429_retries_the_other_provider() {
+        let now = chrono::Utc::now().timestamp();
+        let (upstream, calls) = spawn_usage_limit_then_success(now + 3_600).await;
+        let state = crate::test_state_with_upstream("http://token.invalid", &upstream).await;
+        seed_proxy(&state, true).await;
+        sqlx::query("INSERT INTO providers(id,name,account_id,access_token,refresh_token,status,created_at,updated_at) VALUES('provider-2','two','account-2','access-2','refresh-2','active',?,?)")
+            .bind(now + 1)
+            .bind(now + 1)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        state.balancer.reload_providers(&state.db).await.unwrap();
+
+        let response = crate::router(state.clone())
+            .oneshot(proxy_request(
+                "/v1/responses",
+                "application/json",
+                Body::from(r#"{"model":"gpt-5.4","input":"hello"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let selected = state
+            .balancer
+            .select(&state, "user-1", true, None, None)
+            .await
+            .unwrap();
+        assert_eq!(selected.provider.id, "provider-2");
     }
 
     #[tokio::test]

@@ -1,4 +1,5 @@
 pub mod api;
+mod audio_spool;
 pub mod audit;
 pub mod auth;
 pub mod balancer;
@@ -66,6 +67,8 @@ impl AppState {
         let balancer = Balancer::default();
         balancer.hydrate(&db).await?;
         balancer.start_maintenance(db.clone());
+        #[cfg(not(test))]
+        audio_spool::start_cleanup(config.load().data_dir.clone());
         Ok(Self {
             config,
             db,
@@ -367,6 +370,7 @@ macro_rules! internal_from {
 }
 
 internal_from!(
+    std::io::Error,
     sqlx::Error,
     reqwest::Error,
     serde_json::Error,

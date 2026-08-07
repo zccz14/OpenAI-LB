@@ -56,7 +56,6 @@ const TRANSCRIPTION_USER_AGENT: &str = "Codex Desktop/26.519.81530 (macos; aarch
 const MAX_REFERENCE_IMAGES: usize = 4;
 
 struct CallContext {
-    request_id: String,
     model: Option<String>,
     stream: bool,
 }
@@ -120,7 +119,7 @@ impl AuditTracker {
     fn begin(
         state: &AppState,
         identity: &ApiIdentity,
-        request_id: &str,
+        audit_id: &str,
         thread_id: Option<&str>,
         method: &Method,
         path: &str,
@@ -134,7 +133,7 @@ impl AuditTracker {
         };
         let event = permit.as_ref().map(|_| AuditEvent {
             id: Uuid::new_v4().to_string(),
-            request_id: request_id.to_owned(),
+            request_id: audit_id.to_owned(),
             thread_id: thread_id.map(str::to_owned),
             consumer_id: identity.consumer_id.clone(),
             user_id: identity.user_id.clone(),
@@ -401,14 +400,14 @@ pub async fn handle_json(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let request_id = request_id(&headers);
+    let audit_id = Uuid::new_v4().to_string();
     let thread_id = thread_id(&headers);
     let identity = api_identity(&state, &headers).await?;
     let client_ip = peer.ip().to_string();
     let mut audit = AuditTracker::begin(
         &state,
         &identity,
-        &request_id,
+        &audit_id,
         thread_id.as_deref(),
         &method,
         uri.path(),
@@ -417,16 +416,7 @@ pub async fn handle_json(
     audit.set_request(&headers, &body, false);
     audit.set_compression_headers(&headers, None);
     audit.set_request_size(body.len() as i64);
-    let result = dispatch(
-        state,
-        identity,
-        request_id,
-        uri.path(),
-        &headers,
-        &body,
-        &mut audit,
-    )
-    .await;
+    let result = dispatch(state, identity, uri.path(), &headers, &body, &mut audit).await;
     if let Err(error) = &result
         && audit.event.is_some()
     {
@@ -449,13 +439,13 @@ pub async fn handle_audio(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, AppError> {
-    let request_id = request_id(&headers);
+    let audit_id = Uuid::new_v4().to_string();
     let thread_id = thread_id(&headers);
     let identity = api_identity(&state, &headers).await?;
     let mut audit = AuditTracker::begin(
         &state,
         &identity,
-        &request_id,
+        &audit_id,
         thread_id.as_deref(),
         &method,
         uri.path(),
@@ -463,16 +453,7 @@ pub async fn handle_audio(
     );
     audit.set_request(&headers, &[], true);
     audit.set_compression_headers(&headers, None);
-    let result = dispatch_audio(
-        state,
-        identity,
-        request_id,
-        uri.path(),
-        &headers,
-        body,
-        &mut audit,
-    )
-    .await;
+    let result = dispatch_audio(state, identity, uri.path(), &headers, body, &mut audit).await;
     if let Err(error) = &result
         && audit.event.is_some()
     {
@@ -503,12 +484,10 @@ pub async fn handle_console_transcription(
             != 0
     };
     let lease = select_ready_provider(&state, &user.id, all_providers, None).await?;
-    let request_id = request_id(&headers);
     let upstream = send_transcription_upstream(
         &state,
         &lease,
         &headers,
-        &request_id,
         reqwest::Body::wrap_stream(body.into_data_stream()),
     )
     .await?;
@@ -552,9 +531,7 @@ pub async fn handle_console_image_generation(
         .map_err(|_| AppError::bad_request("JSON request body required"))?;
     let request = transform_request("/v1/images/generations", Some(payload), &state)?;
     let lease = select_ready_provider(&state, &user.id, all_providers, None).await?;
-    let upstream =
-        send_console_image_upstream(&state, &lease, &headers, &request_id(&headers), request)
-            .await?;
+    let upstream = send_console_image_upstream(&state, &lease, &headers, request).await?;
     let upstream =
         track_upstream(&state, &lease.provider.id, UpstreamResponse::Live(upstream)).await?;
     let status = upstream.status();
@@ -585,7 +562,6 @@ fn body_preview(body: &[u8]) -> (Vec<u8>, bool) {
 pub(crate) fn archive_headers(headers: &HeaderMap) -> String {
     let values = headers
         .iter()
-        .filter(|(name, _)| archive_header_allowed(name))
         .map(|(name, value)| {
             (
                 name.as_str(),
@@ -594,23 +570,6 @@ pub(crate) fn archive_headers(headers: &HeaderMap) -> String {
         })
         .collect::<Vec<_>>();
     serde_json::to_string(&values).expect("HTTP headers are serializable")
-}
-
-fn archive_header_allowed(name: &HeaderName) -> bool {
-    let name = name.as_str();
-    matches!(
-        name,
-        "accept"
-            | "accept-encoding"
-            | "content-encoding"
-            | "content-length"
-            | "content-type"
-            | "date"
-            | "retry-after"
-            | "server"
-            | "user-agent"
-            | "x-request-id"
-    ) || name.starts_with("x-ratelimit-")
 }
 
 #[derive(Default)]
@@ -630,15 +589,6 @@ impl StreamingPreview {
     }
 }
 
-fn request_id(headers: &HeaderMap) -> String {
-    headers
-        .get("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| Uuid::new_v4().to_string())
-}
-
 fn thread_id(headers: &HeaderMap) -> Option<String> {
     ["x-codex-conversation-id", "thread-id"]
         .iter()
@@ -655,7 +605,6 @@ fn thread_id(headers: &HeaderMap) -> Option<String> {
 async fn dispatch(
     state: AppState,
     identity: ApiIdentity,
-    request_id: String,
     path: &str,
     headers: &HeaderMap,
     body: &Bytes,
@@ -691,16 +640,8 @@ async fn dispatch(
     .await?;
     audit.set_provider(&first.provider.id);
     let first_id = first.provider.id.clone();
-    let response = send_upstream(
-        &state,
-        &first,
-        path,
-        headers,
-        &request_id,
-        payload.clone().into(),
-        audit,
-    )
-    .await?;
+    let response =
+        send_upstream(&state, &first, path, headers, payload.clone().into(), audit).await?;
     let response = track_upstream(&state, &first_id, UpstreamResponse::Live(response)).await?;
     let should_retry = retryable(response.status());
     let (lease, upstream) = if should_retry {
@@ -717,33 +658,16 @@ async fn dispatch(
         match second {
             Ok(mut second) => {
                 if refresh_if_needed(&state, &mut second).await.is_err() {
-                    return relay_response(
-                        CallContext {
-                            request_id,
-                            model,
-                            stream,
-                        },
-                        first,
-                        response,
-                        audit,
-                    )
-                    .await;
+                    return relay_response(CallContext { model, stream }, first, response, audit)
+                        .await;
                 }
                 drop(response);
                 drop(first);
                 audit.set_provider(&second.provider.id);
                 payload =
                     transform_request(path, serde_json::from_slice::<Value>(body).ok(), &state)?;
-                let second_response = send_upstream(
-                    &state,
-                    &second,
-                    path,
-                    headers,
-                    &request_id,
-                    payload.into(),
-                    audit,
-                )
-                .await?;
+                let second_response =
+                    send_upstream(&state, &second, path, headers, payload.into(), audit).await?;
                 let second_response = track_upstream(
                     &state,
                     &second.provider.id,
@@ -758,18 +682,10 @@ async fn dispatch(
         (first, response)
     };
     if path == "/v1/images/generations" {
-        let context = CallContext {
-            request_id,
-            model,
-            stream,
-        };
+        let context = CallContext { model, stream };
         return image_response(context, lease, upstream, audit).await;
     }
-    let context = CallContext {
-        request_id,
-        model,
-        stream,
-    };
+    let context = CallContext { model, stream };
     relay_response(context, lease, upstream, audit).await
 }
 
@@ -784,7 +700,6 @@ fn reasoning_effort(request: &Value) -> Option<String> {
 async fn dispatch_audio(
     state: AppState,
     identity: ApiIdentity,
-    request_id: String,
     path: &str,
     headers: &HeaderMap,
     body: Body,
@@ -822,7 +737,6 @@ async fn dispatch_audio(
         &lease,
         path,
         headers,
-        &request_id,
         reqwest::Body::wrap_stream(stream),
         audit,
     )
@@ -838,7 +752,6 @@ async fn dispatch_audio(
         track_upstream(&state, &lease.provider.id, UpstreamResponse::Live(upstream)).await?;
     relay_response(
         CallContext {
-            request_id,
             model: None,
             stream: false,
         },
@@ -1200,12 +1113,11 @@ async fn send_upstream(
     lease: &Lease,
     path: &str,
     inbound: &HeaderMap,
-    request_id: &str,
     body: reqwest::Body,
     audit: &mut AuditTracker,
 ) -> Result<reqwest::Response, AppError> {
     if path == "/v1/audio/transcriptions" {
-        let request = transcription_request(state, lease, inbound, request_id)
+        let request = transcription_request(state, lease, inbound)
             .body(body)
             .build()?;
         audit.set_upstream_request_headers(request.headers());
@@ -1229,8 +1141,7 @@ async fn send_upstream(
             header::AUTHORIZATION,
             format!("Bearer {}", lease.access_token),
         )
-        .header("chatgpt-account-id", &lease.provider.account_id)
-        .header("x-request-id", request_id);
+        .header("chatgpt-account-id", &lease.provider.account_id);
     request = request.header(header::CONTENT_TYPE, "application/json");
     if let Some(openai_beta) = state.config.load().upstream_openai_beta.clone() {
         request = request.header("OpenAI-Beta", openai_beta);
@@ -1244,13 +1155,12 @@ async fn send_transcription_upstream(
     state: &AppState,
     lease: &Lease,
     inbound: &HeaderMap,
-    request_id: &str,
     body: reqwest::Body,
 ) -> Result<reqwest::Response, AppError> {
     Ok(state
         .client
         .execute(
-            transcription_request(state, lease, inbound, request_id)
+            transcription_request(state, lease, inbound)
                 .body(body)
                 .build()?,
         )
@@ -1261,7 +1171,6 @@ async fn send_console_image_upstream(
     state: &AppState,
     lease: &Lease,
     inbound: &HeaderMap,
-    request_id: &str,
     body: Bytes,
 ) -> Result<reqwest::Response, AppError> {
     let mut request = state
@@ -1278,7 +1187,6 @@ async fn send_console_image_upstream(
             format!("Bearer {}", lease.access_token),
         )
         .header("chatgpt-account-id", &lease.provider.account_id)
-        .header("x-request-id", request_id)
         .header(header::CONTENT_TYPE, "application/json");
     if let Some(openai_beta) = state.config.load().upstream_openai_beta.clone() {
         request = request.header("OpenAI-Beta", openai_beta);
@@ -1290,7 +1198,6 @@ fn transcription_request(
     state: &AppState,
     lease: &Lease,
     inbound: &HeaderMap,
-    request_id: &str,
 ) -> reqwest::RequestBuilder {
     let upstream = state.config.load();
     let endpoint = format!(
@@ -1312,7 +1219,6 @@ fn transcription_request(
         .header("chatgpt-account-id", &lease.provider.account_id)
         .header("originator", TRANSCRIPTION_ORIGINATOR)
         .header(header::USER_AGENT, TRANSCRIPTION_USER_AGENT)
-        .header("x-request-id", request_id)
 }
 
 fn header_value(headers: &HeaderMap, name: HeaderName) -> Option<String> {
@@ -1430,7 +1336,7 @@ async fn relay_response(
                     yield Ok::<Bytes, Infallible>(bytes);
                 }
                 Err(error) => {
-                    tracing::warn!(request_id = context.request_id, %error, "upstream stream ended with error");
+                    tracing::warn!(%error, "upstream stream ended with error");
                     stream_failed = true;
                     break;
                 }
@@ -1538,7 +1444,10 @@ fn images_from_sse(bytes: &[u8]) -> Result<(Vec<Value>, Usage), AppError> {
 fn filtered_response_headers(headers: &HeaderMap) -> Vec<(HeaderName, HeaderValue)> {
     headers
         .iter()
-        .filter(|(name, _)| !HOP_HEADERS.contains(&name.as_str().to_ascii_lowercase().as_str()))
+        .filter(|(name, _)| {
+            let lower = name.as_str().to_ascii_lowercase();
+            !HOP_HEADERS.contains(&lower.as_str()) && lower != "x-request-id"
+        })
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect()
 }
@@ -2377,6 +2286,7 @@ mod tests {
             .uri(path)
             .header(header::AUTHORIZATION, "Bearer sk-test-secret")
             .header(header::CONTENT_TYPE, content_type)
+            .header("x-request-id", "client-request-id")
             .header("x-lb-affinity-key", "explicit-secret")
             .header("x-session-id", "session-secret")
             .header("x-codex-session-id", "codex-session-secret")
@@ -2413,7 +2323,7 @@ mod tests {
         let lease = select_ready_provider(&state, "user-1", true, None)
             .await
             .unwrap();
-        let request = transcription_request(&state, &lease, &HeaderMap::new(), "request-1")
+        let request = transcription_request(&state, &lease, &HeaderMap::new())
             .body(reqwest::Body::from("audio"))
             .build()
             .unwrap();
@@ -2433,6 +2343,7 @@ mod tests {
             request.headers().get("chatgpt-account-id").unwrap(),
             "account-1"
         );
+        assert!(request.headers().get("x-request-id").is_none());
     }
 
     #[tokio::test]
@@ -2449,17 +2360,16 @@ mod tests {
             &state,
         )
         .unwrap();
-        let upstream =
-            send_console_image_upstream(&state, &lease, &HeaderMap::new(), "request-1", payload)
-                .await
-                .unwrap();
+        let upstream = send_console_image_upstream(&state, &lease, &HeaderMap::new(), payload)
+            .await
+            .unwrap();
         let (images, _) = images_from_sse(&upstream.bytes().await.unwrap()).unwrap();
         assert_eq!(images[0]["b64_json"], "aW1hZ2U=");
         let record = records.lock().await.pop().unwrap();
         assert_eq!(record.path, "/responses");
         assert_eq!(record.headers[header::AUTHORIZATION], "Bearer access-token");
         assert_eq!(record.headers["chatgpt-account-id"], "account-1");
-        assert_eq!(record.headers["x-request-id"], "request-1");
+        assert!(record.headers.get("x-request-id").is_none());
     }
 
     #[tokio::test]
@@ -2503,6 +2413,20 @@ mod tests {
 
         headers.clear();
         assert_eq!(thread_id(&headers), None);
+    }
+
+    #[test]
+    fn response_headers_exclude_x_request_id() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-request-id",
+            HeaderValue::from_static("upstream-request-id"),
+        );
+        headers.insert("x-upstream", HeaderValue::from_static("preserved"));
+
+        let forwarded = filtered_response_headers(&headers);
+        assert!(forwarded.iter().all(|(name, _)| name != "x-request-id"));
+        assert!(forwarded.iter().any(|(name, _)| name == "x-upstream"));
     }
 
     #[tokio::test]
@@ -2663,7 +2587,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_preview_excludes_credentials_and_private_headers() {
+    fn diagnostic_archive_keeps_all_headers() {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
@@ -2682,10 +2606,24 @@ mod tests {
         );
         let archived = archive_headers(&headers);
         let archived: Vec<(String, String)> = serde_json::from_str(&archived).unwrap();
-        assert_eq!(
-            archived,
-            vec![("content-type".to_owned(), "application/json".to_owned())]
-        );
+        assert_eq!(archived.len(), 9);
+        for (name, value) in [
+            ("authorization", "Bearer secret"),
+            ("x-api-key", "secret"),
+            ("x-openai-api-key", "secret"),
+            ("x-auth", "secret"),
+            ("x-credential", "secret"),
+            ("access-key", "secret"),
+            ("x-session-id", "session-secret"),
+            ("x-arbitrary", "private"),
+            ("content-type", "application/json"),
+        ] {
+            assert!(
+                archived
+                    .iter()
+                    .any(|header| header == &(name.to_owned(), value.to_owned()))
+            );
+        }
 
         let (preview, truncated) = body_preview(&vec![7; ARCHIVE_BODY_LIMIT + 1]);
         assert_eq!(preview.len(), ARCHIVE_BODY_LIMIT);
@@ -3048,6 +2986,7 @@ mod tests {
             ]
         );
         for record in records.iter() {
+            assert!(record.headers.get("x-request-id").is_none());
             assert!(record.headers.get("x-lb-affinity-key").is_none());
             assert!(record.headers.get("x-session-id").is_none());
             assert!(record.headers.get("x-codex-session-id").is_none());
@@ -3119,9 +3058,10 @@ mod tests {
         .fetch_one(&state.db)
         .await
         .unwrap();
-        assert!(!archive.0.contains("authorization"));
-        assert!(!archive.0.contains("sk-test-secret"));
-        assert!(!archive.0.contains("session-secret"));
+        assert!(archive.0.contains("authorization"));
+        assert!(archive.0.contains("sk-test-secret"));
+        assert!(archive.0.contains("session-secret"));
+        assert!(archive.0.contains("client-request-id"));
         assert!(std::str::from_utf8(&archive.1).unwrap().contains("hello"));
         assert!(std::str::from_utf8(&archive.2).unwrap().contains("resp"));
         assert!(!archive.3);

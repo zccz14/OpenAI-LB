@@ -287,12 +287,12 @@ pub async fn list_providers(
 ) -> Result<Json<Value>, AppError> {
     let user = browser_identity(&state, &headers).await?;
     let providers = if is_admin(&user) {
-        sqlx::query_as::<_, Provider>("SELECT * FROM providers ORDER BY created_at DESC")
+        sqlx::query_as::<_, Provider>("SELECT p.*,u.display_name AS owner_name FROM providers p LEFT JOIN users u ON u.id=p.owner_id ORDER BY p.created_at DESC")
             .fetch_all(&state.db)
             .await?
     } else {
         sqlx::query_as::<_, Provider>(
-            "SELECT * FROM providers WHERE owner_id=? ORDER BY created_at DESC",
+            "SELECT p.*,u.display_name AS owner_name FROM providers p LEFT JOIN users u ON u.id=p.owner_id WHERE p.owner_id=? ORDER BY p.created_at DESC",
         )
         .bind(&user.id)
         .fetch_all(&state.db)
@@ -1161,7 +1161,7 @@ pub async fn audit(
         .await?;
 
     let mut rows_query = QueryBuilder::<Sqlite>::new(
-        "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.path,c.method,c.model,c.reasoning_effort,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at,c.first_byte_latency_ms,c.request_bytes,c.response_bytes,c.request_transport_bytes,c.response_transport_bytes,c.cost_usd_nanos FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id",
+        "SELECT c.id,c.request_id,c.thread_id,c.user_id,k.name,c.provider_id,ch.name,c.path,c.method,c.model,c.reasoning_effort,c.status,c.latency_ms,c.input_tokens,c.output_tokens,c.cached_tokens,c.error,c.client_ip,c.created_at,c.first_byte_latency_ms,c.request_bytes,c.response_bytes,c.request_transport_bytes,c.response_transport_bytes,c.cost_usd_nanos,u.display_name FROM api_calls c JOIN consumers k ON k.id=c.consumer_id LEFT JOIN providers ch ON ch.id=c.provider_id LEFT JOIN users u ON u.id=c.user_id",
     );
     append_audit_filters(&mut rows_query, &filters, &user);
     rows_query
@@ -1172,7 +1172,7 @@ pub async fn audit(
     let rows = rows_query.build().fetch_all(&state.db).await?;
     Ok(Json(json!({
         "rows": rows.into_iter().map(|row| json!({
-        "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"thread_id":row.get::<Option<String>,_>(2),"user_id":row.get::<String,_>(3),"consumer_name":row.get::<String,_>(4),"provider_id":row.get::<Option<String>,_>(5),"provider_name":row.get::<Option<String>,_>(6),
+        "id":row.get::<String,_>(0),"request_id":row.get::<String,_>(1),"thread_id":row.get::<Option<String>,_>(2),"user_id":row.get::<String,_>(3),"user_name":row.get::<Option<String>,_>(25),"consumer_name":row.get::<String,_>(4),"provider_id":row.get::<Option<String>,_>(5),"provider_name":row.get::<Option<String>,_>(6),
         "path":row.get::<String,_>(7),"method":row.get::<String,_>(8),"model":row.get::<Option<String>,_>(9),"reasoning_effort":row.get::<Option<String>,_>(10),"status":row.get::<i64,_>(11),"latency_ms":row.get::<i64,_>(12),
         "input_tokens":row.get::<i64,_>(13),"output_tokens":row.get::<i64,_>(14),"cached_tokens":row.get::<i64,_>(15),"error":row.get::<Option<String>,_>(16),"client_ip":row.get::<Option<String>,_>(17),"created_at":row.get::<i64,_>(18),"first_byte_latency_ms":row.get::<Option<i64>,_>(19),"request_bytes":row.get::<i64,_>(20),"response_bytes":row.get::<i64,_>(21),"request_transport_bytes":row.get::<i64,_>(22),"response_transport_bytes":row.get::<i64,_>(23),"cost_usd_nanos":row.get::<Option<i64>,_>(24)
     })).collect::<Vec<_>>(),
@@ -2870,6 +2870,19 @@ mod tests {
         )
         .await;
         assert_eq!(tenant_vacuum.status(), StatusCode::FORBIDDEN);
+        let tenant_providers =
+            provider_request(&state, Method::GET, "/api/providers", &tenant_token, None).await;
+        assert_eq!(tenant_providers.status(), StatusCode::OK);
+        let tenant_providers: Value = serde_json::from_slice(
+            &tenant_providers
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(tenant_providers[0]["owner_name"], "Tenant operations");
         let created = provider_request(
             &state,
             Method::POST,
@@ -2946,6 +2959,13 @@ mod tests {
         )
         .await;
         assert_eq!(tenant_detail.status(), StatusCode::OK);
+        let tenant_audit =
+            provider_request(&state, Method::GET, "/api/audit", &tenant_token, None).await;
+        assert_eq!(tenant_audit.status(), StatusCode::OK);
+        let tenant_audit: Value =
+            serde_json::from_slice(&tenant_audit.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(tenant_audit["rows"][0]["user_name"], "Tenant operations");
         let foreign_detail = provider_request(
             &state,
             Method::GET,
